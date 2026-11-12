@@ -131,6 +131,7 @@ Matched geometry is kept as drawn (translated only). Everything else is placed b
 | **Metabolite instances** | Extra visual copies of non-currency metabolites to shorten long edges; currency stays private `side:` glyphs | Long lines; cofactor clones | `instances.py`, `drawing.py` |
 | **Orientation** | Put free reactions between substrates and products; currency copies on the correct side | Participant placement | `orientation.py` |
 | **Composition & peripherals** | Pull related components in; shelf independents; attach exchange/transport; optional relocation inside large curated blocks | Long lines; cofactor clones; exchange on periphery; aspect; blank space | `composition.py`, `peripheral.py`, `block_relocation.py` |
+| **Cycle layout** | Find short rings in the drawn reaction–reaction graph and place free glyphs on a closed loop (curated/pinned nodes stay put) | Cycle circularity, direction and order | `cycle_layout.py` |
 | **Spacing / relaxation** | Soft-preserve curated shape; shorten edges; minimum node spacing | Connection crossings; unrelated overlaps | `geometry.py`, `global_layout.py` |
 | **Bézier connections** | Cubic Béziers from reaction templates; optional `--source-paths` for original Escher curves | Connection crossings; unrelated overlaps; detours, hooks, bends; quality gate | `edge_style.py`, `source_paths.py`, `routing.py` |
 | **Labels** | Move labels among candidates to cut collisions | — | `label_placement.py` |
@@ -198,7 +199,7 @@ Layout targets (including backlog) stay on Detailed metrics; non-targets under D
 | Axis-aligned segments / axes | Not yet | |
 | Grid metabolites | Not yet | |
 | Chain turns | Not yet | |
-| Cycle placement | Not yet | |
+| Cycle placement | Not yet | Stage present (`cycle_layout.py`); no measured cycle-score gain yet on e_coli_core / iIT341 |
 | Reproducibility | Partial | Fixed seeds; no compose seed CLI |
 | Build on previous layout | Partial | `--previous OpenMetaMaps_<stem>_result.json` reuses matched geometry and grafts leftovers |
 | Scale to GEMs | Partial | Global ≤3 000 + tiled views; large maps start routing-degraded |

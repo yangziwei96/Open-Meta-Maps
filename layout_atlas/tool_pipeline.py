@@ -785,6 +785,7 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             log(f"  same-map rigid restore (after arms): {_rr2['restored']} glyphs")
         # Private glyphs already move with each reaction in place(); a second full
         # instances.optimize here doubled runtime on iIT341 without cutting ac crossings.
+    cycle_report = None
     import orientation as orientation_module
     scene = orientation_module.apply(model, scene, blocks, ORIENTATION, 'before_relax')
     previous_relayout = None
@@ -1184,6 +1185,24 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
         if log:
             log(f"  orthogonal algorithm routes (final): {metric['edge_style_orthogonal']}")
         dump(folder / 'map.json', data)
+    # Closed-loop layout of free glyphs on drawn metabolic rings (after final routing).
+    if LAYOUT_STYLE == 'curated' and not PREVIOUS_SKIP_PACK:
+        import cycle_layout as cycle_layout_module
+        pinned_rx = set()
+        pinned_mets = set()
+        if PREVIOUS_ANCHORS:
+            pinned_rx = {k[2:] for k in PREVIOUS_ANCHORS if str(k).startswith('r:')}
+            pinned_mets = {k[2:] for k in PREVIOUS_ANCHORS if str(k).startswith('m:')}
+        data, cycle_escher = cycle_layout_module.apply_escher(
+            data, model, blocks, currency(model),
+            pinned_reaction_ids=pinned_rx, pinned_metabolite_ids=pinned_mets,
+            skip_edges=skip_edges)
+        metric['cycle_layout_escher'] = cycle_escher
+        cycle_report = dict(escher=cycle_escher)
+        if log:
+            log(f"  cycle layout: rings={cycle_escher.get('lengths')} "
+                f"placed={cycle_escher.get('placed')} moved={cycle_escher.get('moved')}")
+        dump(folder / 'map.json', data)
     t_quality = time.time()
     # Persist structure membership on the map so continuity can be scored from map.json alone.
     # Absolute same-map reuse keeps BiGG spacing; score spatial pieces, not whole atlas windows.
@@ -1220,6 +1239,9 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
     if composition_report is not None:
         quality_summary['details']['composition_pass'] = {k: v for k, v in composition_report.items() if k != 'moves'}
         quality_issues['composition_moves'] = composition_report.get('moves', [])
+    if cycle_report is not None:
+        quality_summary['details']['cycle_layout'] = dict(cycle_report)
+        metric['cycle_layout'] = dict(cycle_report)
     if peripheral_report is not None:
         quality_summary['details']['peripheral'] = dict({k: v for k, v in peripheral_report.items() if k not in ('details', 'gate_rows')},
                                                          unattached=[dict(exchange=d['exchange'], transports=d['transports'], anchors=d['anchors'], x=d.get('x'), y=d.get('y'))

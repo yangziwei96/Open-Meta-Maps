@@ -107,9 +107,9 @@ def test_detailed_panel_keeps_goals_only():
     labels = [r["label"] for g in d["panel"]["groups"] for r in g["rows"]]
     assert "Local crossing hotspot" in labels
     assert "Blank space / space utilisation" in labels
-    # Cycle is a layout target → detail row marked not yet optimised
+    # Cycle is a layout target owned by cycle layout · composition
     cycle_rows = [r for r in groups["structure_flow"]["rows"] if r["code"] == "cycle_circularity"]
-    assert cycle_rows and cycle_rows[0]["stage"] == lq.STAGE_NOT_YET
+    assert cycle_rows and cycle_rows[0]["stage"] == "cycle layout · composition"
     # Orderliness metrics are targets (not yet optimised)
     for code in ("main_segment_axis_share", "reaction_axis_share", "metabolite_grid_share", "chain_turn_median_deg"):
         rows = [r for r in groups["structure_flow"]["rows"] if r["code"] == code]

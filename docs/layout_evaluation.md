@@ -77,7 +77,7 @@ amber highlight.
 |---|---|---|
 | Connections | Local crossing hotspot; Unrelated overlaps | Bézier routing · quality gate; spacing / relaxation · Bézier routing |
 | Line shape | Detour; Hooks / sharp turns / self-intersections; Bends per connection | Bézier routing |
-| Structure & flow | Exchange reactions on the periphery; Axis-aligned main segments; Axis-aligned reaction axes; Grid-aligned metabolites; Median chain turn angle; Cycle circularity / direction / order; Species in another compartment | composition & peripherals; **not yet optimised** (orderliness / octilinear snap; ring/cycle placement; compartment packing) |
+| Structure & flow | Exchange reactions on the periphery; Axis-aligned main segments; Axis-aligned reaction axes; Grid-aligned metabolites; Median chain turn angle; Cycle circularity / direction / order; Species in another compartment | composition & peripherals; cycle layout · composition; **not yet optimised** (orderliness / octilinear snap; compartment packing) |
 | Space & shape | Map size; Aspect ratio vs target; Blank space / space utilisation; Largest empty rectangle; Isolated reactions; Most reactions in one cell | composition & packing |
 | Reproducibility | Procrustes / mean displacement (when `evaluate --compare-map`) | **not yet optimised** (detail row) |
 | Debug diagnostics (hidden by default) | Main flow-direction share | Debug diagnostic |

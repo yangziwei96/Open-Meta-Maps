@@ -75,7 +75,7 @@ def test_gate_ok_respects_angular_directions():
 
 
 def test_gate_metrics_no_optional_imports():
-    """Accept gates must not import layout_benchmark or gdMetriX."""
+    """Accept gates and cycle_layout must not import layout_benchmark or gdMetriX."""
     import sys
     blocked = {'layout_benchmark', 'gdMetriX', 'gdmetrix'}
     before = {k for k in sys.modules if any(k == b or k.startswith(b + '.') for b in blocked)}
@@ -107,6 +107,17 @@ def test_gate_metrics_no_optional_imports():
         },
     ]
     m = ortho._gate_metrics(data)
+    import cycle_layout as cycle_layout_module
+    model = dict(
+        id='tiny',
+        reactions=[dict(id='RNEW', metabolites={'a_c': 1.0, 'b_c': -1.0},
+                        lower_bound=0.0, upper_bound=1000.0)],
+        metabolites=[
+            dict(id='a_c', name='a', compartment='c', annotations=[]),
+            dict(id='b_c', name='b', compartment='c', annotations=[]),
+        ],
+    )
+    cycle_layout_module.apply_escher(data, model, blocks=[], cur=set())
     after = {k for k in sys.modules if any(k == b or k.startswith(b + '.') for b in blocked)}
     assert after == before
     assert set(m) >= {'crossings', 'angular_resolution', 'participant_consistency',

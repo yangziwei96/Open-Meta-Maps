@@ -597,9 +597,9 @@ def _detailed_metrics_panel(details, *, line_shape, cycles, unrelated, crossing_
             'Cycle circularity / direction / order',
             f"{_na(circ)} / {_na(cy.get('cycle_direction_consistency'))} ({_na(cy.get('cycle_direction'))}) / {_na(cy.get('cycle_order_consistency'))}",
             code='cycle_circularity',
-            tip='How round and consistently oriented drawn cycles are (isoperimetric quotient and neighbour order). Higher is better; goal higher circularity and neighbour-order consistency.',
+            tip='How round and consistently oriented drawn metabolic cycles are (isoperimetric quotient and neighbour order). Higher is better.',
             better='higher', target='higher circularity & consistency',
-            stage=STAGE_NOT_YET,
+            stage='cycle layout · composition',
             miss=(circ is not None and circ < 0.35),
         ))
     structure_rows.append(_row(
