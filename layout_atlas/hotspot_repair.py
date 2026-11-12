@@ -10,8 +10,8 @@ as a whole-block translation.
 Evaluation is incremental: a spatial segment index is built once; each candidate
 only recounts segments of the touched reactions (delta counting).  Candidate
 generation is pruned to nodes/edges that participate in crossings inside the
-window.  The time budget scales with window crossing/edge mass, not a fixed
-model-specific constant.  Deterministic and model-agnostic.
+window.  Search stops on a deterministic evaluation budget (and accept/round
+caps), never on wall-clock.  Deterministic and model-agnostic.
 """
 from __future__ import annotations
 
@@ -30,12 +30,17 @@ DEFAULT_K = 3
 MAX_ROUNDS = 4
 MAX_ACCEPTS = 20
 WINDOW_PAD = 40.0
-# Budget scales with window mass: seconds ≈ α·crossings + β·edges, summed over top-k.
-BUDGET_CROSS = 0.05   # search-seconds per crossing in the top-k windows
-BUDGET_EDGE = 0.002   # search-seconds per edge touching those windows
-BUDGET_FLOOR = 0.8    # search floor (index build is timed separately)
-BUDGET_CAP = 30.0     # absolute search cap (mid GEMs need headroom past the old 12 s)
+# Historical mass→seconds scale (kept so callers that still pass budget_s convert
+# through the same curve).  Search itself uses evaluation counts only.
+BUDGET_CROSS = 0.05   # former search-seconds per crossing in the top-k windows
+BUDGET_EDGE = 0.002   # former search-seconds per edge touching those windows
+BUDGET_FLOOR = 0.8    # former search floor (index build is timed separately)
+BUDGET_CAP = 30.0     # former absolute search cap
 TRIES_PER_CROSS = 4.0 # evaluation tries scale with window crossings
+# Calibrated on an unloaded machine (2026-11): iIT341 completed 1815 evaluations
+# under the former 45 s wall-clock stop (1815/45 ≈ 40.333 eval/s).  e_coli_core
+# exhausted its natural try budget well under 35 s, so evaluation caps dominate there.
+EVALS_PER_SEC = 1815.0 / 45.0
 
 
 def _is_currency(bigg):
@@ -77,13 +82,21 @@ def _score(data, skip_edges, structures=None):
 
 
 def _window_budget(windows, k=DEFAULT_K):
-    """Time/try budget from window size (crossings + edges), not a model id."""
+    """Evaluation/try budget from window size (crossings + edges), not a model id.
+
+    Returns ``(evals, tries, mass)``.  ``evals`` is the wall-clock-equivalent
+    evaluation count (former seconds × ``EVALS_PER_SEC``); ``tries`` is the
+    mass-scaled try floor.  Search uses ``max(evals, tries)`` unless the caller
+    overrides via ``budget_s`` / ``budget_evals``.
+    """
     wins = list(windows or [])[:k]
     mass_c = sum(int(w.get('crossings') or 0) for w in wins)
     mass_e = sum(int(w.get('edges') or 0) for w in wins)
     seconds = min(BUDGET_CAP, max(BUDGET_FLOOR, BUDGET_CROSS * mass_c + BUDGET_EDGE * mass_e))
+    evals = max(8, int(round(seconds * EVALS_PER_SEC)))
     tries = max(8, int(TRIES_PER_CROSS * max(mass_c, 1)))
-    return seconds, tries, dict(window_crossings=mass_c, window_edges=mass_e)
+    return evals, tries, dict(window_crossings=mass_c, window_edges=mass_e,
+                              former_seconds=round(seconds, 3))
 
 
 def _spacing_from_nodes(nodes):
@@ -613,8 +626,12 @@ def diagnose_windows(data, skip_edges=None, k=DEFAULT_K):
 
 def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K,
            max_rounds=MAX_ROUNDS, max_accepts=MAX_ACCEPTS, budget_s=None, log=None,
-           structures=None):
-    """Greedy local repair of the top-k crossing hotspots. Mutates ``data`` in place when accepting."""
+           structures=None, budget_evals=None):
+    """Greedy local repair of the top-k crossing hotspots. Mutates ``data`` in place when accepting.
+
+    Search stops on evaluation / accept / round caps only (never wall-clock).  ``budget_s`` is
+    retained as a compatibility alias and converted to evaluations via ``EVALS_PER_SEC``.
+    """
     t0 = time.time()
     skip = _skip_set(data, skip_edges)
     expert = _expert_reaction_ids(blocks, data)
@@ -631,13 +648,18 @@ def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K
     from evaluation.continuity import structure_continuity as _structure_continuity
     cont = _structure_continuity(data, structures=structures)
     before = _metrics_from_index(index, windows, node_ov0, lab_ov0, cont, length_p90, spacing)
-    auto_budget, auto_tries, mass = _window_budget(windows, k)
-    if budget_s is None:
-        budget_s = auto_budget
-    # When the caller raises the time budget, scale tries so search is not try-capped first.
-    max_tries = auto_tries
-    if budget_s > auto_budget and auto_budget > 0:
-        max_tries = max(auto_tries, int(auto_tries * budget_s / auto_budget))
+    auto_evals, auto_tries, mass = _window_budget(windows, k)
+    if budget_evals is not None:
+        max_tries = max(auto_tries, int(budget_evals))
+        budget_s_report = float(budget_evals) / EVALS_PER_SEC
+    elif budget_s is None:
+        max_tries = max(auto_tries, auto_evals)
+        budget_s_report = mass.get('former_seconds', auto_evals / EVALS_PER_SEC)
+    else:
+        # Caller raised the former wall-clock budget: convert at calibrated throughput so
+        # unloaded-machine results match the old time-limited search (iIT341: 1815 @ 45 s).
+        max_tries = max(auto_tries, int(round(float(budget_s) * EVALS_PER_SEC)))
+        budget_s_report = float(budget_s)
     setup_s = round(time.time() - t0, 2)
 
     report = dict(
@@ -645,7 +667,8 @@ def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K
             'crossings', 'top_window_crossings', 'worst_window', 'node_overlaps', 'label_overlaps',
             'continuity_share', 'split_structures', 'length_p90', 'currency_involved', 'main_metabolite')},
         accepted=[], rejected=0, tries=0, rounds=0, reject_reasons={},
-        budget_s=round(budget_s, 2), budget_mass=mass, setup_s=setup_s, diagnosis=[],
+        budget_s=round(budget_s_report, 2), budget_evals=max_tries, budget_mass=mass,
+        setup_s=setup_s, diagnosis=[],
     )
     for win in windows[:k]:
         report['diagnosis'].append(index.window_breakdown(win) | dict(
@@ -656,18 +679,18 @@ def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K
     current_cross = index.headline()
     if log:
         log(f"  hotspot repair: start crossings={before['crossings']} worst_window={report['before']['worst_window']} "
-            f"search_budget={budget_s:.1f}s tries≤{max_tries} setup={setup_s}s spacing={spacing:.1f}")
+            f"search_budget={max_tries} evals tries≤{max_tries} setup={setup_s}s spacing={spacing:.1f}")
 
     t_search = time.time()
     for rnd in range(max_rounds):
-        if time.time() - t_search > budget_s or accepts >= max_accepts or report['tries'] >= max_tries:
+        if accepts >= max_accepts or report['tries'] >= max_tries:
             break
         report['rounds'] = rnd + 1
         if not windows or all(w.get('crossings', 0) <= 0 for w in windows):
             break
         progressed = False
         for win in windows:
-            if time.time() - t_search > budget_s or accepts >= max_accepts or report['tries'] >= max_tries:
+            if accepts >= max_accepts or report['tries'] >= max_tries:
                 break
             cross_rids, cross_nids = index.participants_in_window(win)
             if not cross_rids:
@@ -679,7 +702,7 @@ def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K
             tried_here = 0
             mi = 0
             while mi < len(moves):
-                if time.time() - t_search > budget_s or accepts >= max_accepts or report['tries'] >= max_tries:
+                if accepts >= max_accepts or report['tries'] >= max_tries:
                     break
                 if tried_here >= win_try_cap:
                     break

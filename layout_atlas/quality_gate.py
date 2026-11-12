@@ -158,23 +158,31 @@ def translate_module(data, scene, keys, delta, reactions, skip_edges):
     return d2, redo, moved_nodes
 
 
-def peripheral_pass(data, scene, proposals, skip_edges, budget_s=150.0, max_candidates=24, log=None):
-    """Try each proposed module move on a copy of the map, keep it only when `accept` says the final geometry is not worse.  Returns (data, report)."""
+def peripheral_pass(data, scene, proposals, skip_edges, budget_s=150.0, max_candidates=24, log=None,
+                    max_evals=None):
+    """Try each proposed module move on a copy of the map, keep it only when `accept` says the final geometry is not worse.  Returns (data, report).
+
+    Stops on a deterministic evaluation budget (full ``evaluate_map`` calls on candidates),
+    never on wall-clock.  ``budget_s`` is retained for call-site compatibility and ignored;
+    on unloaded machines the former 12 s / 2-candidate e_coli_core path never hit the clock.
+    """
     import edge_style
     t0 = time.time()
     far = len(proposals)
     base, summary, issues = evaluate_map(data, skip_edges, disconnected=far)
     rows, accepted = [], 0
+    # Work budget = number of candidate gate evaluations (baseline evaluate is free).
+    if max_evals is None:
+        max_evals = int(max_candidates)
+    evals = 0
     for prop in sorted(proposals, key=lambda p: -p.get('connection_px', [0, 0])[0])[:max_candidates]:
-        if time.time() - t0 > budget_s:
+        if evals >= max_evals:
             rows.append(dict(exchange=prop['exchange'], decision='budget_exhausted'))
             continue
         d2, redo, _ = translate_module(data, scene, prop['keys'], prop['delta'], set(prop['reactions']), skip_edges)
         edge_style.apply(d2, skip_edges, only=redo)
         new, s2, i2 = evaluate_map(d2, skip_edges, disconnected=far - 1)
-        if time.time() - t0 > budget_s:
-            rows.append(dict(exchange=prop['exchange'], decision='budget_exhausted'))
-            continue
+        evals += 1
         ok, why = accept(base, new)
         rows.append(dict(exchange=prop['exchange'], transports=prop['transports'], decision='accepted' if ok else 'rejected', reason=why, moved_px=prop.get('moved_px'),
                          before={k: base[k] for k in ('collisions', 'crossings', 'long_edges')}, after={k: new[k] for k in ('collisions', 'crossings', 'long_edges')}))
@@ -189,4 +197,4 @@ def peripheral_pass(data, scene, proposals, skip_edges, budget_s=150.0, max_cand
     for prop in sorted(proposals, key=lambda p: -p.get('connection_px', [0, 0])[0])[max_candidates:]:
         rows.append(dict(exchange=prop['exchange'], decision='budget_exhausted'))
     return data, dict(proposed=len(proposals), accepted=accepted, rejected=sum(r['decision'] == 'rejected' for r in rows), budget_exhausted=sum(r['decision'] == 'budget_exhausted' for r in rows),
-                      seconds=round(time.time() - t0, 1), rows=rows)
+                      max_evals=max_evals, evals=evals, seconds=round(time.time() - t0, 1), rows=rows)

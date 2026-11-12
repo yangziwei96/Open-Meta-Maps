@@ -140,6 +140,7 @@ def test_repair_can_reduce_crossings_on_fixable_hotspot():
 def test_window_budget_scales_with_mass():
     small = hr._window_budget([dict(crossings=4, edges=20)], k=1)
     large = hr._window_budget([dict(crossings=60, edges=200)], k=1)
+    # (evals, tries, mass) — both evaluation and try caps grow with window mass.
     assert small[0] < large[0]
     assert small[1] < large[1]
 
