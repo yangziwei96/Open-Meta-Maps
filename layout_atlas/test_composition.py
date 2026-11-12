@@ -270,3 +270,56 @@ def test_fit_canvas_to_content_shrinks_frame():
     assert abs(can['y'] - 160.0) < 1e-6
     assert abs(can['width'] - 380.0) < 1e-6
     assert abs(can['height'] - 380.0) < 1e-6
+
+
+def test_compose_freezes_previous_pinned_island():
+    # Fully --previous-pinned islands stay put while packing moves other leftovers.
+    model = {
+        'reactions': [
+            {'id': 'R1', 'metabolites': {'A_c': -1, 'B_c': 1}},
+            {'id': 'R2', 'metabolites': {'B_c': -1, 'C_c': 1}},
+            {'id': 'R3', 'metabolites': {'C_c': -1, 'D_c': 1}},
+            {'id': 'R4', 'metabolites': {'D_c': -1, 'E_c': 1}},
+            {'id': 'R5', 'metabolites': {'E_c': -1, 'F_c': 1}},
+            {'id': 'R6', 'metabolites': {'F_c': -1, 'G_c': 1}},
+            {'id': 'R7', 'metabolites': {'G_c': -1, 'H_c': 1}},
+            {'id': 'R8', 'metabolites': {'H_c': -1, 'I_c': 1}},
+            {'id': 'T1', 'metabolites': {'X_c': -1, 'Y_c': 1}},
+        ],
+        'metabolites': [],
+    }
+    pins = {'r:T1': [5000.0, 5000.0], 'm:X_c': [5000.0, 5040.0], 'm:Y_c': [5000.0, 4960.0]}
+    scene = dict(
+        positions={
+            'r:R1': [0.0, 0.0], 'r:R2': [100.0, 0.0], 'r:R3': [200.0, 0.0], 'r:R4': [300.0, 0.0],
+            'r:R5': [400.0, 0.0], 'r:R6': [500.0, 0.0], 'r:R7': [600.0, 0.0], 'r:R8': [700.0, 0.0],
+            'm:A_c': [0.0, 40.0], 'm:B_c': [50.0, 40.0], 'm:C_c': [150.0, 40.0], 'm:D_c': [250.0, 40.0],
+            'm:E_c': [350.0, 40.0], 'm:F_c': [450.0, 40.0], 'm:G_c': [550.0, 40.0], 'm:H_c': [650.0, 40.0],
+            'm:I_c': [700.0, 40.0],
+            'r:T1': [5000.0, 5000.0], 'm:X_c': [5000.0, 5040.0], 'm:Y_c': [5000.0, 4960.0],
+        },
+        labels={},
+        copies={
+            'm:A_c': 'A_c', 'm:B_c': 'B_c', 'm:C_c': 'C_c', 'm:D_c': 'D_c', 'm:E_c': 'E_c',
+            'm:F_c': 'F_c', 'm:G_c': 'G_c', 'm:H_c': 'H_c', 'm:I_c': 'I_c',
+            'm:X_c': 'X_c', 'm:Y_c': 'Y_c',
+        },
+        participants={
+            ('R1', 'A_c'): 'm:A_c', ('R1', 'B_c'): 'm:B_c',
+            ('R2', 'B_c'): 'm:B_c', ('R2', 'C_c'): 'm:C_c',
+            ('R3', 'C_c'): 'm:C_c', ('R3', 'D_c'): 'm:D_c',
+            ('R4', 'D_c'): 'm:D_c', ('R4', 'E_c'): 'm:E_c',
+            ('R5', 'E_c'): 'm:E_c', ('R5', 'F_c'): 'm:F_c',
+            ('R6', 'F_c'): 'm:F_c', ('R6', 'G_c'): 'm:G_c',
+            ('R7', 'G_c'): 'm:G_c', ('R7', 'H_c'): 'm:H_c',
+            ('R8', 'H_c'): 'm:H_c', ('R8', 'I_c'): 'm:I_c',
+            ('T1', 'X_c'): 'm:X_c', ('T1', 'Y_c'): 'm:Y_c',
+        },
+    )
+    out, rep = C.compose(model, scene, blocks=[], cur=set(), previous_pins=pins)
+    assert rep.get('previous_pinned_reactions') == 1
+    assert out['positions']['r:T1'] == [5000.0, 5000.0]
+    assert out['positions']['m:X_c'] == [5000.0, 5040.0]
+    # Compose must not stamp scene['anchors'] (previous-relayout revert fallback).
+    assert 'anchors' not in out
+

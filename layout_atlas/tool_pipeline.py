@@ -705,7 +705,8 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
     composition_report = None
     if LAYOUT_STYLE == 'curated' and os.environ.get('OPM_COMPOSE', 'on') != 'off' and not PREVIOUS_SKIP_PACK:
         import composition
-        scene, composition_report = composition.compose(model, scene, blocks, currency(model))
+        scene, composition_report = composition.compose(
+            model, scene, blocks, currency(model), previous_pins=PREVIOUS_ANCHORS)
         if log:
             log('  composition: ' + str({k: v for k, v in composition_report.items() if k != 'moves'}))
         # Composition / landscape reflow must not break same-map absolute relatives.
@@ -1145,6 +1146,15 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
         metric['edge_routing'] = er
     else:
         metric['edge_routing'] = dict(mode=EDGE_ROUTING, not_applied='large model: routing of the algorithm-placed connections is a later step')
+    # After every post-export geometry pass, restore --previous pins in the map
+    # frame (translation fit).  Partial --previous still runs squeeze/hotspot, which
+    # would otherwise move pinned midmarkers and metabolites.
+    if PREVIOUS_ANCHORS and not scalable:
+        data, n_pin = prev.pin_escher(data, PREVIOUS_ANCHORS)
+        if n_pin:
+            dump(folder / 'map.json', data)
+            if log:
+                log(f'  previous layout pin (escher final): {n_pin} nodes')
     t_quality = time.time()
     # Persist structure membership on the map so continuity can be scored from map.json alone.
     # Absolute same-map reuse keeps BiGG spacing; score spatial pieces, not whole atlas windows.

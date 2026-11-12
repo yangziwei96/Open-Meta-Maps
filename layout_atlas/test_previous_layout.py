@@ -35,16 +35,65 @@ def test_load_previous_anchors_filters_to_model(tmp_path):
 
 def test_pin_scene_and_blocks():
     anchors = {'r:A': [1.0, 2.0], 'm:x': [3.0, 4.0]}
-    scene = dict(positions={'r:A': [9.0, 9.0], 'm:x': [8.0, 8.0], 'r:B': [0.0, 0.0]})
+    scene = dict(
+        positions={
+            'r:A': [9.0, 9.0], 'm:x': [8.0, 8.0], 'r:B': [0.0, 0.0],
+            'inst:long:x:0': [50.0, 50.0],
+        },
+        copies={'m:x': 'x', 'inst:long:x:0': 'x'},
+    )
     scene, n = prev.pin_scene(scene, anchors)
-    assert n == 2
+    assert n >= 3
     assert scene['positions']['r:A'] == [1.0, 2.0]
     assert scene['positions']['r:B'] == [0.0, 0.0]
+    assert scene['positions']['inst:long:x:0'] == [3.0, 4.0]
     blocks = [dict(positions={'r:A': [0.0, 0.0], 'm:x': [0.0, 0.0], 'r:C': [5.0, 5.0]})]
     blocks, n = prev.apply_block_positions(blocks, anchors)
     assert n == 2
     assert blocks[0]['positions']['r:A'] == [1.0, 2.0]
     assert blocks[0]['positions']['r:C'] == [5.0, 5.0]
+
+
+def test_pin_escher_restores_final_map_pins():
+    # After export-frame drift, pin_escher must put previous pins back so
+    # load_previous_anchors recovers the same relative geometry (fails if no-op).
+    anchors = {
+        'r:RA': [100.0, 200.0],
+        'r:RB': [400.0, 200.0],
+        'm:hub_c': [250.0, 100.0],
+    }
+    # Map frame is translated +50,+30 vs the previous anchors, and hub was nudged.
+    data = [
+        {'metadata': {}},
+        {
+            'nodes': {
+                '1': dict(node_type='midmarker', x=150.0, y=230.0),
+                '2': dict(node_type='midmarker', x=450.0, y=230.0),
+                '3': dict(node_type='metabolite', bigg_id='hub_c', node_is_primary=True,
+                          x=310.0, y=140.0, label_x=319.0, label_y=125.0),
+                '4': dict(node_type='metabolite', bigg_id='hub_c', node_is_primary=True,
+                          x=900.0, y=900.0, label_x=909.0, label_y=885.0),
+            },
+            'reactions': {
+                '0': dict(bigg_id='RA', label_x=155.0, label_y=240.0,
+                          segments={'s': dict(from_node_id='1', to_node_id='3')}),
+                '1': dict(bigg_id='RB', label_x=455.0, label_y=240.0,
+                          segments={'s': dict(from_node_id='2', to_node_id='3')}),
+            },
+            'canvas': dict(x=0, y=0, width=1000, height=1000),
+        },
+    ]
+    out, n = prev.pin_escher(data, anchors)
+    assert n >= 4
+    nodes = out[1]['nodes']
+    # Translation fit from the two midmarkers: +50, +30.
+    assert abs(nodes['1']['x'] - 150.0) < 1e-6 and abs(nodes['1']['y'] - 230.0) < 1e-6
+    assert abs(nodes['2']['x'] - 450.0) < 1e-6 and abs(nodes['2']['y'] - 230.0) < 1e-6
+    # Every hub glyph sits on the translated previous primary — not left at a corner.
+    assert abs(nodes['3']['x'] - 300.0) < 1e-6 and abs(nodes['3']['y'] - 130.0) < 1e-6
+    assert abs(nodes['4']['x'] - 300.0) < 1e-6 and abs(nodes['4']['y'] - 130.0) < 1e-6
+    # Pairwise distance between RA and RB matches the previous map.
+    assert abs((nodes['2']['x'] - nodes['1']['x']) - 300.0) < 1e-6
 
 
 def test_filter_previous_map_drops_removed_reactions(tmp_path):

@@ -48,6 +48,33 @@ POCKET_CELL_FRAC = 0.55
 POCKET_PAD_CELLS = 1
 
 
+def previous_pinned_reactions(pins):
+    """Reaction ids that have an ``r:`` pin in a previous-layout anchor map."""
+    return {
+        k[2:] for k in (pins or {})
+        if isinstance(k, str) and k.startswith('r:')
+    }
+
+
+def freeze_previous_components(comps, main, pins):
+    """Append islands whose every reaction is previous-pinned to the frozen main set.
+
+    Returns ``(main, pinned_rx)``.  ``main`` is extended in place when pins hit;
+    callers may pass a fresh list.
+    """
+    pinned_rx = previous_pinned_reactions(pins)
+    if not pinned_rx:
+        return main, pinned_rx
+    seen = set(main)
+    for i, c in enumerate(comps):
+        if i in seen:
+            continue
+        if c['reactions'] and all(rid in pinned_rx for rid in c['reactions']):
+            main.append(i)
+            seen.add(i)
+    return main, pinned_rx
+
+
 def components(model, scene, cur):
     """Connected visual components: reaction ids -> dict(reactions, keys)."""
     parts = scene['participants']
@@ -113,8 +140,13 @@ def _aligned_spot(local, target, anchors, size, tree, centre):
     return min(cands, key=score)
 
 
-def compose(model, scene, blocks, cur):
-    """-> (new scene, report).  Moves small components; `scene` is not modified."""
+def compose(model, scene, blocks, cur, previous_pins=None):
+    """-> (new scene, report).  Moves small components; `scene` is not modified.
+
+    ``previous_pins``: optional ``{'r:id':[x,y], 'm:id':[x,y]}`` from ``--previous``;
+    fully pinned islands are frozen with main.  Not stored on ``scene`` (avoids
+    changing the previous-relayout revert fallback that reads ``scene['anchors']``).
+    """
     scene = dict(scene, positions={k: list(v) for k, v in scene['positions'].items()})
     pos, parts = scene['positions'], scene['participants']
     comps = components(model, scene, cur)
@@ -149,6 +181,9 @@ def compose(model, scene, blocks, cur):
             if any(rid in rigid_rx for rid in c['reactions']):
                 main.append(i)
         report['same_map_rigid_reactions'] = len(rigid_rx)
+    main, pinned_rx = freeze_previous_components(comps, main, previous_pins)
+    if pinned_rx:
+        report['previous_pinned_reactions'] = len(pinned_rx)
     report['main'] = len(main)
     if not main:
         scene['composition'] = report
@@ -465,7 +500,8 @@ def compose(model, scene, blocks, cur):
         report['interior_repack'] = iter_reps
     # Final landscape reflow: translation-only skyline of rigid visual components so the
     # content bbox lands in 4:3–16:9 even when related-pulls left a tall column.
-    scene, reflow = reflow_landscape(model, scene, blocks, cur)
+    scene, reflow = reflow_landscape(
+        model, scene, blocks, cur, previous_pins=previous_pins)
     report['landscape_reflow'] = reflow
     scene['composition'] = report
     return scene, report
@@ -677,7 +713,7 @@ def pack_into_main_pockets(boxes, main_pts, spacing, prefer_c=None, prefer_void=
                                                  / max(content_hi[1] - content_lo[1], 1e-9)), 3))
 
 
-def reflow_landscape(model, scene, blocks, cur):
+def reflow_landscape(model, scene, blocks, cur, previous_pins=None):
     """Bring the scene content bbox into 4:3–16:9 without deforming curated glyphs.
 
     Safe tools only (never tear the main packed network):
@@ -718,6 +754,7 @@ def reflow_landscape(model, scene, blocks, cur):
         for i, c in enumerate(comps):
             if i not in main and any(rid in rigid_rx for rid in c['reactions']):
                 main.append(i)
+    main, _pinned_rx = freeze_previous_components(comps, main, previous_pins)
     movable = [i for i in range(len(comps)) if i not in set(main)]
     if not main or not movable:
         report.update(aspect_after=round(aspect0, 3),

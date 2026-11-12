@@ -80,29 +80,31 @@ def apply_block_positions(blocks, anchors):
 def pin_scene(scene, anchors):
     """Hard-pin previous anchors into a display scene before export.
 
-    Pins ``r:`` / ``m:`` keys and curated ``copy:…:met`` glyphs to the previous
-    primary metabolite position.  Currency ``side:`` stubs follow their reaction
-    midmarker by the same delta so spokes stay attached.  Must run before
-    ``drawing.export`` (which applies one uniform canvas translation); do not
-    re-apply absolute previous coordinates onto the exported Escher JSON.
+    Pins ``r:`` / ``m:`` keys and every drawn glyph of a pinned metabolite
+    (``m:``, ``inst:``, curated ``copy:…``) via ``scene['copies']``.  Currency
+    ``side:`` stubs follow their reaction midmarker by the same delta so spokes
+    stay attached.  Must run before ``drawing.export`` (uniform canvas
+    translation); absolute previous coordinates are re-applied on the exported
+    map by ``pin_escher`` after post-export geometry.
     """
     if not scene or not anchors:
         return scene, 0
     pos = scene.get('positions') or {}
+    copies = scene.get('copies') or {}
     n = 0
     old_mids = {k: list(pos[k]) for k in pos if k.startswith('r:') and k in anchors}
     for k, xy in anchors.items():
         if k in pos:
             pos[k] = [float(xy[0]), float(xy[1])]
             n += 1
-    for k in list(pos):
-        if not k.startswith('copy:'):
+    # Every visual instance of a pinned metabolite sits on the previous primary.
+    pinned_mets = {k[2:] for k in anchors if isinstance(k, str) and k.startswith('m:')}
+    for k, mid in copies.items():
+        if mid not in pinned_mets or k not in pos:
             continue
-        met = k.rsplit(':', 1)[-1]
-        mk = 'm:' + met
-        if mk in anchors:
-            pos[k] = [float(anchors[mk][0]), float(anchors[mk][1])]
-            n += 1
+        mk = 'm:' + mid
+        pos[k] = [float(anchors[mk][0]), float(anchors[mk][1])]
+        n += 1
     # Keep side stubs attached to pinned midmarkers.
     for k in list(pos):
         if not k.startswith('side:'):
@@ -122,12 +124,81 @@ def pin_scene(scene, anchors):
 
 
 def pin_escher(data, anchors):
-    """No-op kept for call-site compatibility; scene pinning + export translation is enough.
+    """Restore previous pins on an exported Escher map (translation-only fit).
 
-    Re-applying absolute previous coordinates after ``drawing.export`` mixes the
-    previous canvas frame with the new export translation and scrambles edges.
+    Post-export passes (squeeze, corridor, hotspot) can move glyphs even after
+    ``pin_scene``.  Fit a single translation from pinned reaction midmarkers
+    present in both frames, then place every pinned reaction midmarker and every
+    metabolite node of a pinned species at ``anchor + translation`` so relative
+    pin geometry matches the previous map.
     """
-    return data, 0
+    if not data or not anchors:
+        return data, 0
+    body = data[1] if isinstance(data, list) and len(data) >= 2 else data
+    if not isinstance(body, dict):
+        return data, 0
+    nodes = body.get('nodes') or {}
+    reactions = body.get('reactions') or {}
+    # Current midmarker node + xy per pinned reaction.
+    cur_rx = {}
+    for r in reactions.values():
+        rid = r.get('bigg_id')
+        if not rid or ('r:' + rid) not in anchors:
+            continue
+        for seg in (r.get('segments') or {}).values():
+            for nid in (seg.get('from_node_id'), seg.get('to_node_id')):
+                node = nodes.get(nid) if nid in nodes else nodes.get(str(nid))
+                if not node or node.get('node_type') != 'midmarker':
+                    continue
+                key = nid if nid in nodes else str(nid)
+                cur_rx[rid] = (key, float(node['x']), float(node['y']))
+                break
+            if rid in cur_rx:
+                break
+    if not cur_rx:
+        return data, 0
+    deltas = [
+        (x - float(anchors['r:' + rid][0]), y - float(anchors['r:' + rid][1]))
+        for rid, (_nid, x, y) in cur_rx.items()
+    ]
+    dx = float(np.mean([d[0] for d in deltas]))
+    dy = float(np.mean([d[1] for d in deltas]))
+
+    def _move_node(nid, tx, ty):
+        node = nodes[nid]
+        ox, oy = float(node['x']), float(node['y'])
+        node['x'], node['y'] = float(tx), float(ty)
+        if 'label_x' in node and 'label_y' in node:
+            node['label_x'] = float(node['label_x']) + (float(tx) - ox)
+            node['label_y'] = float(node['label_y']) + (float(ty) - oy)
+
+    n = 0
+    for rid, (nid, ox, oy) in cur_rx.items():
+        ax, ay = anchors['r:' + rid]
+        tx, ty = float(ax) + dx, float(ay) + dy
+        _move_node(nid, tx, ty)
+        for r in reactions.values():
+            if r.get('bigg_id') != rid:
+                continue
+            if 'label_x' in r and 'label_y' in r:
+                r['label_x'] = float(r['label_x']) + (tx - ox)
+                r['label_y'] = float(r['label_y']) + (ty - oy)
+            break
+        n += 1
+    met_nodes = {}
+    for nid, node in nodes.items():
+        if node.get('node_type') != 'metabolite' or not node.get('bigg_id'):
+            continue
+        met_nodes.setdefault(node['bigg_id'], []).append(nid)
+    for key, xy in anchors.items():
+        if not (isinstance(key, str) and key.startswith('m:')):
+            continue
+        mid = key[2:]
+        tx, ty = float(xy[0]) + dx, float(xy[1]) + dy
+        for nid in met_nodes.get(mid, []):
+            _move_node(nid, tx, ty)
+            n += 1
+    return data, n
 
 
 def filter_previous_map(path, model):
