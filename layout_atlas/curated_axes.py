@@ -985,8 +985,9 @@ def _clear_rigid_node_overlaps_escher_official(data, blocks, min_dist=12.0, max_
     """Final Escher-footprint clear; optional reject of moves that raise official crossings.
 
     All glyph moves go through ``map_edit`` helpers so metabolite and reaction labels
-    stay with their nodes. Accepted nudges are recorded as deltas so a crossings
-    regression can be rolled back without detaching labels.
+    stay with their nodes. Accepted nudges are recorded as deltas; a crossings or
+    participant regression restores from an absolute pre-clear snapshot so labels
+    never drift under rounded undo/redo.
     """
     if not data or len(data) < 2:
         return data, dict(moved=0)
@@ -1041,11 +1042,49 @@ def _clear_rigid_node_overlaps_escher_official(data, blocks, min_dist=12.0, max_
     def _crossings():
         return om.count_piece_crossings(om.piece_segments(om.escher_drawn_edges(data)))
 
+    def _snap_state():
+        node_snap = {}
+        for nid in ids:
+            n = nodes[nid]
+            node_snap[nid] = (
+                float(n['x']), float(n['y']),
+                None if 'label_x' not in n else float(n['label_x']),
+                None if 'label_y' not in n else float(n['label_y']),
+            )
+        rx_snap = {}
+        for key, rx in reactions.items():
+            if 'label_x' in rx:
+                rx_snap[key] = (float(rx['label_x']), float(rx['label_y']))
+        return node_snap, rx_snap
+
+    def _restore_state(node_snap, rx_snap):
+        for nid, (x, y, lx, ly) in node_snap.items():
+            n = nodes[nid]
+            n['x'], n['y'] = x, y
+            if lx is not None:
+                n['label_x'], n['label_y'] = lx, ly
+        for key, (lx, ly) in rx_snap.items():
+            reactions[key]['label_x'] = lx
+            reactions[key]['label_y'] = ly
+
     before_ov = _overlaps()
     before_cross = _crossings() if guard_official else None
+    before_part = om.participant_consistency(data) if guard_official else None
+    origin_nodes, origin_rx = _snap_state()
     accepted = 0
-    # Each history entry: list of (nid, dx, dy) applied for that nudge.
-    history = []
+    history = []  # list of delta lists [(nid, dx, dy), ...]
+
+    def _layout_ok():
+        if not guard_official:
+            return True
+        if _crossings() > before_cross:
+            return False
+        if before_part is None:
+            return True
+        part = om.participant_consistency(data)
+        if part is None:
+            return True
+        return part + 1e-15 >= before_part
 
     for _ in range(max_iters):
         if accepted >= max_moves:
@@ -1103,6 +1142,7 @@ def _clear_rigid_node_overlaps_escher_official(data, blocks, min_dist=12.0, max_
                     k = index[nid]
                     xy[k] = [nodes[nid]['x'], nodes[nid]['y']]
             else:
+                # Reject: restore absolute positions for touched glyphs (no rounded undo drift).
                 for nid, dx, dy in deltas:
                     _nudge_escher_node(nodes, reactions, nid, -dx, -dy)
         if not progressed:
@@ -1112,40 +1152,42 @@ def _clear_rigid_node_overlaps_escher_official(data, blocks, min_dist=12.0, max_
         moved=accepted, accepted=accepted, rigid_nodes=len(rigid_nids),
         mode=('escher_radii_guarded' if guard_official else 'escher_radii'),
         before_overlaps=before_ov, before_crossings=before_cross,
+        before_participant=before_part,
     )
     if guard_official:
         after_cross = _crossings()
         after_ov = _overlaps()
-        if after_cross > before_cross and history:
-            # Keep the longest prefix of nudges that does not raise crossings.
+        after_part = om.participant_consistency(data)
+        worse = (after_cross > before_cross) or (
+            before_part is not None and after_part is not None and after_part + 1e-15 < before_part)
+        if worse and history:
             lo, hi, best = 0, len(history), 0
             while lo <= hi:
                 mid = (lo + hi) // 2
-                # Reset to pre-clear geometry by undoing all accepted nudges.
-                for deltas in reversed(history):
-                    for nid, dx, dy in reversed(deltas):
-                        _nudge_escher_node(nodes, reactions, nid, -dx, -dy)
+                _restore_state(origin_nodes, origin_rx)
                 for deltas in history[:mid]:
                     for nid, dx, dy in deltas:
                         _nudge_escher_node(nodes, reactions, nid, dx, dy)
-                if _crossings() <= before_cross:
+                if _layout_ok():
                     best = mid
                     lo = mid + 1
                 else:
                     hi = mid - 1
-            for deltas in reversed(history):
-                for nid, dx, dy in reversed(deltas):
-                    _nudge_escher_node(nodes, reactions, nid, -dx, -dy)
+            _restore_state(origin_nodes, origin_rx)
             for deltas in history[:best]:
                 for nid, dx, dy in deltas:
                     _nudge_escher_node(nodes, reactions, nid, dx, dy)
             report.update(dict(
                 accepted=best, moved=best,
                 after_overlaps=_overlaps(), after_crossings=_crossings(),
-                reason='prefix keep to protect crossings',
+                after_participant=om.participant_consistency(data),
+                reason='prefix keep to protect crossings and participant consistency',
             ))
             return data, report
-        report.update(dict(after_overlaps=after_ov, after_crossings=after_cross))
+        report.update(dict(
+            after_overlaps=after_ov, after_crossings=after_cross,
+            after_participant=after_part,
+        ))
     else:
         report.update(dict(after_overlaps=_overlaps()))
     return data, report
