@@ -703,6 +703,9 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
     composition_report = None
     if LAYOUT_STYLE == 'curated' and os.environ.get('OPM_COMPOSE', 'on') != 'off' and not PREVIOUS_SKIP_PACK:
         import composition
+        # Stamp --previous pins onto the scene so compose freezes those islands in place.
+        if PREVIOUS_ANCHORS:
+            scene['anchors'] = {k: list(v) for k, v in PREVIOUS_ANCHORS.items()}
         scene, composition_report = composition.compose(model, scene, blocks, currency(model))
         if log:
             log('  composition: ' + str({k: v for k, v in composition_report.items() if k != 'moves'}))

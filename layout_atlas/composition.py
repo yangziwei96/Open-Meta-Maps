@@ -47,7 +47,6 @@ ARM_TARGET = 150.0
 POCKET_CELL_FRAC = 0.55
 POCKET_PAD_CELLS = 1
 
-
 def components(model, scene, cur):
     """Connected visual components: reaction ids -> dict(reactions, keys)."""
     parts = scene['participants']
@@ -149,6 +148,16 @@ def compose(model, scene, blocks, cur):
             if any(rid in rigid_rx for rid in c['reactions']):
                 main.append(i)
         report['same_map_rigid_reactions'] = len(rigid_rx)
+    # --previous pins: freeze islands whose reactions are all anchored so packing
+    # does not drag pinned modules apart.
+    pinned_rx = {k[2:] for k in (scene.get('anchors') or {}) if isinstance(k, str) and k.startswith('r:')}
+    if pinned_rx:
+        for i, c in enumerate(comps):
+            if i in main:
+                continue
+            if c['reactions'] and all(rid in pinned_rx for rid in c['reactions']):
+                main.append(i)
+        report['previous_pinned_reactions'] = len(pinned_rx)
     report['main'] = len(main)
     if not main:
         scene['composition'] = report
@@ -244,7 +253,28 @@ def compose(model, scene, blocks, cur):
         main_pts = np.array([placed_pts[k] for i in main for k in cur_keys_of[i] if k in placed_pts], float)
         lo, hi = main_pts.min(0), main_pts.max(0)
         W = max(float(hi[0] - lo[0]), ROW_WIDTH_MIN)
-        order = sorted(independent, key=lambda t: (_compartment(comps[t[0]], rx), -len(comps[t[0]]['reactions']), comps[t[0]]['reactions'][0]))
+        # Compartment groups stay together; within a compartment, Prim-order by
+        # non-currency island links so chemically related leftovers shelf adjacently.
+        link_w = island_link_weights(model, comps, cur)
+        by_comp = defaultdict(list)
+        for t in independent:
+            by_comp[_compartment(comps[t[0]], rx)].append(t)
+        order = []
+        for g in sorted(by_comp):
+            group = by_comp[g]
+            remaining = {t[0]: t for t in group}
+            seed = max(remaining, key=lambda i: (len(comps[i]['reactions']), comps[i]['reactions'][0]))
+            seq_ids = [seed]
+            del remaining[seed]
+            while remaining:
+                def _pick(i, seq=seq_ids):
+                    w = sum(link_w.get(_link_key(i, p), 0.0) for p in seq)
+                    return (w, len(comps[i]['reactions']), comps[i]['reactions'][0])
+                nxt = max(remaining, key=_pick)
+                seq_ids.append(nxt)
+                del remaining[nxt]
+            lookup = {t[0]: t for t in group}
+            order.extend(lookup[i] for i in seq_ids)
         boxes = []
         labels = scene.get('labels', {})
         try:
@@ -718,6 +748,11 @@ def reflow_landscape(model, scene, blocks, cur):
         for i, c in enumerate(comps):
             if i not in main and any(rid in rigid_rx for rid in c['reactions']):
                 main.append(i)
+    pinned_rx = {k[2:] for k in (scene.get('anchors') or {}) if isinstance(k, str) and k.startswith('r:')}
+    if pinned_rx:
+        for i, c in enumerate(comps):
+            if i not in main and c['reactions'] and all(rid in pinned_rx for rid in c['reactions']):
+                main.append(i)
     movable = [i for i in range(len(comps)) if i not in set(main)]
     if not main or not movable:
         report.update(aspect_after=round(aspect0, 3),
@@ -1142,7 +1177,12 @@ def _seg_hits_rect(x0, y0, x1, y1, rx, ry, rw, rh):
 
 
 def island_link_weights(model, comps, cur):
-    """Undirected weights between visual islands = shared non-currency metabolites."""
+    """Undirected weights between visual islands = shared non-currency metabolites.
+
+    Multi-edge island pairs accumulate one unit per shared metabolite, so a pair
+    joined by several lines outranks every single-bridge neighbour in Prim shelf
+    order and skyline link scoring.
+    """
     rx = {r['id']: r for r in model['reactions']}
     users = defaultdict(set)
     for i, c in enumerate(comps):
