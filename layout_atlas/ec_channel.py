@@ -563,7 +563,12 @@ class ECMapper(st.Mapper):
 
 
 def usable(proposal):
-    """EC proposals whose source module is mostly mapped; heavily unmapped modules carry little layout information."""
+    """EC proposals whose source module is mostly mapped; heavily unmapped modules carry little layout information.
+
+    Non-EC proposals have no ``unmapped_source_nodes`` field and are usable.
+    """
+    if 'unmapped_source_nodes' not in proposal:
+        return True
     n = max(1, proposal.get('source_node_count', 1))
     return len(proposal['unmapped_source_nodes']) / n <= CONFIG['max_unmapped_fraction']
 
@@ -571,15 +576,20 @@ def usable(proposal):
 def select_with_ec(strong_pool, ec_pools):
     """Strong-first selection.
 
-    1. `retrieval.select` over the existing strong pool, unchanged.
+    1. `retrieval.select` over complete (non-relaxed, non-partial) strong proposals.
     2. For each EC pool in order (expert-library EC first, unverified extensions last), select only among proposals
        that do not touch an already covered reaction, again with `retrieval.select`.
-    EC therefore fills gaps; it never displaces or overlaps a complete-equation or geometry selection.
+    EC fills gaps; it never displaces or overlaps a complete-equation or geometry selection.
     Returns (all selected, per-stage selected lists).
     """
     import copy
     import retrieval
-    stages = [retrieval.select(copy.deepcopy(strong_pool))]
+
+    def is_incomplete(p):
+        return p.get('match_level') == 'relaxed_equation' or bool(p.get('partial_match'))
+
+    full = [p for p in strong_pool if not is_incomplete(p)]
+    stages = [retrieval.select(copy.deepcopy(full if full else strong_pool))]
     covered = {r for p in stages[0] for r in p['reaction_ids']}
     for pool in ec_pools:
         free = [p for p in pool if usable(p) and not set(p['reaction_ids']) & covered]

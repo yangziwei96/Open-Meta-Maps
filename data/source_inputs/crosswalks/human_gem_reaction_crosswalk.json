@@ -1,7 +1,7 @@
 {
   "format_version": 1,
   "source": "Human-GEM model/reactions.tsv",
-  "source_url": "https://raw.githubusercontent.com/SysBioChalmers/Human-GEM/main/model/reactions.tsv",
+  "source_url": "https://raw.githubusercontent.com/SysBioChalmers/Human-GEM/v2.1.1/model/reactions.tsv",
   "license": "CC-BY-4.0",
   "license_uri": "https://creativecommons.org/licenses/by/4.0/",
   "tsv_sha256": "fc24110e552538a88a0c40fbdcae4be4adc00485824b0d6c8773a08a3420405e",

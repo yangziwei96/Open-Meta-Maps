@@ -25,6 +25,8 @@
 # Derived Mapper crosswalk (built from identifier_bridge + available models); do not track
 /data/annotation_bridge.json
 /data/annotation_bridge.json.gz
+# Built from Human-GEM-metabolites.tsv at runtime / canonical_ids.build_human_gem_metabolite_crosswalk
+/data/source_inputs/crosswalks/human_gem_metabolite_crosswalk.json
 /data/extensions/brenda/*
 !/data/extensions/brenda/SOURCE.json
 !/data/extensions/brenda/modules.json.gz

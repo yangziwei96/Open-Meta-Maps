@@ -17,6 +17,65 @@ def spelling(identifier):
     return re.sub(r'_{2,}', '_', identifier)
 
 
+
+def _mam_bridge_links():
+    """MAM → BiGG/ChEBI/MetaNetX from Human-GEM metabolites.tsv (registry licence).
+
+    Built on demand from the pinned TSV; the JSON is gitignored. Used for licence
+    checks and for callers that opt in — ``mapper_bridge`` does not merge these
+    links into BiGG matching (keeps e_coli_core / iIT341 layout parity with main).
+    """
+    import canonical_ids as cid
+    path = DATA / 'source_inputs/crosswalks/human_gem_metabolite_crosswalk.json'
+    tsv = DATA / 'source_inputs/crosswalks/Human-GEM-metabolites.tsv'
+    src = DATA / 'source_inputs/crosswalks/Human-GEM-metabolites.SOURCE.json'
+    if not path.exists() and tsv.exists():
+        cid.build_human_gem_metabolite_crosswalk(tsv_path=tsv, out_path=path)
+    if not path.exists():
+        return {}, dict(skipped=True, reason='missing_human_gem_metabolite_crosswalk')
+    payload = json.loads(path.read_text())
+    meta = dict(
+        license=payload.get('license') or '',
+        license_uri=payload.get('license_uri'),
+        source_url=payload.get('source_url'),
+        skipped=False,
+    )
+    if src.exists():
+        src_meta = json.loads(src.read_text())
+        for k in ('license', 'license_uri', 'url'):
+            if src_meta.get(k):
+                meta[k if k != 'url' else 'source_url'] = src_meta[k]
+    links = defaultdict(lambda: defaultdict(set))
+    for mam, row in (payload.get('metabolites') or {}).items():
+        refs = row.get('references') or {}
+        aliases = {spelling(chem(mam))}
+        aliases.update(spelling(b) for b in (refs.get('bigg.metabolite') or []))
+        for alias in aliases:
+            for ns in ('chebi', 'metanetx.chemical', 'bigg.metabolite'):
+                links[alias][ns].update(str(v) for v in (refs.get(ns) or []))
+    return {k: {ns: sorted(v) for ns, v in refs.items()} for k, refs in links.items()}, meta
+
+
+def _pick_assignment(assignments):
+    """Deterministic choice among ≤2 complete assignments: keep compartments, then direction.
+
+    Kept for tests and call-sites that resolve ambiguity explicitly. ``match_reaction``
+    still drops ambiguous equations (main behaviour) so drawn coverage stays gate-safe.
+    """
+    if not assignments:
+        return None
+    if len(assignments) == 1:
+        return assignments[0]
+    ranked = sorted(assignments, key=lambda a: (
+        0 if a.get('label_compartments_exact') else 1,
+        0 if a.get('direction') == 'same' else 1,
+        tuple(sorted((a.get('metabolites') or {}).items())),
+    ))
+    chosen = dict(ranked[0])
+    chosen['assignment_resolution'] = 'deterministic_prefer_compartments_then_direction'
+    chosen['alternate_assignments'] = len(assignments) - 1
+    return chosen
+
 def annotation_bridge(models):
     """Build a Mapper crosswalk from model annotations (legacy / enrichment path).
 

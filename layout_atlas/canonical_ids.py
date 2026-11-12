@@ -11,6 +11,7 @@ Rhea equation in ``data/rhea/``.
 from __future__ import annotations
 
 import csv
+import datetime
 import gzip
 import json
 import re
@@ -24,6 +25,9 @@ CROSSWALK_DIR = INPUTS / 'crosswalks'
 HUMAN_GEM_TSV = CROSSWALK_DIR / 'Human-GEM-reactions.tsv'
 HUMAN_GEM_JSON = CROSSWALK_DIR / 'human_gem_reaction_crosswalk.json'
 HUMAN_GEM_SOURCE = CROSSWALK_DIR / 'Human-GEM-reactions.SOURCE.json'
+HUMAN_GEM_MET_TSV = CROSSWALK_DIR / 'Human-GEM-metabolites.tsv'
+HUMAN_GEM_MET_JSON = CROSSWALK_DIR / 'human_gem_metabolite_crosswalk.json'
+HUMAN_GEM_MET_SOURCE = CROSSWALK_DIR / 'Human-GEM-metabolites.SOURCE.json'
 
 CANONICAL_NS = ('bigg.reaction', 'metanetx.reaction', 'rhea')
 NATIVE_NS = {
@@ -77,7 +81,7 @@ def build_human_gem_crosswalk(tsv_path=None, out_path=None):
     payload = dict(
         format_version=1,
         source='Human-GEM model/reactions.tsv',
-        source_url='https://raw.githubusercontent.com/SysBioChalmers/Human-GEM/main/model/reactions.tsv',
+        source_url='https://raw.githubusercontent.com/SysBioChalmers/Human-GEM/v2.1.1/model/reactions.tsv',
         license='CC-BY-4.0',
         license_uri='https://creativecommons.org/licenses/by/4.0/',
         tsv_sha256=sha(tsv_path.read_bytes()),
@@ -92,8 +96,65 @@ def build_human_gem_crosswalk(tsv_path=None, out_path=None):
         license_uri=payload['license_uri'],
         sha256=payload['tsv_sha256'],
         path=str(tsv_path.relative_to(DATA.parent)),
-        access_date=__import__('datetime').date.today().isoformat(),
+        access_date=datetime.date.today().isoformat(),
         note='Reaction identifier crosswalk used to attach BiGG/MetaNetX/Rhea to Human-maps MAR ids',
+    ))
+    return payload
+
+
+def build_human_gem_metabolite_crosswalk(tsv_path=None, out_path=None):
+    """Compile Human-GEM metabolites.tsv into a MAM → BiGG/ChEBI/MetaNetX JSON."""
+    from core import chem, comp
+
+    tsv_path = Path(tsv_path or HUMAN_GEM_MET_TSV)
+    out_path = Path(out_path or HUMAN_GEM_MET_JSON)
+    CROSSWALK_DIR.mkdir(parents=True, exist_ok=True)
+    table = {}
+    with tsv_path.open() as f:
+        for row in csv.DictReader(f, delimiter='\t'):
+            mam = (row.get('mets') or '').strip()
+            if not mam:
+                continue
+            refs = {}
+            bigg = [x.strip() for x in re.split(r'[;,]', row.get('metBiGGID') or '') if x.strip()]
+            chebi = []
+            for part in re.split(r'[;,]', row.get('metChEBIID') or ''):
+                part = part.strip()
+                if not part:
+                    continue
+                chebi.append(part.split(':')[-1])
+            mnx = [x.strip() for x in re.split(r'[;,]', row.get('metMetaNetXID') or '') if x.strip()]
+            seed = [x.strip() for x in re.split(r'[;,]', row.get('metSeedID') or '') if x.strip()]
+            if bigg:
+                refs['bigg.metabolite'] = sorted(set(bigg))
+            if chebi:
+                refs['chebi'] = sorted(set(chebi))
+            if mnx:
+                refs['metanetx.chemical'] = sorted(set(mnx))
+            if seed:
+                refs['seed.metabolite'] = sorted(set(seed))
+            base = (row.get('metsNoComp') or '').strip() or chem(mam)
+            table[mam] = dict(base=base, compartment=comp(mam), references=refs)
+    payload = dict(
+        format_version=1,
+        source='Human-GEM model/metabolites.tsv',
+        source_url='https://raw.githubusercontent.com/SysBioChalmers/Human-GEM/v2.1.1/model/metabolites.tsv',
+        license='CC-BY-4.0',
+        license_uri='https://creativecommons.org/licenses/by/4.0/',
+        tsv_sha256=sha(tsv_path.read_bytes()),
+        metabolites=table,
+    )
+    dump(out_path, payload)
+    dump(HUMAN_GEM_MET_SOURCE, dict(
+        source='Human-GEM',
+        file='model/metabolites.tsv',
+        url=payload['source_url'],
+        license=payload['license'],
+        license_uri=payload['license_uri'],
+        sha256=payload['tsv_sha256'],
+        path=str(tsv_path.relative_to(DATA.parent)),
+        access_date=datetime.date.today().isoformat(),
+        note='Metabolite identifier crosswalk (MAM → BiGG/ChEBI/MetaNetX); Human-GEM is CC BY 4.0',
     ))
     return payload
 

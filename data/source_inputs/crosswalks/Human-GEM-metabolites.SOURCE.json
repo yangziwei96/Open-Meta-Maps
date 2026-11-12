@@ -1,0 +1,11 @@
+{
+  "source": "Human-GEM",
+  "file": "model/metabolites.tsv",
+  "url": "https://raw.githubusercontent.com/SysBioChalmers/Human-GEM/v2.1.1/model/metabolites.tsv",
+  "license": "CC-BY-4.0",
+  "license_uri": "https://creativecommons.org/licenses/by/4.0/",
+  "sha256": "0b7509a37fe4e92bea3d1cbf2d0e7f87183ecf7bda81173770fa4a1a1ee32a96",
+  "path": "data/source_inputs/crosswalks/Human-GEM-metabolites.tsv",
+  "access_date": "2026-11-12",
+  "note": "Metabolite identifier crosswalk (MAM \u2192 BiGG/ChEBI/MetaNetX); Human-GEM is CC BY 4.0"
+}

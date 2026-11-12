@@ -36,8 +36,32 @@ def source_module_records():
 def source_modules(quality=None):return [r['observation'] for r in source_module_records() if quality is None or r['observation']['quality']==quality]
 def source_maps():
  with gzip.open(INPUTS/'map_observations.json.gz','rt') as f:return json.load(f)
-def chem(mid):return mid.split('@')[0] if '@' in mid else re.sub(r'_[a-z][0-9]?$','',mid)
-def comp(mid):return mid.split('@')[-1] if '@' in mid else (re.search(r'_([a-z][0-9]?)$',mid)[1] if re.search(r'_([a-z][0-9]?)$',mid) else 'unknown')
+# Namespace-aware metabolite id parsing (BiGG, Human-GEM MAM, ModelSEED, MetaNetX).
+_BIGG_COMP=re.compile(r'_([a-z][0-9]?)$')
+_SEED_COMP=re.compile(r'_(c\d+)$',re.I)          # ModelSEED cpdXXXX_c0
+_MAM_ID=re.compile(r'^(MAM\d+)([a-z])$',re.I)    # Human-GEM MAM00001c
+
+def chem(mid):
+ """Chemical identity of a metabolite id, stripping a namespace compartment suffix."""
+ if not isinstance(mid,str) or not mid:return mid
+ if '@' in mid:return mid.split('@',1)[0]
+ if _MAM_ID.match(mid):return _MAM_ID.match(mid).group(1)
+ if mid.lower().startswith('cpd') and _SEED_COMP.search(mid):return _SEED_COMP.sub('',mid)
+ return _BIGG_COMP.sub('',mid)
+
+def comp(mid):
+ """Compartment token of a metabolite id (BiGG _c, MAM…c, ModelSEED _c0, MetaNetX @MNXC)."""
+ if not isinstance(mid,str) or not mid:return 'unknown'
+ if '@' in mid:
+  tail=mid.split('@',1)[1];return tail or 'unknown'
+ m=_MAM_ID.match(mid)
+ if m:return m.group(2).lower()
+ if mid.lower().startswith('cpd'):
+  m=_SEED_COMP.search(mid)
+  if m:return m.group(1).lower()
+ m=_BIGG_COMP.search(mid)
+ return m.group(1) if m else 'unknown'
+
 def xrefs(annotations):
  out=defaultdict(set)
  for a in annotations:
@@ -45,6 +69,17 @@ def xrefs(annotations):
   u=a.get('uri','');m=re.search(r'/(chebi|bigg.metabolite|rhea|reactome|bigg.reaction|metanetx.chemical|metanetx.reaction)[/:](?:CHEBI[:_])?([^/?#]+)',u,re.I)
   if m:out[m[1].lower()].add(m[2])
  return {k:sorted(v) for k,v in out.items()}
+
+def reaction_kind(reaction, cur=None):
+ """Classify a GEM reaction as exchange, transport or metabolic."""
+ mets=list((reaction.get('metabolites') or {}))
+ if not mets:return 'metabolic'
+ noncur=[m for m in mets if cur is None or m not in cur]
+ comps={comp(m) for m in mets}
+ if len(mets)==1 and len(noncur)<=1:return 'exchange'
+ if len(comps)>1:return 'transport'
+ return 'metabolic'
+
 def currency(model):
  out=set();names={'water','h2o','proton','h+','atp','adp','amp','nad+','nadh','nadp+','nadph','coenzyme a','coa','phosphate','diphosphate'}
  for m in model['metabolites']:

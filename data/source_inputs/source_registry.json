@@ -435,11 +435,25 @@
       "sha256": "fc24110e552538a88a0c40fbdcae4be4adc00485824b0d6c8773a08a3420405e",
       "license": "CC-BY-4.0",
       "license_uri": "https://creativecommons.org/licenses/by/4.0/",
-      "url": "https://raw.githubusercontent.com/SysBioChalmers/Human-GEM/main/model/reactions.tsv",
+      "url": "https://raw.githubusercontent.com/SysBioChalmers/Human-GEM/v2.1.1/model/reactions.tsv",
       "version": "2026-11-11",
       "use": "crosswalk",
       "retrieval_date": "2026-11-11",
       "extraction_method": "canonical_ids.build_human_gem_crosswalk"
+    },
+    {
+      "source": "Human-GEM",
+      "id": "metabolites.tsv",
+      "format": "tsv",
+      "path": "data/source_inputs/crosswalks/Human-GEM-metabolites.tsv",
+      "sha256": "0b7509a37fe4e92bea3d1cbf2d0e7f87183ecf7bda81173770fa4a1a1ee32a96",
+      "license": "CC-BY-4.0",
+      "license_uri": "https://creativecommons.org/licenses/by/4.0/",
+      "url": "https://raw.githubusercontent.com/SysBioChalmers/Human-GEM/v2.1.1/model/metabolites.tsv",
+      "version": "2026-11-12",
+      "use": "crosswalk",
+      "retrieval_date": "2026-11-12",
+      "note": "Metabolite identifier crosswalk (MAM → BiGG/ChEBI/MetaNetX); Human-GEM is CC BY 4.0"
     },
     {
       "source": "reactome",

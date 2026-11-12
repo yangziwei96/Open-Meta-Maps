@@ -64,8 +64,9 @@ STEPS = [('parse', 'Parse the model'), ('map', 'Match library structures'),
          ('select', 'Select structures'), ('skeleton', 'Build the skeleton'),
          ('complete', 'Complete the map'), ('report', 'Write the report')]
 SOURCE_COLORS = {'escher': '#128781', 'reactome': '#3d6fa3', 'wikipathways': '#8a5fb0', 'brenda': '#b04a4a', 'human_maps': '#2d6a8f', 'metabolismregulation': '#6b4f2a', 'panther': '#8a6b3d', 'ich360': '#3d7a5a'}
-LEVEL_RANK = {'complete_equation': 0, 'reaction_reference': 1, 'partial_reference': 2, 'ec_topology': 3, 'geometry': 4}
-LEVEL_NAMES = {'complete_equation': 'complete_equation', 'reaction_reference': 'reference_supported', 'partial_reference': 'reference_supported',
+LEVEL_RANK = {'complete_equation': 0, 'relaxed_equation': 1, 'reaction_reference': 2, 'partial_reference': 3, 'ec_topology': 4, 'geometry': 5}
+LEVEL_NAMES = {'complete_equation': 'complete_equation', 'relaxed_equation': 'relaxed_equation',
+               'reaction_reference': 'reference_supported', 'partial_reference': 'reference_supported',
                'ec_topology': 'ec_topology', 'geometry': 'geometry_only'}
 
 
@@ -559,7 +560,7 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
         anchors, blocks, containers, routes = drawing.pack_modules(model, copy.deepcopy(selected), bridges, physical_scale=True)
     proposal_by_id = {p['id']: p for p in selected}
     for b in blocks:
-        p = proposal_by_id[b['id']]
+        p = proposal_by_id.get(b['id']) or {}
         for key in ('license', 'partition', 'mapping_evidence', 'source_glyph_mapping', 'label_compartments_verified', 'source_to_initial_frame',
                     'source_xy', 'source_path_policy', 'source_citation', 'view_clipping', 'source_sha256', 'original_instance',
                     'same_map_rigid', 'source_xy_absolute'):
@@ -1266,7 +1267,7 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
     metric['completion'] = metric_completion
     assert_chemistry(model, output_names.map_json(folder))
     assert uid(model) == original
-    used = {r for p in selected for r in p['reaction_ids']}
+    used = {r for b in blocks for r in b['reaction_ids']}
     bridge_ids = {r for b in bridges for r in b['reaction_ids']}
     allids = {r['id'] for r in model['reactions']}
     state = dict(schema=4, model=model['id'], target_model_hash=original, modules=blocks, bridges=bridges, containers=containers, anchors=scene['anchors'],
@@ -1281,7 +1282,9 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
     state['display_scope_reaction_ids'] = sorted(allids)
     state['full_target_model_hash'] = uid(full_model)
     dump(folder / 'skeleton.json', state)
-    dump(folder / 'metrics.json', metric)
+    metric['blocks'] = blocks
+    metric['drawn_curated_reactions'] = sorted(used)
+    dump(folder / 'metrics.json', {k: v for k, v in metric.items() if k != 'blocks'})
     return metric
 
 
@@ -1687,7 +1690,7 @@ def run_job(folder):
         if LAYOUT == 'global' and LIMITS['full_routed_max_reactions'] < len(allids) <= LIMITS['whole_map_max_reactions']:
             import global_layout as gl_pack
             try:
-                global_plan = gl_pack.plan_global(model, selected, bridges, g, log=job.log)  # the skeleton shows the same expert-block positions as the final global map
+                global_plan = gl_pack.plan_global(model, selected, bridges, g, log=job.log)
                 anchors, blocks, containers, macro = [copy.deepcopy(global_plan[k]) for k in ('anchors', 'blocks', 'containers', 'routes')]
                 expert_keys = {k for b in blocks for k in b['positions']}
                 anchors = {k: v for k, v in anchors.items() if k in expert_keys}
@@ -1695,11 +1698,14 @@ def run_job(folder):
                 global_plan = None
                 job.log(f'global plan failed ({type(e).__name__}: {str(e)[:120]}); the skeleton uses the ELK layout')
         if global_plan is None:
-            anchors, blocks, containers, macro = drawing.pack_modules(model, copy.deepcopy(selected), bridges, physical_scale=True)
+            anchors, blocks, containers, macro = drawing.pack_modules(
+                model, copy.deepcopy(selected), bridges, physical_scale=True)
         proposal_by_id = {p['id']: p for p in selected}
         for b in blocks:
-            p = proposal_by_id[b['id']]
-            for key in ('license', 'partition', 'mapping_evidence', 'source_citation', 'source_sha256', 'original_instance', 'layout_origin', 'counted_as_expert_design'):
+            p = proposal_by_id.get(b['id']) or {}
+            for key in ('license', 'partition', 'mapping_evidence', 'source_citation', 'source_sha256',
+                        'original_instance', 'layout_origin', 'counted_as_expert_design',
+                        'match_level', 'complete_chemical_equation_verified', 'features'):
                 if key in p:
                     b[key] = p[key]
         # Small-model ELK path: same-source fragments → one rigid group (global_plan already bakes).
@@ -1715,7 +1721,6 @@ def run_job(folder):
                             f"(x={pad.get('gaps_x', 0)}/−{pad.get('removed_x', 0)}px, "
                             f"y={pad.get('gaps_y', 0)}/−{pad.get('removed_y', 0)}px) "
                             f"max_gap={pad.get('max_gap')}")
-                # Rebuild anchors from rewritten block positions (bridges re-anchored below).
                 anchors = {}
                 met_acc = defaultdict(list)
                 for b in blocks:
@@ -1733,9 +1738,11 @@ def run_job(folder):
             for i, rid in enumerate(bridge['reaction_ids']):
                 anchors['r:' + rid] = (np.array(a) + (np.array(c) - a) * (i + 1) / (len(bridge['reaction_ids']) + 1)).tolist()
         bridge_ids = {r for b in bridges for r in b['reaction_ids']}
+        # Coverage / provenance count reactions drawn from curated block geometry.
+        used = {r for b in blocks for r in b['reaction_ids']}
         status = {rid: 'expert_module' if rid in used else 'algorithmic_bridge' if rid in bridge_ids else 'pending_algorithm' for rid in sorted(allids)}
         codes = module_codes(blocks)
-        provenance = epv.reaction_provenance(model, selected, bridge_ids, codes, templates=templates, mapper=mapper)
+        provenance = epv.reaction_provenance(model, blocks, bridge_ids, codes, templates=templates, mapper=mapper)
         evidence_summary = epv.evidence_summary(provenance)
         job.log('Evidence: ' + ', '.join(f'{k} {v}' for k, v in evidence_summary['chemical_compatibility'].items()) + f"; identity revoked {evidence_summary['identity_revoked']}")
         dump(folder / 'reaction_provenance.json', list(provenance.values()))
@@ -1835,16 +1842,43 @@ def run_job(folder):
             _write_map_exports(job, folder, model, upload)
         integrity = check_integrity(model, original, upload, output_names.map_json(folder) if (output_names.map_json(folder)).exists() else None)
         job.log('Integrity: ' + ', '.join(f"{k}={v['passed']}" for k, v in integrity.items()))
+        # Coverage counts only reactions that appear in placed curated blocks (drawn geometry).
         best = {}
-        for p in selected:
-            for r in p['reaction_ids']:
-                level = 'complete_equation' if p.get('complete_chemical_equation_verified') else p['match_level']
+        for b in blocks:
+            if b.get('from_expansion') and not b.get('complete_chemical_equation_verified') and (
+                    b.get('match_level') in ('geometry', 'partial_reference') or float((b.get('features') or [0, 0])[1]) < 1):
+                continue
+            for r in b.get('reaction_ids') or []:
+                level = 'complete_equation' if b.get('complete_chemical_equation_verified') else b.get('match_level') or 'geometry'
+                if level not in LEVEL_RANK:
+                    level = 'geometry'
                 if r not in best or LEVEL_RANK[level] < LEVEL_RANK[best[r]]:
                     best[r] = level
-        counts = Counter(LEVEL_NAMES[v] for v in best.values())
-        covered = dict(expert_module_reactions=len(used), complete_equation=counts['complete_equation'], reference_supported=counts['reference_supported'],
-                       ec_topology=counts['ec_topology'], geometry_only=counts['geometry_only'], bridge_reactions=len(bridge_ids),
-                       algorithm_completed=len(allids) - len(used) - len(bridge_ids), total=len(allids))
+        counts = Counter(LEVEL_NAMES.get(v, v) for v in best.values())
+        coverage_used = set(best)
+        cur_set = currency(model)
+        kind_of = {r['id']: reaction_kind(r, cur_set) for r in model['reactions']}
+        kind_totals = Counter(kind_of.values())
+        kind_curated = Counter(kind_of[rid] for rid in coverage_used if rid in kind_of)
+        covered = dict(expert_module_reactions=len(coverage_used),
+                       complete_equation=counts.get('complete_equation', 0),
+                       relaxed_equation=counts.get('relaxed_equation', 0),
+                       geometry_only=counts.get('geometry_only', 0),
+                       reference_supported=counts.get('reference_supported', 0),
+                       ec_topology=counts.get('ec_topology', 0),
+                       bridge_reactions=len(bridge_ids),
+                       algorithm_completed=len(allids) - len(coverage_used) - len(bridge_ids), total=len(allids),
+                       coverage_split=dict(
+                           complete_equation=counts.get('complete_equation', 0),
+                           relaxed_equation=counts.get('relaxed_equation', 0),
+                           geometry_only=counts.get('geometry_only', 0)),
+                       by_kind=dict(
+                           metabolic=dict(total=kind_totals['metabolic'], curated=kind_curated['metabolic'],
+                                          coverage=round(kind_curated['metabolic'] / kind_totals['metabolic'], 4) if kind_totals['metabolic'] else None),
+                           transport=dict(total=kind_totals['transport'], curated=kind_curated['transport'],
+                                          coverage=round(kind_curated['transport'] / kind_totals['transport'], 4) if kind_totals['transport'] else None),
+                           exchange=dict(total=kind_totals['exchange'], curated=kind_curated['exchange'],
+                                         coverage=round(kind_curated['exchange'] / kind_totals['exchange'], 4) if kind_totals['exchange'] else None)))
         modules = []
         codes = module_codes(blocks)
         for b in sorted(blocks, key=lambda b: (-len(b['reaction_ids']), b['id'])):
