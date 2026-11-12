@@ -10,8 +10,11 @@ as a whole-block translation.
 Evaluation is incremental: a spatial segment index is built once; each candidate
 only recounts segments of the touched reactions (delta counting).  Candidate
 generation is pruned to nodes/edges that participate in crossings inside the
-window.  The time budget scales with window crossing/edge mass, not a fixed
-model-specific constant.  Deterministic and model-agnostic.
+window.  Each visit tries that window's ranked candidates (regenerating
+after an accept); the first accepting window ends the round. Search stops
+when a full pass accepts nothing. Accept/round caps equal the window
+crossing mass; the try cap is (max_accepts+1)×initial candidates. Never
+wall-clock. Deterministic and model-agnostic.
 """
 from __future__ import annotations
 
@@ -26,16 +29,15 @@ import edge_style
 import layout_quality as lq
 from core import CURRENCY, chem
 
-DEFAULT_K = 3
-MAX_ROUNDS = 4
-MAX_ACCEPTS = 20
+DEFAULT_K = 5  # layout_quality.evaluate worst_regions count (tests / explicit k)
 WINDOW_PAD = 40.0
-# Budget scales with window mass: seconds ≈ α·crossings + β·edges, summed over top-k.
-BUDGET_CROSS = 0.05   # search-seconds per crossing in the top-k windows
-BUDGET_EDGE = 0.002   # search-seconds per edge touching those windows
-BUDGET_FLOOR = 0.8    # search floor (index build is timed separately)
-BUDGET_CAP = 30.0     # absolute search cap (mid GEMs need headroom past the old 12 s)
-TRIES_PER_CROSS = 4.0 # evaluation tries scale with window crossings
+# Pipeline leaves k=None: every positive-crossing window after evaluate-style
+# separation. Bounds from that window list (no wall-clock, no hand-picked floors):
+#   max_accepts = sum of those windows' crossings (each accept drops ≥1)
+#   max_rounds  = max_accepts + 1  (first-improvement rounds + idle)
+#   max_tries   = (max_accepts + 1) × initial candidate-list length
+#                 (one full candidate pass per round, including the idle round)
+# Per window visit: ranked candidates with regen after each accept.
 
 
 def _is_currency(bigg):
@@ -76,14 +78,14 @@ def _score(data, skip_edges, structures=None):
     )
 
 
-def _window_budget(windows, k=DEFAULT_K):
-    """Time/try budget from window size (crossings + edges), not a model id."""
-    wins = list(windows or [])[:k]
+def _window_mass(windows, k=None):
+    """Crossing/edge mass of the selected hotspot windows (reporting only)."""
+    wins = list(windows or [])
+    if k is not None:
+        wins = wins[:k]
     mass_c = sum(int(w.get('crossings') or 0) for w in wins)
     mass_e = sum(int(w.get('edges') or 0) for w in wins)
-    seconds = min(BUDGET_CAP, max(BUDGET_FLOOR, BUDGET_CROSS * mass_c + BUDGET_EDGE * mass_e))
-    tries = max(8, int(TRIES_PER_CROSS * max(mass_c, 1)))
-    return seconds, tries, dict(window_crossings=mass_c, window_edges=mass_e)
+    return dict(window_crossings=mass_c, window_edges=mass_e)
 
 
 def _spacing_from_nodes(nodes):
@@ -362,6 +364,7 @@ def _candidate_moves(data, scene, blocks, win, skip, expert, spacing, cross_rids
             moves.append(dict(kind='reroute', rid=rid, order=(2, rid)))
 
     # Small free-node nudges for crossing participants that are free.
+    # Stable sort; at most the first 12 free participants get 4-direction probes.
     free = []
     for nid in sorted(focus_nids):
         n = nodes.get(nid)
@@ -611,17 +614,24 @@ def diagnose_windows(data, skip_edges=None, k=DEFAULT_K):
                 main_metabolite=len(idx.events) - cur_n, windows=rows)
 
 
-def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K,
-           max_rounds=MAX_ROUNDS, max_accepts=MAX_ACCEPTS, budget_s=None, log=None,
+def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=None,
+           max_rounds=None, max_accepts=None, budget_evals=None, log=None,
            structures=None):
-    """Greedy local repair of the top-k crossing hotspots. Mutates ``data`` in place when accepting."""
+    """Greedy local repair of crossing hotspots. Mutates ``data`` when accepting.
+
+    ``k`` is the max number of separated positive-crossing windows (None = all).
+    Each window visit walks ranked candidates and regenerates after an accept;
+    the first accepting window ends the round. A full pass with no accept stops
+    search. Defaults: ``max_accepts`` = sum of crossings in those windows;
+    ``max_rounds`` = ``max_accepts + 1``; try cap =
+    ``(max_accepts + 1) × initial_candidates``. ``budget_evals`` overrides the
+    try cap for tests. Never wall-clock.
+    """
     t0 = time.time()
     skip = _skip_set(data, skip_edges)
     expert = _expert_reaction_ids(blocks, data)
     structures = structures or (data[0].get('metadata') or {}).get('expert_structures')
 
-    # Setup (not charged to the search budget): shared index + light metrics (no full evaluate).
-    # Use the same skip set as evaluate (preserved + source_paths), not the raw caller list.
     index = lq.CrossingIndex(data, skip)
     node_ov0, lab_ov0 = lq.overlap_counts(data)
     windows = _windows_from_index(index, k)
@@ -631,13 +641,29 @@ def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K
     from evaluation.continuity import structure_continuity as _structure_continuity
     cont = _structure_continuity(data, structures=structures)
     before = _metrics_from_index(index, windows, node_ov0, lab_ov0, cont, length_p90, spacing)
-    auto_budget, auto_tries, mass = _window_budget(windows, k)
-    if budget_s is None:
-        budget_s = auto_budget
-    # When the caller raises the time budget, scale tries so search is not try-capped first.
-    max_tries = auto_tries
-    if budget_s > auto_budget and auto_budget > 0:
-        max_tries = max(auto_tries, int(auto_tries * budget_s / auto_budget))
+    mass = _window_mass(windows, k)
+    # Caps from the windows we search: each accept removes ≥1 of that crossing mass.
+    if max_accepts is None:
+        max_accepts = max(1, int(mass['window_crossings'] or before['crossings'] or 1))
+    else:
+        max_accepts = int(max_accepts)
+    if max_rounds is None:
+        max_rounds = max_accepts + 1
+    else:
+        max_rounds = int(max_rounds)
+    n_cand = 0
+    for win in windows:
+        cross_rids, cross_nids = index.participants_in_window(win)
+        if not cross_rids:
+            cross_rids = set(win.get('reactions') or [])
+        n_cand += len(_candidate_moves(
+            data, scene, blocks, win, skip, expert, spacing, cross_rids, cross_nids))
+    mass = dict(mass, initial_candidates=n_cand)
+    # One candidate pass per round (including the idle round), no hand-picked factor.
+    if budget_evals is not None:
+        max_tries = int(budget_evals)
+    else:
+        max_tries = max(1, (max_accepts + 1) * max(n_cand, 1))
     setup_s = round(time.time() - t0, 2)
 
     report = dict(
@@ -645,9 +671,10 @@ def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K
             'crossings', 'top_window_crossings', 'worst_window', 'node_overlaps', 'label_overlaps',
             'continuity_share', 'split_structures', 'length_p90', 'currency_involved', 'main_metabolite')},
         accepted=[], rejected=0, tries=0, rounds=0, reject_reasons={},
-        budget_s=round(budget_s, 2), budget_mass=mass, setup_s=setup_s, diagnosis=[],
+        budget_evals=max_tries, budget_mass=mass, setup_s=setup_s, diagnosis=[],
+        max_rounds=max_rounds, max_accepts=max_accepts,
     )
-    for win in windows[:k]:
+    for win in windows:
         report['diagnosis'].append(index.window_breakdown(win) | dict(
             window=[win['x'], win['y']], listed_crossings=win.get('crossings'),
             reactions=win.get('reactions')))
@@ -656,36 +683,30 @@ def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K
     current_cross = index.headline()
     if log:
         log(f"  hotspot repair: start crossings={before['crossings']} worst_window={report['before']['worst_window']} "
-            f"search_budget={budget_s:.1f}s tries≤{max_tries} setup={setup_s}s spacing={spacing:.1f}")
+            f"search_budget=tries≤{max_tries} ((accepts+1)×candidates) / idle stop / "
+            f"rounds≤{max_rounds} accepts≤{max_accepts} setup={setup_s}s spacing={spacing:.1f}")
 
     t_search = time.time()
     for rnd in range(max_rounds):
-        if time.time() - t_search > budget_s or accepts >= max_accepts or report['tries'] >= max_tries:
+        if accepts >= max_accepts or report['tries'] >= max_tries:
             break
         report['rounds'] = rnd + 1
         if not windows or all(w.get('crossings', 0) <= 0 for w in windows):
             break
         progressed = False
         for win in windows:
-            if time.time() - t_search > budget_s or accepts >= max_accepts or report['tries'] >= max_tries:
+            if accepts >= max_accepts or report['tries'] >= max_tries:
                 break
             cross_rids, cross_nids = index.participants_in_window(win)
             if not cross_rids:
-                # Fall back to the window's listed reactions so we still try side flips.
                 cross_rids = set(win.get('reactions') or [])
             moves = _candidate_moves(data, scene, blocks, win, skip, expert, spacing, cross_rids, cross_nids)
-            win_share = max(1, int(win.get('crossings') or 1))
-            win_try_cap = max(6, int(max_tries * win_share / max(mass['window_crossings'], 1)))
-            tried_here = 0
             mi = 0
             while mi < len(moves):
-                if time.time() - t_search > budget_s or accepts >= max_accepts or report['tries'] >= max_tries:
-                    break
-                if tried_here >= win_try_cap:
+                if accepts >= max_accepts or report['tries'] >= max_tries:
                     break
                 move = moves[mi]
                 mi += 1
-                tried_here += 1
                 report['tries'] += 1
                 result = _apply_move_inplace(data, scene, blocks, move, skip, expert)
                 if result[0] is None:
@@ -705,7 +726,6 @@ def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K
                     report['rejected'] += 1
                     report['reject_reasons']['no_crossing_drop'] = report['reject_reasons'].get('no_crossing_drop', 0) + 1
                     continue
-                # Overlap check only for promising (crossing-reducing) moves.
                 n_ov, l_ov = lq.overlap_counts(data)
                 if n_ov > node_ov0 or l_ov > lab_ov0:
                     undo()
@@ -744,7 +764,6 @@ def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K
                     cross_rids = set(win.get('reactions') or [])
                 moves = _candidate_moves(data, scene, blocks, win, skip, expert, spacing, cross_rids, cross_nids)
                 mi = 0
-                tried_here = 0
             if progressed:
                 break
         if not progressed:
@@ -773,8 +792,12 @@ def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K
     return report
 
 
-def _windows_from_index(index, k):
-    """Rebuild top-k worst regions from the index events (same 400/200 boxes as evaluate)."""
+def _windows_from_index(index, k=None):
+    """Worst crossing windows from the index (same 400/200 boxes as evaluate).
+
+    When ``k`` is None, keep every positive-crossing cell that survives the
+    300 px separation filter (problem-sized window list).
+    """
     if not index.edges:
         return []
     centres = np.array([[n['x'], n['y']] for n in index.nodes.values()
@@ -805,6 +828,6 @@ def _windows_from_index(index, k):
         out.append(dict(x=round(wx, 1), y=round(wy, 1), w=int(lq.REGION_WINDOW), h=int(lq.REGION_WINDOW),
                         crossings=c['crossings'], edges=c['edges'],
                         reactions=sorted(c['reactions'])[:10]))
-        if len(out) == k:
+        if k is not None and len(out) == k:
             break
     return out

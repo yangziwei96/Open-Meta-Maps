@@ -51,7 +51,6 @@ CONTEXT = 'auto'  # 'auto' (reactions without non-currency participants share no
 INSTANCES = 'auto'  # 'auto' (V3: decide how many visual instances each metabolite gets) | 'off'
 LAYOUT = 'global'  # 'global' (one map for the whole model, <=3,000 reactions) | 'tiled' (50-reaction views tiled on a grid; also the automatic fallback)
 GLOBAL_FAILURE = ''
-GLOBAL_BUDGET_S = 1500
 COMPLETION = 'spaced'  # 'spaced' (free nodes keep a minimum distance) | 'classic' (drawing.complete only)
 REACTION_STYLE = 'line'  # 'line' (reactions are lines between metabolites, like the curated maps) | 'marker' (earlier style: a dot per reaction)
 PREVIOUS_ANCHORS = None  # optional pins from --previous map.json: {'r:id':[x,y], 'm:id':[x,y]}
@@ -966,9 +965,9 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                     log('  peripheral modules: skipped gate (n_rx=%d); ' % n_rx
                         + str({k: v for k, v in peripheral_report.items() if k not in ('details', 'gate_rows')}))
             else:
-                peri_budget, peri_max = 12.0, 2
+                peri_max = 2
                 data, gate = quality_gate.peripheral_pass(data, scene, props, skip_edges,
-                                                         budget_s=peri_budget, max_candidates=peri_max, log=log)
+                                                         max_candidates=peri_max, log=log)
                 for d in peripheral_report['details']:
                     row = next((r for r in gate['rows'] if r['exchange'] == d['exchange']), None)
                     if d['state'] == 'proposed' and row:
@@ -992,10 +991,8 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             dump(output_names.map_json(folder), data)
         if os.environ.get('OPM_EXPERT_SUBMODULE', 'branch') in ('on', 'branch') and not PREVIOUS_SKIP_PACK:   # on by default: constrained relocation of exchange + transport modules inside big curated blocks; OPM_EXPERT_SUBMODULE=off disables it
             import block_relocation
-            n_rx = len(model['reactions'])
-            sub_budget = 45.0 if n_rx < 200 else (60.0 if n_rx < 800 else 90.0)
             data, sub = block_relocation.relocate_sub(data, model, scene, blocks, currency(model), skip_edges,
-                                                     budget_s=sub_budget, log=log,
+                                                     log=log,
                                                      simple=os.environ.get('OPM_EXPERT_SUBMODULE', 'branch') != 'branch')
             metric['expert_submodule'] = sub
             data[0].setdefault('metadata', {})['regenerated_expert_edges'] = sub['regenerated_expert_edges']
@@ -1103,17 +1100,11 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                      reactions=list(b['reaction_ids']))
                 for b in blocks if len(b.get('reaction_ids') or []) >= 2]
             data[0].setdefault('metadata', {})['expert_structures'] = curated_structures_early
-            # After absolute rigid restore, more windows need search than the default
-            # mass-scaled budget covers (e_coli formate cluster alone was 15 crossings).
-            n_rx = len(model['reactions'])
-            # Corridor slides can add a few local spoke crossings; give small maps
-            # enough search to recover the pre-corridor counted-crossing floor.
-            hs_budget = 35.0 if n_rx < 200 else 45.0
-            hs_k = 10 if n_rx < 200 else 8
+            # All separated positive-crossing windows; accept/round caps from
+            # window crossing mass, try cap (accepts+1)×candidates, idle-pass stop.
             metric['hotspot_repair'] = hotspot_repair.repair(
                 data, model=model, scene=scene, blocks=blocks, skip_edges=skip_edges, log=log,
-                structures=curated_structures_early, k=hs_k, max_accepts=100, budget_s=hs_budget,
-                max_rounds=8)
+                structures=curated_structures_early)
             if log:
                 hr = metric['hotspot_repair']
                 log('  hotspot repair: ' + str({k: hr.get(k) for k in ('accepted_count', 'tries', 'rounds', 'seconds', 'improved')}))
@@ -1466,23 +1457,22 @@ def global_network_metrics(model, map_path):
 def draw_global_map(job, model, selected, folder, prov_kinds, n_reactions, plan=None):
     """One map for the whole model (scalable global steps, see global_layout).  Returns the map note, or None when the global layout failed
     (the caller then falls back to the tiled views; the failure is recorded and shown, never hidden)."""
-    import global_layout as gl
     global GLOBAL_FAILURE
     job.log(f'Large model ({n_reactions} reactions): global layout of the whole network')
     t0 = time.time()
     try:
-        with gl.deadline(GLOBAL_BUDGET_S):
-            metric = draw_map(model, selected, folder / 'full', full_model=model, scalable=True, log=job.log, plan=plan)
-            if (folder / 'full' / 'layout_issues.json').is_file():
-                (folder / 'layout_issues.json').write_bytes((folder / 'full' / 'layout_issues.json').read_bytes())
-            output_names.map_json(folder).write_bytes((folder / 'full' / 'map.json').read_bytes())
-            output_names.map_svg(folder).write_bytes((folder / 'full' / 'map.svg').read_bytes())
-            if REACTION_STYLE == 'line':
-                import line_render
-                line_render.render_file(output_names.map_json(folder), output_names.map_svg(folder), prov_kinds)
-            else:
-                (output_names.map_svg(folder)).write_text(epv.recolor_svg((output_names.map_svg(folder)).read_text(), prov_kinds))
-    except Exception as e:  # includes the time budget
+        # No wall-clock deadline: stages use deterministic iteration/eval budgets.
+        metric = draw_map(model, selected, folder / 'full', full_model=model, scalable=True, log=job.log, plan=plan)
+        if (folder / 'full' / 'layout_issues.json').is_file():
+            (folder / 'layout_issues.json').write_bytes((folder / 'full' / 'layout_issues.json').read_bytes())
+        output_names.map_json(folder).write_bytes((folder / 'full' / 'map.json').read_bytes())
+        output_names.map_svg(folder).write_bytes((folder / 'full' / 'map.svg').read_bytes())
+        if REACTION_STYLE == 'line':
+            import line_render
+            line_render.render_file(output_names.map_json(folder), output_names.map_svg(folder), prov_kinds)
+        else:
+            (output_names.map_svg(folder)).write_text(epv.recolor_svg((output_names.map_svg(folder)).read_text(), prov_kinds))
+    except Exception as e:
         GLOBAL_FAILURE = f'{type(e).__name__}: {str(e)[:200]}'
         job.warn('global_failed', f'The global layout failed ({GLOBAL_FAILURE}); the map is built from tiled views instead.')
         output_names.map_json(folder).unlink(missing_ok=True)

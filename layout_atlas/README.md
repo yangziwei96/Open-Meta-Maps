@@ -24,7 +24,7 @@ A run writes `OpenMetaMaps_<name>_result.json` (Escher), matching `.svg` / `.sbg
 | Context and anchors for unmatched reactions | `context.py`, `completion_context.py`, `instances.py` (metabolite instances and protected shared connections), `orientation.py` |
 | Whole-map composition | `composition.py` (recovers stray components, arranges independent modules in rows), `peripheral.py` (exchange and transport modules), `block_relocation.py` (moves curated blocks that sit far from the reactions they connect to) |
 | Connections and labels | `edge_style.py` (Bézier connections from curated templates, joint routing per reaction), `reaction_templates.py`, `label_placement.py`, `line_render.py`, `routing.py` (libavoid) |
-| Local repair | `hotspot_repair.py` (post-layout pass: top-k crossing windows via shared `CrossingIndex`, incremental delta recount + window-scaled search budget; default on) |
+| Local repair | `hotspot_repair.py` (post-layout pass: worst_regions windows via shared `CrossingIndex`, incremental delta recount; accept/round caps from window crossing mass, stop after an idle pass; default on) |
 | Quality | `layout_quality.py` (final-geometry for the quality gate: curve crossings, overlaps, …), `quality_gate.py` (accepts a change only if the final geometry is not worse), `evaluation/` (layout-benchmark metrics + the same final-geometry block; CLI `python3 project.py evaluate`) |
 | Pages | `ui.py`, `navigation.py`, `gallery*.py` (tool UI is the committed `results/tool/index.html`) |
 
