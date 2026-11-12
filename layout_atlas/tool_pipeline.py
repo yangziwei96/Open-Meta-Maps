@@ -1100,8 +1100,8 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                      reactions=list(b['reaction_ids']))
                 for b in blocks if len(b.get('reaction_ids') or []) >= 2]
             data[0].setdefault('metadata', {})['expert_structures'] = curated_structures_early
-            # All separated positive-crossing windows; accept/round caps from
-            # window crossing mass, try cap (accepts+1)×candidates, idle-pass stop.
+            # worst_regions windows (DEFAULT_K); accept/round caps from window
+            # crossing mass, try cap (accepts+1)×candidates, idle-pass stop.
             metric['hotspot_repair'] = hotspot_repair.repair(
                 data, model=model, scene=scene, blocks=blocks, skip_edges=skip_edges, log=log,
                 structures=curated_structures_early)

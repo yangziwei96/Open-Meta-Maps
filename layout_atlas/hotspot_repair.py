@@ -31,8 +31,8 @@ from core import CURRENCY, chem
 
 DEFAULT_K = 5  # layout_quality.evaluate worst_regions count (tests / explicit k)
 WINDOW_PAD = 40.0
-# Pipeline leaves k=None: every positive-crossing window after evaluate-style
-# separation. Bounds from that window list (no wall-clock, no hand-picked floors):
+# Default k=DEFAULT_K matches layout_quality.evaluate worst_regions. Bounds from
+# that window list (no wall-clock, no hand-picked try factor):
 #   max_accepts = sum of those windows' crossings (each accept drops ≥1)
 #   max_rounds  = max_accepts + 1  (first-improvement rounds + idle)
 #   max_tries   = (max_accepts + 1) × initial candidate-list length
@@ -614,12 +614,13 @@ def diagnose_windows(data, skip_edges=None, k=DEFAULT_K):
                 main_metabolite=len(idx.events) - cur_n, windows=rows)
 
 
-def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=None,
+def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K,
            max_rounds=None, max_accepts=None, budget_evals=None, log=None,
            structures=None):
     """Greedy local repair of crossing hotspots. Mutates ``data`` when accepting.
 
-    ``k`` is the max number of separated positive-crossing windows (None = all).
+    ``k`` is the max number of separated positive-crossing windows (same count as
+    ``layout_quality.evaluate`` worst_regions; default ``DEFAULT_K``).
     Each window visit walks ranked candidates and regenerates after an accept;
     the first accepting window ends the round. A full pass with no accept stops
     search. Defaults: ``max_accepts`` = sum of crossings in those windows;
