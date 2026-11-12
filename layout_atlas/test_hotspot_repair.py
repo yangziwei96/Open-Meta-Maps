@@ -152,7 +152,8 @@ def test_repair_derives_accept_and_round_caps_from_window_mass():
     assert report["max_accepts"] == max(1, int(mass["window_crossings"]))
     assert report["max_rounds"] == report["max_accepts"] + 1
     assert mass.get("initial_candidates", 0) >= 1
-    assert report["budget_evals"] == (report["max_accepts"] + 1) * mass["initial_candidates"]
+    assert mass.get("n_windows", 0) >= 1
+    assert report["budget_evals"] == mass["n_windows"] * mass["initial_candidates"]
 
 
 if __name__ == "__main__":

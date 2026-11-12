@@ -13,7 +13,7 @@ generation is pruned to nodes/edges that participate in crossings inside the
 window.  Each visit tries that window's ranked candidates (regenerating
 after an accept); the first accepting window ends the round. Search stops
 when a full pass accepts nothing. Accept/round caps equal the window
-crossing mass; the try cap is (max_accepts+1)×initial candidates. Never
+crossing mass; the try cap is n_windows×initial candidates. Never
 wall-clock. Deterministic and model-agnostic.
 """
 from __future__ import annotations
@@ -35,9 +35,10 @@ WINDOW_PAD = 40.0
 # that window list (no wall-clock, no hand-picked try factor):
 #   max_accepts = sum of those windows' crossings (each accept drops ≥1)
 #   max_rounds  = max_accepts + 1  (first-improvement rounds + idle)
-#   max_tries   = (max_accepts + 1) × initial candidate-list length
-#                 (one full candidate pass per round, including the idle round)
-# Per window visit: ranked candidates with regen after each accept.
+#   max_tries   = n_windows × initial candidate-list length
+#                 (one aggregate candidate pass per searched window)
+# Per window visit: ranked candidates with regen after each accept;
+# the first accepting window ends the round.
 
 
 def _is_currency(bigg):
@@ -625,7 +626,7 @@ def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K
     the first accepting window ends the round. A full pass with no accept stops
     search. Defaults: ``max_accepts`` = sum of crossings in those windows;
     ``max_rounds`` = ``max_accepts + 1``; try cap =
-    ``(max_accepts + 1) × initial_candidates``. ``budget_evals`` overrides the
+    ``n_windows × initial_candidates``. ``budget_evals`` overrides the
     try cap for tests. Never wall-clock.
     """
     t0 = time.time()
@@ -659,12 +660,13 @@ def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K
             cross_rids = set(win.get('reactions') or [])
         n_cand += len(_candidate_moves(
             data, scene, blocks, win, skip, expert, spacing, cross_rids, cross_nids))
-    mass = dict(mass, initial_candidates=n_cand)
-    # One candidate pass per round (including the idle round), no hand-picked factor.
+    n_win = max(len(windows), 1)
+    mass = dict(mass, initial_candidates=n_cand, n_windows=n_win)
+    # One aggregate candidate pass per searched window.
     if budget_evals is not None:
         max_tries = int(budget_evals)
     else:
-        max_tries = max(1, (max_accepts + 1) * max(n_cand, 1))
+        max_tries = max(1, n_win * max(n_cand, 1))
     setup_s = round(time.time() - t0, 2)
 
     report = dict(
@@ -684,7 +686,7 @@ def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K
     current_cross = index.headline()
     if log:
         log(f"  hotspot repair: start crossings={before['crossings']} worst_window={report['before']['worst_window']} "
-            f"search_budget=tries≤{max_tries} ((accepts+1)×candidates) / idle stop / "
+            f"search_budget=tries≤{max_tries} (windows×candidates) / idle stop / "
             f"rounds≤{max_rounds} accepts≤{max_accepts} setup={setup_s}s spacing={spacing:.1f}")
 
     t_search = time.time()
