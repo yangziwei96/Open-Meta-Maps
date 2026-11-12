@@ -158,13 +158,11 @@ def translate_module(data, scene, keys, delta, reactions, skip_edges):
     return d2, redo, moved_nodes
 
 
-def peripheral_pass(data, scene, proposals, skip_edges, budget_s=150.0, max_candidates=24, log=None,
-                    max_evals=None):
+def peripheral_pass(data, scene, proposals, skip_edges, max_candidates=24, log=None, max_evals=None):
     """Try each proposed module move on a copy of the map, keep it only when `accept` says the final geometry is not worse.  Returns (data, report).
 
     Stops on a deterministic evaluation budget (full ``evaluate_map`` calls on candidates),
-    never on wall-clock.  ``budget_s`` is retained for call-site compatibility and ignored;
-    on unloaded machines the former 12 s / 2-candidate e_coli_core path never hit the clock.
+    never on wall-clock.
     """
     import edge_style
     t0 = time.time()

@@ -963,9 +963,9 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                     log('  peripheral modules: skipped gate (n_rx=%d); ' % n_rx
                         + str({k: v for k, v in peripheral_report.items() if k not in ('details', 'gate_rows')}))
             else:
-                peri_budget, peri_max = 12.0, 2
+                peri_max = 2
                 data, gate = quality_gate.peripheral_pass(data, scene, props, skip_edges,
-                                                         budget_s=peri_budget, max_candidates=peri_max, log=log)
+                                                         max_candidates=peri_max, log=log)
                 for d in peripheral_report['details']:
                     row = next((r for r in gate['rows'] if r['exchange'] == d['exchange']), None)
                     if d['state'] == 'proposed' and row:
@@ -989,10 +989,8 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             dump(folder / 'map.json', data)
         if os.environ.get('OPM_EXPERT_SUBMODULE', 'branch') in ('on', 'branch') and not PREVIOUS_SKIP_PACK:   # on by default: constrained relocation of exchange + transport modules inside big curated blocks; OPM_EXPERT_SUBMODULE=off disables it
             import block_relocation
-            n_rx = len(model['reactions'])
-            sub_budget = 45.0 if n_rx < 200 else (60.0 if n_rx < 800 else 90.0)
             data, sub = block_relocation.relocate_sub(data, model, scene, blocks, currency(model), skip_edges,
-                                                     budget_s=sub_budget, log=log,
+                                                     log=log,
                                                      simple=os.environ.get('OPM_EXPERT_SUBMODULE', 'branch') != 'branch')
             metric['expert_submodule'] = sub
             data[0].setdefault('metadata', {})['regenerated_expert_edges'] = sub['regenerated_expert_edges']
@@ -1105,11 +1103,13 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             n_rx = len(model['reactions'])
             # Corridor slides can add a few local spoke crossings; give small maps
             # enough search to recover the pre-corridor counted-crossing floor.
-            hs_budget = 35.0 if n_rx < 200 else 45.0
+            # Evaluation caps calibrated from the former 35 s / 45 s wall clocks.
+            hs_evals = (hotspot_repair.PIPELINE_EVALS_SMALL if n_rx < 200
+                        else hotspot_repair.PIPELINE_EVALS_LARGE)
             hs_k = 10 if n_rx < 200 else 8
             metric['hotspot_repair'] = hotspot_repair.repair(
                 data, model=model, scene=scene, blocks=blocks, skip_edges=skip_edges, log=log,
-                structures=curated_structures_early, k=hs_k, max_accepts=100, budget_s=hs_budget,
+                structures=curated_structures_early, k=hs_k, max_accepts=100, budget_evals=hs_evals,
                 max_rounds=8)
             if log:
                 hr = metric['hotspot_repair']

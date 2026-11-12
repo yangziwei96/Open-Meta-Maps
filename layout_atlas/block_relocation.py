@@ -192,13 +192,11 @@ def _diagnose(data, scene, unit, delta, old_issues, new_issues, radius=400.0):
     return dict(new_near_module=near, new_elsewhere=far, reactions=sorted(x for x in names if x)[:8])
 
 
-def relocate(data, model, scene, blocks, cur, skip_edges, budget_s=150.0, max_units=20, log=None,
-             max_unit_evals=None):
+def relocate(data, model, scene, blocks, cur, skip_edges, max_units=20, log=None, max_unit_evals=None):
     """Try the relocation candidates of every unit on copies of the final map; keep what the unified gate accepts.  -> (data, report).
 
-    Stops on a deterministic unit/evaluation budget, never on wall-clock.  ``budget_s`` is
-    retained for call-site compatibility and ignored; each unit still tries at most two
-    ranked candidates (and the joint-pair pass keeps its fixed pair/candidate caps).
+    Stops on a deterministic unit/evaluation budget, never on wall-clock.  Each unit tries at
+    most two ranked candidates; the joint-pair pass keeps its fixed pair/candidate caps.
     """
     import edge_style
     import quality_gate as qg
@@ -577,7 +575,7 @@ def _whole_block_unit(model, scene, block, cur, long_hint, spacing):
                 block_size=len(inside), cross=[], whole_block=True)
 
 
-def relocate_sub(data, model, scene, blocks, cur, skip_edges, budget_s=150.0, max_units=12, log=None, simple=True,
+def relocate_sub(data, model, scene, blocks, cur, skip_edges, max_units=12, log=None, simple=True,
                  max_unit_evals=None):
     """Relocate whole curated blocks triggered by a long exchange+transport submodule.
 
@@ -585,9 +583,7 @@ def relocate_sub(data, model, scene, blocks, cur, skip_edges, budget_s=150.0, ma
     large expert block), but the move always translates the **entire** block.  Pulling only
     EX_mal/MALt2_2 (or EX_fum/FUMt2_2) out of the curated structure is forbidden.
 
-    Stops on unit / per-unit try caps only (never wall-clock).  ``budget_s`` is retained for
-    call-site compatibility and ignored; e_coli_core / iIT341 had zero submodule units under
-    the former time budget, so the calibrated work caps match that behaviour.
+    Stops on unit / per-unit try caps only (never wall-clock).
     """
     import edge_style
     import quality_gate as qg

@@ -115,7 +115,7 @@ def test_repair_fast_and_no_overlap_regression():
     data = _crossing_map()
     before = hr._score(data, [])
     t0 = time.time()
-    report = hr.repair(data, skip_edges=[], k=3, max_rounds=2, max_accepts=8, budget_s=5)
+    report = hr.repair(data, skip_edges=[], k=3, max_rounds=2, max_accepts=8, budget_evals=200)
     elapsed = time.time() - t0
     after = hr._score(data, [])
     assert after["node_overlaps"] <= before["node_overlaps"]
@@ -130,7 +130,7 @@ def test_repair_can_reduce_crossings_on_fixable_hotspot():
     before = hr._score(before_data, [])
     assert before["crossings"] >= 1
     live = _dense_fixable()
-    report = hr.repair(live, skip_edges=[], k=3, max_rounds=3, max_accepts=12, budget_s=5)
+    report = hr.repair(live, skip_edges=[], k=3, max_rounds=3, max_accepts=12, budget_evals=200)
     after = hr._score(live, [])
     assert after["crossings"] <= before["crossings"]
     assert after["node_overlaps"] <= before["node_overlaps"]
