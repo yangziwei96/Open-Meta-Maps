@@ -694,7 +694,7 @@ def plan_global(model, selected, bridges, g, log=None):
                 f"(x={pad.get('gaps_x', 0)}/−{pad.get('removed_x', 0)}px, "
                 f"y={pad.get('gaps_y', 0)}/−{pad.get('removed_y', 0)}px) "
                 f"max_gap={pad.get('max_gap')}")
-    lap('expert blocks (ELK)')
+    lap('curated blocks (ELK)')
     reactions = {r['id']: r for r in model['reactions']}
     groups, stats = reaction_communities(model, g, blocks, cur)
     lap('communities of uncovered reactions')
