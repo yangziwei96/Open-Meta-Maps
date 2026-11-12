@@ -46,7 +46,7 @@ EDGE_ROUTING = 'libavoid'  # 'libavoid' (orthogonal, all edges) | 'hybrid' (rout
 #   - layout_style='legacy' with > ROUTING_THRESHOLD reactions: Routing is deferred (edge_routing.measure only).
 # For scalable=True (large models), straight connections are used initially; edge_style is applied separately.
 ROUTING_THRESHOLD = 500  # reactions; above this, routing is deferred for legacy style
-CONTEXT = 'auto'  # 'auto' (reactions without non-currency participants share nodes and sit next to related reactions) | 'off'
+CONTEXT = 'auto'  # 'auto' (cluster currency-only de-novo reactions; late hub split keeps per-reaction clones when LB allows) | 'off'
 INSTANCES = 'auto'  # 'auto' (V3: decide how many visual instances each metabolite gets) | 'off'
 LAYOUT = 'global'  # 'global' (one map for the whole model, <=3,000 reactions) | 'tiled' (50-reaction views tiled on a grid; also the automatic fallback)
 GLOBAL_FAILURE = ''
@@ -1134,6 +1134,39 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             if log:
                 log(f"  label placement (final): {metric['label_placement_final']}")
             dump(folder / 'map.json', data)
+        # Late per-reaction currency clones for PLS-style hubs (accept if no LB regression).
+        if os.environ.get('OPM_SPLIT_COFACTOR_HUBS', 'on') != 'off' and not PREVIOUS_SKIP_PACK:
+            import split_cofactor_hubs as _sch
+            from pathlib import Path as _Path
+            pathway = None
+            try:
+                from layout_benchmark.graph import read_sbml
+                candidates = []
+                upload = next(iter(sorted((folder / 'upload').glob('model.*'))), None)
+                if upload is not None:
+                    candidates.append(upload)
+                # CLI compose may also keep the source gem beside the job; try common example path.
+                mid = model.get('id') or ''
+                if mid:
+                    candidates.append(BASE.parent / 'examples' / f'{mid}.xml')
+                for cand in candidates:
+                    if cand is not None and _Path(cand).exists() and str(cand).endswith('.xml'):
+                        pathway = read_sbml(str(cand))
+                        break
+            except Exception as exc:
+                if log:
+                    log(f"  cofactor hub split: scorer unavailable ({exc})")
+                pathway = None
+            curated_rids = {rid for b in blocks for rid in b.get('reaction_ids') or []}
+            if log and pathway is None:
+                log('  cofactor hub split: skipped (no pathway for layout-benchmark gate)')
+            data, hub_report = _sch.apply_gated(
+                data, model, pathway=pathway, curated=curated_rids, log=log)
+            metric['cofactor_hub_split'] = hub_report
+            dump(folder / 'map.json', data)
+            dump(folder / 'cofactor_hub_split.json', {
+                k: v for k, v in hub_report.items() if k not in ('before', 'after')
+            })
     elif not scalable and len(model['reactions']) <= 400:
         import edge_routing
         er = dict(mode=EDGE_ROUTING, before=edge_routing.measure(data, skip_edges))
@@ -1484,7 +1517,7 @@ def draw_global_map(job, model, selected, folder, prov_kinds, n_reactions, plan=
     job.save()
     return dict(kind='global_degraded', requested_layout='global', degraded=['routing: none (straight connections)'], seconds=round(time.time() - t0, 1), network=network,
                 metrics={k: metric.get(k) for k in ('node_overlap_pairs', 'label_overlap_pairs', 'straight_crossings')}, source_paths=metric.get('source_paths'),
-                instances=metric.get('instances'), global_layout=metric.get('global'), completion=metric.get('completion'), expert_geometry=metric.get('expert_geometry'), instance_optimization=metric.get('instance_optimization'), context_placement=metric.get('context_placement'), completion_context=metric.get('completion_context'), layout_quality_final=metric.get('layout_quality_final'), edge_style=metric.get('edge_style'), peripheral=metric.get('peripheral'), block_relocation=metric.get('block_relocation'), region_placement=metric.get('region_placement'), regions=metric.get('regions'), expert_submodule=metric.get('expert_submodule'), label_placement=metric.get('label_placement'), hotspot_repair=metric.get('hotspot_repair'), protected=metric.get('protected'), node_overlap_kinds=metric.get('node_overlap_kinds'), edge_routing=metric.get('edge_routing'))
+                instances=metric.get('instances'), global_layout=metric.get('global'), completion=metric.get('completion'), expert_geometry=metric.get('expert_geometry'), instance_optimization=metric.get('instance_optimization'), context_placement=metric.get('context_placement'), completion_context=metric.get('completion_context'), layout_quality_final=metric.get('layout_quality_final'), edge_style=metric.get('edge_style'), peripheral=metric.get('peripheral'), block_relocation=metric.get('block_relocation'), region_placement=metric.get('region_placement'), regions=metric.get('regions'), expert_submodule=metric.get('expert_submodule'), label_placement=metric.get('label_placement'), hotspot_repair=metric.get('hotspot_repair'), cofactor_hub_split=metric.get('cofactor_hub_split'), protected=metric.get('protected'), node_overlap_kinds=metric.get('node_overlap_kinds'), edge_routing=metric.get('edge_routing'))
 
 
 def run_job(folder):
@@ -1764,7 +1797,7 @@ def run_job(folder):
             else:
                 (folder / 'map.svg').write_text(epv.recolor_svg((folder / 'map.svg').read_text(), prov_kinds))
             map_note = dict(kind='routed_full', routing=(metric.get('routing') or {}).get('status'), routing_attempts=metric.get('routing_attempts'),
-                            metrics={k: metric.get(k) for k in ('node_overlap_pairs', 'label_overlap_pairs', 'straight_crossings')}, source_paths=metric.get('source_paths'), expert_geometry=metric.get('expert_geometry'), instance_optimization=metric.get('instance_optimization'), context_placement=metric.get('context_placement'), completion_context=metric.get('completion_context'), layout_quality_final=metric.get('layout_quality_final'), edge_style=metric.get('edge_style'), peripheral=metric.get('peripheral'), block_relocation=metric.get('block_relocation'), region_placement=metric.get('region_placement'), regions=metric.get('regions'), expert_submodule=metric.get('expert_submodule'), label_placement=metric.get('label_placement'), hotspot_repair=metric.get('hotspot_repair'), protected=metric.get('protected'), node_overlap_kinds=metric.get('node_overlap_kinds'), edge_routing=metric.get('edge_routing'))
+                            metrics={k: metric.get(k) for k in ('node_overlap_pairs', 'label_overlap_pairs', 'straight_crossings')}, source_paths=metric.get('source_paths'), expert_geometry=metric.get('expert_geometry'), instance_optimization=metric.get('instance_optimization'), context_placement=metric.get('context_placement'), completion_context=metric.get('completion_context'), layout_quality_final=metric.get('layout_quality_final'), edge_style=metric.get('edge_style'), peripheral=metric.get('peripheral'), block_relocation=metric.get('block_relocation'), region_placement=metric.get('region_placement'), regions=metric.get('regions'), expert_submodule=metric.get('expert_submodule'), label_placement=metric.get('label_placement'), hotspot_repair=metric.get('hotspot_repair'), cofactor_hub_split=metric.get('cofactor_hub_split'), protected=metric.get('protected'), node_overlap_kinds=metric.get('node_overlap_kinds'), edge_routing=metric.get('edge_routing'))
         elif len(allids) <= LIMITS['whole_map_max_reactions']:
             global_note = None
             if LAYOUT == 'global':

@@ -96,6 +96,12 @@ def tool_environment():
         env['PATH'] = str(node_dir) + os.pathsep + env.get('PATH', '')
     env['PYTHONHASHSEED'] = '0'
     env['PYTHONDONTWRITEBYTECODE'] = '1'
+    # Prefer an editable layout-benchmark checkout when present (hub-split gate).
+    lb = Path('/tmp/layout-benchmark/src')
+    if lb.is_dir():
+        prev = env.get('PYTHONPATH', '')
+        parts = [str(lb)] + ([prev] if prev else [])
+        env['PYTHONPATH'] = os.pathsep.join(parts)
     return env
 
 

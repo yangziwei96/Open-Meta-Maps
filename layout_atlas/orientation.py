@@ -29,6 +29,7 @@ import math
 import numpy as np
 
 from core import currency
+import main_pair as main_pair_module
 
 SIDE_K = 0.27
 SIDE_MIN = 32.0
@@ -42,7 +43,7 @@ SIDE_P10_A = 20.0
 SIDE_P10_B = 0.324
 
 
-def _expert_reactions(blocks):
+def _curated_reactions(blocks):
     return {rid for b in blocks for rid in b['reaction_ids']}
 
 
@@ -189,13 +190,18 @@ def place_side_glyphs(model, positions, participants, cur, params=None, fixed_di
 
 
 def free_reactions(model, scene, blocks, blend=1.0, max_shift=600.0):
-    """Move every reaction outside the expert structures to the point between its (non-currency) substrates and products."""
+    """Move de-novo reactions between their non-currency substrates and products.
+
+    Records ``orientation_main_pairs`` for reporting. Curated midmarkers never move.
+    """
     cur = currency(model)
-    expert = _expert_reactions(blocks)
+    curated = _curated_reactions(blocks)
     scene = dict(scene, positions={k: list(v) for k, v in scene['positions'].items()})
     positions, moved = scene['positions'], 0
+    pairs = main_pair_module.choose_all(model, scene, cur)
+    scene['orientation_main_pairs'] = {rid: list(pair) for rid, pair in pairs.items() if rid not in curated}
     for r in model['reactions']:
-        if r['id'] in expert:
+        if r['id'] in curated:
             continue
         subs, prods = _split(r, scene['participants'], positions, cur)
         if not subs or not prods:
@@ -214,12 +220,17 @@ def free_reactions(model, scene, blocks, blend=1.0, max_shift=600.0):
 
 
 def sides(model, scene, blocks, distance=None, spread=None):
-    """Currency substrates on the substrate side, currency products on the product side (`side:` glyphs only; they are not expert geometry).
+    """Currency substrates on the substrate side, currency products on the product side (`side:` glyphs only).
 
     Spoke length defaults to adaptive local clearance. Passing ``distance``/``spread`` keeps a fixed offset (tests / ablations).
     """
     cur = currency(model)
+    curated = _curated_reactions(blocks)
     scene = dict(scene, positions={k: list(v) for k, v in scene['positions'].items()})
+    if scene.get('orientation_main_pairs') is None:
+        scene['orientation_main_pairs'] = {
+            rid: list(pair) for rid, pair in main_pair_module.choose_all(model, scene, cur).items() if rid not in curated
+        }
     moved, params = place_side_glyphs(model, scene['positions'], scene['participants'], cur,
                                       fixed_distance=distance, fixed_spread=spread)
     scene['orientation_sides_moved'] = moved
@@ -234,7 +245,7 @@ def separate_free_reactions(model, scene, blocks, reaction_gap=95.0, other_gap=4
     """After moving reactions between their substrates and products: keep reactions that no structure placed from landing on each other
     (reaction labels are 60-80 px wide) or on glyphs they are not connected to.  Only these reactions move; structures and glyphs stay."""
     from scipy.spatial import cKDTree
-    expert = _expert_reactions(blocks)
+    curated = _curated_reactions(blocks)
     scene = dict(scene, positions={k: list(v) for k, v in scene['positions'].items()})
     positions = scene['positions']
     keys = sorted(positions)
@@ -242,7 +253,7 @@ def separate_free_reactions(model, scene, blocks, reaction_gap=95.0, other_gap=4
     xy = np.array([positions[k] for k in keys], float)
     movable = np.zeros(len(keys), bool)
     for r in model['reactions']:
-        if r['id'] not in expert:
+        if r['id'] not in curated:
             movable[index['r:' + r['id']]] = True
     is_reaction = np.array([k.startswith('r:') for k in keys])
     linked = {}
@@ -310,7 +321,7 @@ def straighten_chains(model, scene, blocks, max_shift=140.0, min_turn_deg=25.0, 
     """
     from collections import defaultdict
     cur = currency(model)
-    expert = _expert_reactions(blocks)
+    curated = _curated_reactions(blocks)
     scene = dict(scene, positions={k: list(v) for k, v in scene['positions'].items()})
     pos, parts = scene['positions'], scene['participants']
     holders = defaultdict(set)
@@ -339,7 +350,7 @@ def straighten_chains(model, scene, blocks, max_shift=140.0, min_turn_deg=25.0, 
 
     moved = 0
     for key, rid0, rid1 in chains:
-        mov0, mov1 = rid0 not in expert, rid1 not in expert
+        mov0, mov1 = rid0 not in curated, rid1 not in curated
         if not (mov0 or mov1):
             continue
         met = np.array(pos[key], float)
