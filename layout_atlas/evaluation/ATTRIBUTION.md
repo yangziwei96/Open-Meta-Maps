@@ -28,12 +28,13 @@ CC BY 4.0). MetaCarto code is not copied; see `docs/layout_evaluation.md`.
 
 - **shapely** — used by `evaluation/metrics.py` for pathway box-overlap and
   compartment metrics when installed; without it those fields are `None`.
-  `official_metrics.py` also uses shapely's `Point.buffer(..., quad_segs=16)`
-  when installed (same definition as layout-benchmark); a pure 64-gon fallback
-  matches those areas when shapely is absent.
+  `official_metrics.py` uses shapely's `Point.buffer(..., quad_segs=16)` when
+  installed (same definition as layout-benchmark); without shapely it uses
+  exact disk intersection (analytic).
 - **gdMetriX** (GPL-3.0) — imported by `evaluation/metrics.py` `general_metrics`
   when installed; without it general graph-drawing fields are `None`. Official
   Escher figures in `official_metrics.py` do not import gdMetriX.
 
 Installing layout-benchmark separately also enables the optional external scorer
-in `evaluation.score_map`.
+in `evaluation.score_map` (via `layout_benchmark.graph.read_sbml`,
+`layout_benchmark.external.escher_drawing`, and `layout_benchmark.metrics.all_metrics`).

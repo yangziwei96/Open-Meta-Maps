@@ -6,9 +6,9 @@ and from Purchase's graph-drawing measures. This file is an independent
 implementation: no functions are copied from layout-benchmark or gdMetriX
 (GPL-3.0 is never vendored).
 
-Overlaps use the same 64-gon circle buffers as layout-benchmark
-(``Point.buffer(r, quad_segs=16)``). Angular resolution follows gdMetriX's
-Purchase measure on y-up stub directions.
+Overlaps use shapely ``Point.buffer(r, quad_segs=16)`` when shapely is
+installed (layout-benchmark definition); otherwise exact disk intersection.
+Angular resolution follows gdMetriX's Purchase measure on y-up stub directions.
 
 Used by the quality gate, the Layout quality panel, and ``evaluation.score``.
 Optional cross-checks against an installed ``layout_benchmark`` package live
@@ -315,7 +315,8 @@ def _label_boxes(data) -> list[dict[str, Any]]:
     return boxes
 
 
-# layout-benchmark overlaps use shapely ``Point.buffer(r, quad_segs=16)`` (64-gon).
+# layout-benchmark overlaps use shapely ``Point.buffer(r, quad_segs=16)`` when
+# shapely is installed. Without it, use exact circle–circle area (analytic).
 _BUFFER_QUAD_SEGS = 16
 
 try:
@@ -323,80 +324,24 @@ try:
     from shapely.geometry import Point as _ShapelyPoint
 
     _HAS_SHAPELY_BUFFER = True
-except ImportError:  # pragma: no cover - optional; pure 64-gon fallback below
+except ImportError:  # pragma: no cover - optional
     _HAS_SHAPELY_BUFFER = False
 
 
-def _circle_buffer_poly(x: float, y: float, r: float, quad_segs: int = _BUFFER_QUAD_SEGS) -> np.ndarray:
-    """Regular ``4 * quad_segs``-gon matching shapely ``Point.buffer`` area (CCW)."""
-    n = 4 * int(quad_segs)
-    angs = np.linspace(0.0, 2.0 * math.pi, n, endpoint=False)
-    return np.column_stack([x + r * np.cos(angs), y + r * np.sin(angs)])
-
-
-def _poly_area(poly: np.ndarray) -> float:
-    if len(poly) < 3:
+def _circle_intersection_area(r1: float, r2: float, d: float) -> float:
+    """Exact intersection area of two disks (0 when they only touch)."""
+    if d >= r1 + r2 or r1 <= 0.0 or r2 <= 0.0:
         return 0.0
-    x, y = poly[:, 0], poly[:, 1]
-    return 0.5 * float(np.abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
-
-
-def _convex_clip(subject: np.ndarray, clip: np.ndarray) -> np.ndarray:
-    """Sutherland–Hodgman clip of convex subject by convex clip (CCW, inside left)."""
-
-    def inside(p, a, b) -> bool:
-        return (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]) >= -1e-12
-
-    def intersect(p1, p2, a, b) -> np.ndarray:
-        x1, y1 = float(p1[0]), float(p1[1])
-        x2, y2 = float(p2[0]), float(p2[1])
-        x3, y3 = float(a[0]), float(a[1])
-        x4, y4 = float(b[0]), float(b[1])
-        den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-        if abs(den) < 1e-18:
-            return np.asarray(p2, float)
-        t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / den
-        return np.array([x1 + t * (x2 - x1), y1 + t * (y2 - y1)])
-
-    out = np.asarray(subject, float)
-    for i in range(len(clip)):
-        a, b = clip[i], clip[(i + 1) % len(clip)]
-        inp = out
-        if len(inp) == 0:
-            return inp
-        pts = []
-        s = inp[-1]
-        for e in inp:
-            ein, sin = inside(e, a, b), inside(s, a, b)
-            if ein:
-                if not sin:
-                    pts.append(intersect(s, e, a, b))
-                pts.append(e)
-            elif sin:
-                pts.append(intersect(s, e, a, b))
-            s = e
-        out = np.asarray(pts, float).reshape(-1, 2)
-    return out
-
-
-def _buffer_shape(x: float, y: float, r: float):
-    """Shapely buffer polygon when available; else a CCW 64-gon ndarray."""
-    if _HAS_SHAPELY_BUFFER:
-        return _ShapelyPoint(x, y).buffer(r, quad_segs=_BUFFER_QUAD_SEGS)
-    return _circle_buffer_poly(x, y, r)
-
-
-def _buffer_area(shape) -> float:
-    if _HAS_SHAPELY_BUFFER:
-        return float(shape.area)
-    return _poly_area(shape)
-
-
-def _buffer_intersection_area(a, b) -> float:
-    if _HAS_SHAPELY_BUFFER:
-        return float(a.intersection(b).area)
-    clipped = _convex_clip(a, b)
-    return _poly_area(clipped) if len(clipped) >= 3 else 0.0
+    if d <= abs(r1 - r2):
+        return math.pi * min(r1, r2) ** 2
+    r1_sq, r2_sq = r1 * r1, r2 * r2
+    alpha = math.acos(np.clip((d * d + r1_sq - r2_sq) / (2.0 * d * r1), -1.0, 1.0))
+    beta = math.acos(np.clip((d * d + r2_sq - r1_sq) / (2.0 * d * r2), -1.0, 1.0))
+    return (
+        r1_sq * alpha
+        + r2_sq * beta
+        - 0.5 * math.sqrt(max(0.0, (-d + r1 + r2) * (d + r1 - r2) * (d - r1 + r2) * (d + r1 + r2)))
+    )
 
 
 def _box_overlap_area(a, b) -> float:
@@ -436,29 +381,38 @@ def glyph_overlaps(data, *, include_labels: bool = False) -> dict[str, float | i
         return empty
     pairs = 0
     area = 0.0
-    shapes = [_buffer_shape(g["x"], g["y"], g["r"]) for g in glyphs] if glyphs else []
     if len(glyphs) >= 2:
         if _HAS_SHAPELY_BUFFER:
+            # Match layout-benchmark: shapely Point.buffer(r, quad_segs=16).
+            shapes = [
+                _ShapelyPoint(g["x"], g["y"]).buffer(g["r"], quad_segs=_BUFFER_QUAD_SEGS) for g in glyphs
+            ]
             tree = STRtree(shapes)
             for i, s in enumerate(shapes):
                 for j in tree.query(s):
                     if j > i:
-                        inter = _buffer_intersection_area(s, shapes[j])
+                        inter = float(s.intersection(shapes[j]).area)
                         if inter > 0:
                             pairs += 1
                             area += inter
+            total_glyph_area = sum(float(s.area) for s in shapes)
         else:
+            # Fast exact disks (analytic); same pair predicate as 02e79df.
             max_r = max(g["r"] for g in glyphs)
             centres = np.array([[g["x"], g["y"]] for g in glyphs], float)
+            radii = np.array([g["r"] for g in glyphs], float)
             for i, j in cKDTree(centres).query_pairs(2.0 * max_r + 1e-6):
                 dist = float(np.hypot(*(centres[i] - centres[j])))
-                r1, r2 = glyphs[i]["r"], glyphs[j]["r"]
-                if dist >= r1 + r2 - 1e-12:
+                r1, r2 = float(radii[i]), float(radii[j])
+                if dist >= r1 + r2 - 1e-9:
                     continue
-                inter = _buffer_intersection_area(shapes[i], shapes[j])
+                inter = _circle_intersection_area(r1, r2, dist)
                 if inter > 0:
                     pairs += 1
                     area += inter
+            total_glyph_area = float(np.sum(math.pi * radii * radii))
+    else:
+        total_glyph_area = sum(math.pi * g["r"] ** 2 for g in glyphs)
     glyph_pairs = pairs
     label_pairs = glyph_label_pairs = 0
     boxes = _label_boxes(data) if include_labels else []
@@ -479,8 +433,7 @@ def glyph_overlaps(data, *, include_labels: bool = False) -> dict[str, float | i
                     glyph_label_pairs += 1
                     area += inter
                     pairs += 1
-    # Denominator uses buffer-polygon areas (not πr²), matching layout-benchmark.
-    total_area = sum(_buffer_area(s) for s in shapes)
+    total_area = total_glyph_area
     if include_labels:
         total_area += sum(
             max(0.0, b["box"][2] - b["box"][0]) * max(0.0, b["box"][3] - b["box"][1]) for b in boxes
@@ -603,8 +556,7 @@ def crossing_angular_resolution(segs: Sequence[tuple[tuple[float, float], tuple[
             continue
         cos = abs((v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2))
         cos = min(1.0, max(0.0, cos))
-        angle = math.acos(cos)
-        angle = min(angle, math.pi - angle)  # ∈ [0, π/2]
+        angle = math.acos(cos)  # acos(|cos|) ∈ [0, π/2]
         deviations.append(abs((optimal - angle) / optimal))
     if not deviations:
         return None

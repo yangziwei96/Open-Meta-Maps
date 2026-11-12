@@ -970,18 +970,16 @@ def _curated_structure_groups(data, blocks):
         gid = len(groups)
         groups.append(set(members))
         for nid in members:
-            if nid in nid_group:
-                # Same node claimed by two non-contested sets should not happen;
-                # keep frozen and drop from translation.
-                del nid_group[nid]
-            else:
-                nid_group[nid] = gid
-    # Drop groups whose nodes were invalidated above.
-    live = sorted({gid for gid in nid_group.values()})
-    remap = {old: new for new, old in enumerate(live)}
-    groups = [groups[old] for old in live]
-    nid_group = {nid: remap[gid] for nid, gid in nid_group.items()}
+            nid_group[nid] = gid
     return groups, nid_group, frozen
+
+
+def _stable_separation_dir(a, b):
+    """Unit direction for coincident centres; keyed by sorted node ids (hash-seed safe)."""
+    u, v = (a, b) if str(a) <= str(b) else (b, a)
+    ang = (sum(ord(c) for c in str(u)) * 17 + sum(ord(c) for c in str(v)) * 31) % 360
+    ang *= math.pi / 180.0
+    return np.array([math.cos(ang), math.sin(ang)])
 
 
 def _nudge_escher_node(nodes, reactions, nid, dx, dy, digits=6):
@@ -1111,8 +1109,7 @@ def _clear_rigid_node_overlaps_escher_centre_gap(data, blocks, min_dist=12.0, pi
                     continue
             hit = True
             if dist < 1e-6:
-                ang = ((hash(a) + hash(b)) % 360) * math.pi / 180.0
-                d = np.array([math.cos(ang), math.sin(ang)])
+                d = _stable_separation_dir(a, b)
                 dist = 1.0
             step = d / dist * (min_dist - dist)
             if move_a and move_b:
@@ -1133,8 +1130,10 @@ def _clear_rigid_node_overlaps_escher_official(data, blocks, max_iters=8, max_mo
                                               guard_official=True, pinned_nids=None):
     """Final Escher-footprint clear; structures translate as units; guard all official metrics.
 
-    Prefers axis-aligned nudges. Individual curated-structure nodes never move;
-    a structure (or merged structures that share a metabolite) may only translate.
+    Prefers axis-aligned nudges. Individual curated-structure nodes never move.
+    A structure with no shared curated hinge may translate as a whole (every
+    metabolite/midmarker of its reactions, including those shared with free
+    reactions). Two curated structures that share a metabolite stay frozen.
     """
     if not data or len(data) < 2:
         return data, dict(moved=0)
@@ -1272,8 +1271,7 @@ def _clear_rigid_node_overlaps_escher_official(data, blocks, max_iters=8, max_mo
             if dist >= need:
                 continue
             if dist < 1e-6:
-                ang = ((hash(a) + hash(b)) % 360) * math.pi / 180.0
-                d = np.array([math.cos(ang), math.sin(ang)])
+                d = _stable_separation_dir(a, b)
                 dist = 1.0
 
             move_a = _can_move_free(a)
@@ -1550,7 +1548,7 @@ def restore_rigid_group_escher(data, blocks):
             old = old_mid_xy.get(rid)
             if mnid is None or old is None:
                 # Fallback ring so centres stay clear of the primary glyph.
-                ang = (hash(nid) % 360) * math.pi / 180.0
+                ang = (sum(ord(c) for c in str(nid)) * 17) % 360 * math.pi / 180.0
                 set_node_xy(nodes[nid],
                             float(target[0] + 14.0 * math.cos(ang)),
                             float(target[1] + 14.0 * math.sin(ang)),
@@ -1560,7 +1558,7 @@ def restore_rigid_group_escher(data, blocks):
                 stub = np.asarray([nodes[nid]['x'], nodes[nid]['y']], float) - np.asarray(old, float)
                 # If the stub collapsed (already stacked), push onto a small ring.
                 if float(np.hypot(stub[0], stub[1])) < 1.0:
-                    ang = (hash(nid) % 360) * math.pi / 180.0
+                    ang = (sum(ord(c) for c in str(nid)) * 17) % 360 * math.pi / 180.0
                     stub = np.asarray([14.0 * math.cos(ang), 14.0 * math.sin(ang)], float)
                 new_mid = np.asarray([nodes[mnid]['x'], nodes[mnid]['y']], float)
                 set_node_xy(nodes[nid],

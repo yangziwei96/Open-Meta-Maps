@@ -224,11 +224,11 @@ def test_previous_pins_not_moved_by_official_clear():
 
 
 def test_shared_metabolite_curated_structures_translate_as_unit():
-    """Two curated structures sharing a metabolite must not stretch when cleared."""
+    """Two curated structures sharing a metabolite stay frozen (no stretch) when cleared."""
     import curated_axes as ca
 
     # Structure S1: R1–R2 via shared hinge H; structure S2: R3–R4 via H.
-    # An intruder primary sits on H so the clear must translate the merged unit.
+    # An intruder primary sits on H; contested curated nodes must not move.
     data = [
         {"canvas": {"width": 400, "height": 300}, "metadata": {}},
         {

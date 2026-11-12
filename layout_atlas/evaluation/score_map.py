@@ -40,18 +40,10 @@ def score_with_layout_benchmark(
     """
     try:
         from layout_benchmark.external import escher_drawing
-        from layout_benchmark.graph import Pathway as LBPathway
+        from layout_benchmark.graph import read_sbml
         from layout_benchmark.metrics import all_metrics
-        from layout_benchmark.sbmlnet import read_sbml
     except ImportError:
-        try:
-            # Alternate public layouts of the package.
-            from layout_benchmark.external import escher_drawing
-            from layout_benchmark.metrics import all_metrics
-            from layout_benchmark.graph import Pathway as LBPathway  # type: ignore
-            from layout_benchmark.datasets import read_sbml  # type: ignore
-        except ImportError:
-            return None
+        return None
     try:
         pathway = read_sbml(str(gem_path))
         drawing = escher_drawing(pathway, escher_map)
