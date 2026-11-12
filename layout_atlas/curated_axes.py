@@ -887,7 +887,7 @@ def clear_rigid_node_overlaps_escher(data, blocks, min_dist=12.0, max_iters=None
         return _clear_rigid_node_overlaps_escher_centre_gap(
             data, blocks, min_dist=min_dist, pinned_nids=pinned)
     return _clear_rigid_node_overlaps_escher_official(
-        data, blocks, min_dist=min_dist,
+        data, blocks,
         max_iters=8 if max_iters is None else max_iters,
         max_moves=80 if max_moves is None else max_moves,
         guard_official=guard_official, pinned_nids=pinned)
@@ -922,30 +922,25 @@ def _curated_structure_groups(data, blocks):
     """Curated-structure node sets (blocks with ≥2 reactions).
 
     Returns ``(groups, nid_group, frozen)``:
-    - ``groups``: exclusive node sets that may translate as a unit
-    - ``nid_group``: exclusive node → group index
-    - ``frozen``: every metabolite/midmarker that touches a curated structure
-      reaction (shared hinges included) — these never move individually
+    - ``groups``: translation units. Each unit is every metabolite/midmarker of
+      one curated structure's reactions (including metabolites shared with
+      non-curated neighbours), so a translate never stretches that structure.
+    - ``nid_group``: node → group index for translatable units
+    - ``frozen``: every curated-structure node — never moved individually
+
+    When two curated structures share a metabolite, both stay frozen and are
+    not translated (moving one unit would stretch the other).
     """
     if not data or len(data) < 2:
         return [], {}, set()
     nodes = data[1].get('nodes') or {}
     reactions = data[1].get('reactions') or {}
-    holders = defaultdict(set)
-    for rx in reactions.values():
-        rid = rx.get('bigg_id')
-        for seg in (rx.get('segments') or {}).values():
-            for nid in (seg.get('from_node_id'), seg.get('to_node_id')):
-                if nid in nodes:
-                    holders[nid].add(rid)
-    groups = []
-    nid_group = {}
-    frozen = set()
+    raw: list[set] = []
     for b in blocks or []:
         rids = set(b.get('reaction_ids') or [])
         if len(rids) < 2:
             continue
-        exclusive = set()
+        members = set()
         for rid in rids:
             for rx in reactions.values():
                 if rx.get('bigg_id') != rid:
@@ -953,25 +948,39 @@ def _curated_structure_groups(data, blocks):
                 for seg in (rx.get('segments') or {}).values():
                     for nid in (seg.get('from_node_id'), seg.get('to_node_id')):
                         n = nodes.get(nid) or {}
-                        kind = n.get('node_type')
-                        if kind not in ('metabolite', 'midmarker'):
-                            continue
-                        frozen.add(nid)
-                        if kind == 'midmarker' or (holders.get(nid) and holders[nid].issubset(rids)):
-                            exclusive.add(nid)
-        if not exclusive:
+                        if n.get('node_type') in ('metabolite', 'midmarker'):
+                            members.add(nid)
+        if members:
+            raw.append(members)
+    if not raw:
+        return [], {}, set()
+    contested = set()
+    for i in range(len(raw)):
+        for j in range(i + 1, len(raw)):
+            if raw[i] & raw[j]:
+                contested.add(i)
+                contested.add(j)
+    groups = []
+    nid_group = {}
+    frozen = set()
+    for i, members in enumerate(raw):
+        frozen.update(members)
+        if i in contested:
             continue
         gid = len(groups)
-        groups.append(exclusive)
-        for nid in exclusive:
+        groups.append(set(members))
+        for nid in members:
             if nid in nid_group:
-                nid_group[nid] = None
+                # Same node claimed by two non-contested sets should not happen;
+                # keep frozen and drop from translation.
+                del nid_group[nid]
             else:
                 nid_group[nid] = gid
-    for nid, gid in list(nid_group.items()):
-        if gid is None:
-            del nid_group[nid]
-            # Contested exclusive nodes stay frozen (already in frozen).
+    # Drop groups whose nodes were invalidated above.
+    live = sorted({gid for gid in nid_group.values()})
+    remap = {old: new for new, old in enumerate(live)}
+    groups = [groups[old] for old in live]
+    nid_group = {nid: remap[gid] for nid, gid in nid_group.items()}
     return groups, nid_group, frozen
 
 
@@ -1120,11 +1129,12 @@ def _clear_rigid_node_overlaps_escher_centre_gap(data, blocks, min_dist=12.0, pi
                       pinned=len(pinned_nids), mode='centre_gap')
 
 
-def _clear_rigid_node_overlaps_escher_official(data, blocks, min_dist=12.0, max_iters=8, max_moves=80,
+def _clear_rigid_node_overlaps_escher_official(data, blocks, max_iters=8, max_moves=80,
                                               guard_official=True, pinned_nids=None):
     """Final Escher-footprint clear; structures translate as units; guard all official metrics.
 
-    Prefers axis-aligned nudges. Individual curated-structure nodes never move.
+    Prefers axis-aligned nudges. Individual curated-structure nodes never move;
+    a structure (or merged structures that share a metabolite) may only translate.
     """
     if not data or len(data) < 2:
         return data, dict(moved=0)
@@ -1135,13 +1145,6 @@ def _clear_rigid_node_overlaps_escher_official(data, blocks, min_dist=12.0, max_
     groups, nid_group, structure_nids = _curated_structure_groups(data, blocks)
     nodes = data[1].get('nodes') or {}
     reactions = data[1].get('reactions') or {}
-    holders = defaultdict(set)
-    for rx in reactions.values():
-        rid = rx.get('bigg_id')
-        for seg in (rx.get('segments') or {}).values():
-            for nid in (seg.get('from_node_id'), seg.get('to_node_id')):
-                if nid in nodes:
-                    holders[nid].add(rid)
     ids = [nid for nid, n in nodes.items() if n.get('node_type') in ('metabolite', 'midmarker')]
     if len(ids) < 2:
         return data, dict(moved=0)
@@ -1262,7 +1265,7 @@ def _clear_rigid_node_overlaps_escher_official(data, blocks, min_dist=12.0, max_
             a, b = ids[int(i)], ids[int(j)]
             ga, gb = nid_group.get(a), nid_group.get(b)
             if ga is not None and ga == gb:
-                continue  # internal to one curated structure
+                continue  # internal to one curated structure / merged unit
             d = xy[int(j)] - xy[int(i)]
             dist = float(np.hypot(d[0], d[1]))
             need = radii[a] + radii[b] + 1e-3
@@ -1278,6 +1281,7 @@ def _clear_rigid_node_overlaps_escher_official(data, blocks, min_dist=12.0, max_
             translate_gid = None
             translate_sign = 1.0
             if not (move_a or move_b):
+                # Only whole-structure translates; never nudge a single curated node.
                 if ga is not None and gb is not None and ga != gb:
                     if not _group_pinned(gb):
                         translate_gid, translate_sign = gb, 1.0
@@ -1285,6 +1289,10 @@ def _clear_rigid_node_overlaps_escher_official(data, blocks, min_dist=12.0, max_
                         translate_gid, translate_sign = ga, -1.0
                     else:
                         continue
+                elif ga is not None and gb is None and not _group_pinned(ga):
+                    translate_gid, translate_sign = ga, -1.0
+                elif gb is not None and ga is None and not _group_pinned(gb):
+                    translate_gid, translate_sign = gb, 1.0
                 else:
                     continue
 
@@ -1297,30 +1305,9 @@ def _clear_rigid_node_overlaps_escher_official(data, blocks, min_dist=12.0, max_
                 ov_n = _overlaps()
                 ok = ov_n < cur_ov
                 if ok and guard_official:
-                    edges = om.escher_drawn_edges(data)
-                    segs = om.piece_segments(edges)
-                    part = om.participant_consistency(data)
-                    eld = om.edge_length_deviation(edges)
-                    eorth = om.edge_orthogonality(segs)
-                    ang = om.angular_resolution(data)
-                    if part is not None and before.get('participant_consistency') is not None and part + TOL < before['participant_consistency']:
-                        ok = False
-                    elif eld is not None and before.get('edge_length_deviation') is not None and eld > before['edge_length_deviation'] + TOL:
-                        ok = False
-                    elif eorth is not None and before.get('edge_orthogonality') is not None and eorth + TOL < before['edge_orthogonality']:
-                        ok = False
-                    elif ang is not None and before.get('angular_resolution') is not None and ang > before['angular_resolution'] + TOL:
-                        ok = False
-                    else:
-                        cross = om.count_piece_crossings(segs)
-                        cang = om.crossing_angular_resolution(segs)
-                        now = dict(
-                            crossings=cross, overlapping_pairs=ov_n,
-                            participant_consistency=part, edge_length_deviation=eld,
-                            edge_orthogonality=eorth, angular_resolution=ang,
-                            crossing_angular_resolution=cang,
-                        )
-                        ok = _layout_ok(before, now)
+                    now = _score_bits()
+                    now['overlapping_pairs'] = ov_n
+                    ok = _layout_ok(before, now)
                 if ok:
                     history.append(deltas)
                     accepted += 1

@@ -6,6 +6,10 @@ and from Purchase's graph-drawing measures. This file is an independent
 implementation: no functions are copied from layout-benchmark or gdMetriX
 (GPL-3.0 is never vendored).
 
+Overlaps use the same 64-gon circle buffers as layout-benchmark
+(``Point.buffer(r, quad_segs=16)``). Angular resolution follows gdMetriX's
+Purchase measure on y-up stub directions.
+
 Used by the quality gate, the Layout quality panel, and ``evaluation.score``.
 Optional cross-checks against an installed ``layout_benchmark`` package live
 only in ``evaluation.score_map``.
@@ -165,15 +169,11 @@ def _collinear_overlap(a, b, c, d) -> bool:
     return min(1.0, t1) - max(0.0, t0) > 1e-9
 
 
-def count_piece_crossings(segs: Sequence[tuple[tuple[float, float], tuple[float, float]]]) -> int:
-    """Count crossings among unique pieces (proper intersections + collinear overlaps).
-
-    Matches the published Escher drawing definition: a piece shared by several
-    edges counts once; overlapping collinear pieces count as a crossing.
-    """
+def _iter_crossing_events(segs: Sequence[tuple[tuple[float, float], tuple[float, float]]]):
+    """Yield (kind, i, j) with kind 'point' (transversal) or 'line' (collinear overlap)."""
     n = len(segs)
     if n < 2:
-        return 0
+        return
     cell = 80.0
     buckets: dict[tuple[int, int], list[int]] = defaultdict(list)
     for i, (a, b) in enumerate(segs):
@@ -182,8 +182,7 @@ def count_piece_crossings(segs: Sequence[tuple[tuple[float, float], tuple[float,
         for gx in range(int(math.floor(x0 / cell)), int(math.floor(x1 / cell)) + 1):
             for gy in range(int(math.floor(y0 / cell)), int(math.floor(y1 / cell)) + 1):
                 buckets[gx, gy].append(i)
-    total = 0
-    seen_pairs: set[tuple[int, int]] = set()
+    seen: set[tuple[int, int]] = set()
     for members in buckets.values():
         m = len(members)
         for ii in range(m):
@@ -192,15 +191,23 @@ def count_piece_crossings(segs: Sequence[tuple[tuple[float, float], tuple[float,
             for jj in range(ii + 1, m):
                 j = members[jj]
                 pair = (i, j) if i < j else (j, i)
-                if pair in seen_pairs:
+                if pair in seen:
                     continue
-                seen_pairs.add(pair)
+                seen.add(pair)
                 c, d = segs[j]
-                if _segments_cross(a, b, c, d) or _collinear_overlap(a, b, c, d):
-                    total += 1
-    return total
+                if _segments_cross(a, b, c, d):
+                    yield "point", i, j
+                elif _collinear_overlap(a, b, c, d):
+                    yield "line", i, j
 
 
+def count_piece_crossings(segs: Sequence[tuple[tuple[float, float], tuple[float, float]]]) -> int:
+    """Count crossings among unique pieces (proper intersections + collinear overlaps).
+
+    Matches the published Escher drawing definition: a piece shared by several
+    edges counts once; overlapping collinear pieces count as a crossing.
+    """
+    return sum(1 for _ in _iter_crossing_events(segs))
 
 
 def edge_length_deviation(edges: Sequence[dict]) -> float | None:
@@ -308,17 +315,88 @@ def _label_boxes(data) -> list[dict[str, Any]]:
     return boxes
 
 
-def _circle_overlap_area(r1: float, r2: float, d: float) -> float:
-    if d >= r1 + r2:
+# layout-benchmark overlaps use shapely ``Point.buffer(r, quad_segs=16)`` (64-gon).
+_BUFFER_QUAD_SEGS = 16
+
+try:
+    from shapely import STRtree
+    from shapely.geometry import Point as _ShapelyPoint
+
+    _HAS_SHAPELY_BUFFER = True
+except ImportError:  # pragma: no cover - optional; pure 64-gon fallback below
+    _HAS_SHAPELY_BUFFER = False
+
+
+def _circle_buffer_poly(x: float, y: float, r: float, quad_segs: int = _BUFFER_QUAD_SEGS) -> np.ndarray:
+    """Regular ``4 * quad_segs``-gon matching shapely ``Point.buffer`` area (CCW)."""
+    n = 4 * int(quad_segs)
+    angs = np.linspace(0.0, 2.0 * math.pi, n, endpoint=False)
+    return np.column_stack([x + r * np.cos(angs), y + r * np.sin(angs)])
+
+
+def _poly_area(poly: np.ndarray) -> float:
+    if len(poly) < 3:
         return 0.0
-    if d <= 0 or d <= abs(r1 - r2):
-        return math.pi * min(r1, r2) ** 2
-    r1_sq, r2_sq = r1 * r1, r2 * r2
-    alpha = math.acos(np.clip((d * d + r1_sq - r2_sq) / (2 * d * r1), -1, 1))
-    beta = math.acos(np.clip((d * d + r2_sq - r1_sq) / (2 * d * r2), -1, 1))
-    return r1_sq * alpha + r2_sq * beta - 0.5 * math.sqrt(
-        max(0.0, (-d + r1 + r2) * (d + r1 - r2) * (d - r1 + r2) * (d + r1 + r2))
-    )
+    x, y = poly[:, 0], poly[:, 1]
+    return 0.5 * float(np.abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+
+def _convex_clip(subject: np.ndarray, clip: np.ndarray) -> np.ndarray:
+    """Sutherland–Hodgman clip of convex subject by convex clip (CCW, inside left)."""
+
+    def inside(p, a, b) -> bool:
+        return (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]) >= -1e-12
+
+    def intersect(p1, p2, a, b) -> np.ndarray:
+        x1, y1 = float(p1[0]), float(p1[1])
+        x2, y2 = float(p2[0]), float(p2[1])
+        x3, y3 = float(a[0]), float(a[1])
+        x4, y4 = float(b[0]), float(b[1])
+        den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+        if abs(den) < 1e-18:
+            return np.asarray(p2, float)
+        t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / den
+        return np.array([x1 + t * (x2 - x1), y1 + t * (y2 - y1)])
+
+    out = np.asarray(subject, float)
+    for i in range(len(clip)):
+        a, b = clip[i], clip[(i + 1) % len(clip)]
+        inp = out
+        if len(inp) == 0:
+            return inp
+        pts = []
+        s = inp[-1]
+        for e in inp:
+            ein, sin = inside(e, a, b), inside(s, a, b)
+            if ein:
+                if not sin:
+                    pts.append(intersect(s, e, a, b))
+                pts.append(e)
+            elif sin:
+                pts.append(intersect(s, e, a, b))
+            s = e
+        out = np.asarray(pts, float).reshape(-1, 2)
+    return out
+
+
+def _buffer_shape(x: float, y: float, r: float):
+    """Shapely buffer polygon when available; else a CCW 64-gon ndarray."""
+    if _HAS_SHAPELY_BUFFER:
+        return _ShapelyPoint(x, y).buffer(r, quad_segs=_BUFFER_QUAD_SEGS)
+    return _circle_buffer_poly(x, y, r)
+
+
+def _buffer_area(shape) -> float:
+    if _HAS_SHAPELY_BUFFER:
+        return float(shape.area)
+    return _poly_area(shape)
+
+
+def _buffer_intersection_area(a, b) -> float:
+    if _HAS_SHAPELY_BUFFER:
+        return float(a.intersection(b).area)
+    clipped = _convex_clip(a, b)
+    return _poly_area(clipped) if len(clipped) >= 3 else 0.0
 
 
 def _box_overlap_area(a, b) -> float:
@@ -358,16 +436,29 @@ def glyph_overlaps(data, *, include_labels: bool = False) -> dict[str, float | i
         return empty
     pairs = 0
     area = 0.0
-    max_r = max((g["r"] for g in glyphs), default=0.0)
-    centres = np.array([[g["x"], g["y"]] for g in glyphs], float) if glyphs else np.zeros((0, 2))
+    shapes = [_buffer_shape(g["x"], g["y"], g["r"]) for g in glyphs] if glyphs else []
     if len(glyphs) >= 2:
-        for i, j in cKDTree(centres).query_pairs(2.0 * max_r + 1e-6):
-            dist = float(np.hypot(*(centres[i] - centres[j])))
-            r1, r2 = glyphs[i]["r"], glyphs[j]["r"]
-            # Touching (dist == r1+r2) is not an overlap.
-            if dist < r1 + r2 - 1e-9:
-                pairs += 1
-                area += _circle_overlap_area(r1, r2, dist)
+        if _HAS_SHAPELY_BUFFER:
+            tree = STRtree(shapes)
+            for i, s in enumerate(shapes):
+                for j in tree.query(s):
+                    if j > i:
+                        inter = _buffer_intersection_area(s, shapes[j])
+                        if inter > 0:
+                            pairs += 1
+                            area += inter
+        else:
+            max_r = max(g["r"] for g in glyphs)
+            centres = np.array([[g["x"], g["y"]] for g in glyphs], float)
+            for i, j in cKDTree(centres).query_pairs(2.0 * max_r + 1e-6):
+                dist = float(np.hypot(*(centres[i] - centres[j])))
+                r1, r2 = glyphs[i]["r"], glyphs[j]["r"]
+                if dist >= r1 + r2 - 1e-12:
+                    continue
+                inter = _buffer_intersection_area(shapes[i], shapes[j])
+                if inter > 0:
+                    pairs += 1
+                    area += inter
     glyph_pairs = pairs
     label_pairs = glyph_label_pairs = 0
     boxes = _label_boxes(data) if include_labels else []
@@ -388,7 +479,8 @@ def glyph_overlaps(data, *, include_labels: bool = False) -> dict[str, float | i
                     glyph_label_pairs += 1
                     area += inter
                     pairs += 1
-    total_area = sum(math.pi * g["r"] ** 2 for g in glyphs)
+    # Denominator uses buffer-polygon areas (not πr²), matching layout-benchmark.
+    total_area = sum(_buffer_area(s) for s in shapes)
     if include_labels:
         total_area += sum(
             max(0.0, b["box"][2] - b["box"][0]) * max(0.0, b["box"][3] - b["box"][1]) for b in boxes
@@ -434,70 +526,59 @@ def participant_consistency(data) -> float | None:
     return opposite / pairs if pairs else None
 
 
-def _stub_angles_at_nodes(edges: Sequence[dict]) -> dict[Any, list[float]]:
-    """Polar angles of first/last pieces at every drawn endpoint (Purchase stubs)."""
-    angles: dict[Any, list[float]] = defaultdict(list)
+def _clockwise_angle(ax: float, ay: float, bx: float, by: float) -> float:
+    """Clockwise angle from vector a to vector b in ``[0, 2π]`` (gdMetriX Vector.angle)."""
+    if (ax == 0.0 and ay == 0.0) or (bx == 0.0 and by == 0.0):
+        return 0.0
+    det = bx * ay - by * ax
+    dot = bx * ax + by * ay
+    ang = math.atan2(det, dot)
+    if ang < 0:
+        ang += 2.0 * math.pi
+    return float(ang)
+
+
+def _stub_dirs_at_nodes(edges: Sequence[dict]) -> dict[Any, list[tuple[float, float]]]:
+    """First/last piece directions at every drawn endpoint, in drawing space (y up)."""
+    dirs: dict[Any, list[tuple[float, float]]] = defaultdict(list)
     for edge in edges:
         pts = edge["pts"]
         if len(pts) < 2:
             continue
-        # Midmarker stub: toward the first bend / metabolite.
-        mx, my = pts[0]
-        tx, ty = pts[1]
-        angles[("mid", edge["mid"])].append(math.atan2(ty - my, tx - mx))
-        # Metabolite stub: toward the last bend / midmarker.
-        ex, ey = pts[-1]
-        sx, sy = pts[-2]
-        angles[("met", edge["met_nid"])].append(math.atan2(sy - ey, sx - ex))
-    return angles
+        # Escher y is down; layout-benchmark flips to y-up before measuring angles.
+        mx, my = float(pts[0][0]), -float(pts[0][1])
+        tx, ty = float(pts[1][0]), -float(pts[1][1])
+        dirs[("mid", edge["mid"])].append((tx - mx, ty - my))
+        ex, ey = float(pts[-1][0]), -float(pts[-1][1])
+        sx, sy = float(pts[-2][0]), -float(pts[-2][1])
+        dirs[("met", edge["met_nid"])].append((sx - ex, sy - ey))
+    return dirs
 
 
 def angular_resolution(data) -> float | None:
-    """Purchase angular-resolution deviation on drawn stubs (lower is better)."""
-    angles = _stub_angles_at_nodes(escher_drawn_edges(data))
+    """Purchase angular-resolution deviation on drawn stubs (lower is better).
+
+    Matches gdMetriX ``angular_resolution`` on layout-benchmark's stub graph:
+    clockwise gaps from up, coincident directions tie-broken by descending length.
+    """
     deviations = []
-    for vals in angles.values():
-        if len(vals) < 2:
+    for vecs in _stub_dirs_at_nodes(escher_drawn_edges(data)).values():
+        if len(vecs) < 2:
             continue
-        ordered = sorted(vals)
-        gaps = [ordered[i + 1] - ordered[i] for i in range(len(ordered) - 1)]
-        gaps.append(ordered[0] + 2 * math.pi - ordered[-1])
+        ordered = sorted(
+            vecs,
+            key=lambda v: (_clockwise_angle(0.0, 1.0, v[0], v[1]), -math.hypot(v[0], v[1])),
+        )
+        gaps = [
+            _clockwise_angle(v[0], v[1], ordered[(i + 1) % len(ordered)][0], ordered[(i + 1) % len(ordered)][1])
+            for i, v in enumerate(ordered)
+        ]
         min_angle = min(gaps)
-        optimal = 2 * math.pi / len(vals)
+        optimal = 2.0 * math.pi / len(vecs)
         deviations.append(abs((optimal - min_angle) / optimal))
     if not deviations:
         return None
     return float(np.mean(deviations))
-
-
-def _iter_crossing_events(segs: Sequence[tuple[tuple[float, float], tuple[float, float]]]):
-    """Yield (kind, i, j) with kind 'point' (transversal) or 'line' (collinear overlap)."""
-    n = len(segs)
-    cell = 80.0
-    buckets: dict[tuple[int, int], list[int]] = defaultdict(list)
-    for i, (a, b) in enumerate(segs):
-        x0, x1 = (a[0], b[0]) if a[0] <= b[0] else (b[0], a[0])
-        y0, y1 = (a[1], b[1]) if a[1] <= b[1] else (b[1], a[1])
-        for gx in range(int(math.floor(x0 / cell)), int(math.floor(x1 / cell)) + 1):
-            for gy in range(int(math.floor(y0 / cell)), int(math.floor(y1 / cell)) + 1):
-                buckets[gx, gy].append(i)
-    seen: set[tuple[int, int]] = set()
-    for members in buckets.values():
-        m = len(members)
-        for ii in range(m):
-            i = members[ii]
-            a, b = segs[i]
-            for jj in range(ii + 1, m):
-                j = members[jj]
-                pair = (i, j) if i < j else (j, i)
-                if pair in seen:
-                    continue
-                seen.add(pair)
-                c, d = segs[j]
-                if _segments_cross(a, b, c, d):
-                    yield 'point', i, j
-                elif _collinear_overlap(a, b, c, d):
-                    yield 'line', i, j
 
 
 def crossing_angular_resolution(segs: Sequence[tuple[tuple[float, float], tuple[float, float]]]) -> float | None:
@@ -509,7 +590,7 @@ def crossing_angular_resolution(segs: Sequence[tuple[tuple[float, float], tuple[
     deviations = []
     for kind, i, j in _iter_crossing_events(segs):
         optimal = math.pi / 2
-        if kind == 'line':
+        if kind == "line":
             deviations.append(1.0)  # min angle 0 → full deviation
             continue
         a, b = segs[i]
@@ -523,9 +604,7 @@ def crossing_angular_resolution(segs: Sequence[tuple[tuple[float, float], tuple[
         cos = abs((v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2))
         cos = min(1.0, max(0.0, cos))
         angle = math.acos(cos)
-        angle = min(angle, math.pi - angle)
-        if angle > math.pi / 2:
-            angle = math.pi - angle
+        angle = min(angle, math.pi - angle)  # ∈ [0, π/2]
         deviations.append(abs((optimal - angle) / optimal))
     if not deviations:
         return None

@@ -1,9 +1,14 @@
 # Optional dependencies for `python3 project.py evaluate` (development aid).
 # Core compose/tool still uses layout_atlas/requirements.txt only.
 #
-# Official figures are computed in-repo by official_metrics (no shapely / gdMetriX
-# required). Installing layout-benchmark from GitHub enables the optional external
-# scorer in evaluation/score_map.py (that package may pull gdMetriX under GPL-3.0;
-# never vendor it into this repository).
+# Matches evaluation/metrics.py optional imports:
+#   shapely  — pathway box-overlap and compartment metrics
+#   gdmetrix — general graph-drawing metrics (GPL-3.0; import only, never vendored)
+# Official Escher figures are computed in-repo by official_metrics (no shapely /
+# gdMetriX required). Installing layout-benchmark from GitHub enables the optional
+# external scorer in evaluation/score_map.py.
+
+shapely>=2.0
+gdmetrix>=0.0.5
 
 # pip install 'layout-benchmark @ git+https://github.com/elixir2026-project22/layout-benchmark.git@837067d'

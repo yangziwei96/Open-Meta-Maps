@@ -221,3 +221,161 @@ def test_previous_pins_not_moved_by_official_clear():
     assert nodes["a"]["x"] == 0 and nodes["a"]["y"] == 0
     assert nodes["m"]["x"] == 5 and nodes["m"]["y"] == 40
     assert rep.get("pinned") == 2
+
+
+def test_shared_metabolite_curated_structures_translate_as_unit():
+    """Two curated structures sharing a metabolite must not stretch when cleared."""
+    import curated_axes as ca
+
+    # Structure S1: R1–R2 via shared hinge H; structure S2: R3–R4 via H.
+    # An intruder primary sits on H so the clear must translate the merged unit.
+    data = [
+        {"canvas": {"width": 400, "height": 300}, "metadata": {}},
+        {
+            "nodes": {
+                "h": {"node_type": "metabolite", "node_is_primary": True, "bigg_id": "H_c",
+                      "x": 100.0, "y": 100.0, "label_x": 100.0, "label_y": 80.0},
+                "a": {"node_type": "metabolite", "node_is_primary": True, "bigg_id": "A_c",
+                      "x": 40.0, "y": 100.0, "label_x": 40.0, "label_y": 80.0},
+                "b": {"node_type": "metabolite", "node_is_primary": True, "bigg_id": "B_c",
+                      "x": 160.0, "y": 100.0, "label_x": 160.0, "label_y": 80.0},
+                "c": {"node_type": "metabolite", "node_is_primary": True, "bigg_id": "C_c",
+                      "x": 100.0, "y": 40.0, "label_x": 100.0, "label_y": 20.0},
+                "d": {"node_type": "metabolite", "node_is_primary": True, "bigg_id": "D_c",
+                      "x": 100.0, "y": 160.0, "label_x": 100.0, "label_y": 140.0},
+                "m1": {"node_type": "midmarker", "x": 70.0, "y": 100.0},
+                "m2": {"node_type": "midmarker", "x": 130.0, "y": 100.0},
+                "m3": {"node_type": "midmarker", "x": 100.0, "y": 70.0},
+                "m4": {"node_type": "midmarker", "x": 100.0, "y": 130.0},
+                "intruder": {"node_type": "metabolite", "node_is_primary": True, "bigg_id": "Z_c",
+                             "x": 105.0, "y": 100.0, "label_x": 105.0, "label_y": 80.0},
+                "mz": {"node_type": "midmarker", "x": 200.0, "y": 100.0},
+                "z2": {"node_type": "metabolite", "node_is_primary": True, "bigg_id": "Y_c",
+                       "x": 240.0, "y": 100.0, "label_x": 240.0, "label_y": 80.0},
+            },
+            "reactions": {
+                "1": {"bigg_id": "R1", "label_x": 70, "label_y": 110,
+                      "metabolites": [{"bigg_id": "A_c", "coefficient": -1},
+                                      {"bigg_id": "H_c", "coefficient": 1}],
+                      "segments": {"0": {"from_node_id": "a", "to_node_id": "m1"},
+                                   "1": {"from_node_id": "m1", "to_node_id": "h"}}},
+                "2": {"bigg_id": "R2", "label_x": 130, "label_y": 110,
+                      "metabolites": [{"bigg_id": "H_c", "coefficient": -1},
+                                      {"bigg_id": "B_c", "coefficient": 1}],
+                      "segments": {"0": {"from_node_id": "h", "to_node_id": "m2"},
+                                   "1": {"from_node_id": "m2", "to_node_id": "b"}}},
+                "3": {"bigg_id": "R3", "label_x": 110, "label_y": 70,
+                      "metabolites": [{"bigg_id": "C_c", "coefficient": -1},
+                                      {"bigg_id": "H_c", "coefficient": 1}],
+                      "segments": {"0": {"from_node_id": "c", "to_node_id": "m3"},
+                                   "1": {"from_node_id": "m3", "to_node_id": "h"}}},
+                "4": {"bigg_id": "R4", "label_x": 110, "label_y": 130,
+                      "metabolites": [{"bigg_id": "H_c", "coefficient": -1},
+                                      {"bigg_id": "D_c", "coefficient": 1}],
+                      "segments": {"0": {"from_node_id": "h", "to_node_id": "m4"},
+                                   "1": {"from_node_id": "m4", "to_node_id": "d"}}},
+                "5": {"bigg_id": "RZ", "label_x": 200, "label_y": 110,
+                      "metabolites": [{"bigg_id": "Z_c", "coefficient": -1},
+                                      {"bigg_id": "Y_c", "coefficient": 1}],
+                      "segments": {"0": {"from_node_id": "intruder", "to_node_id": "mz"},
+                                   "1": {"from_node_id": "mz", "to_node_id": "z2"}}},
+            },
+        },
+    ]
+    blocks = [
+        dict(id="s1", reaction_ids=["R1", "R2"]),
+        dict(id="s2", reaction_ids=["R3", "R4"]),
+    ]
+    groups, nid_group, frozen = ca._curated_structure_groups(data, blocks)
+    # Shared hinge → both structures frozen, neither translated as a unit.
+    assert len(groups) == 0
+    assert "h" in frozen and "a" in frozen and "c" in frozen
+    assert nid_group.get("h") is None
+
+    before = {nid: (float(n["x"]), float(n["y"])) for nid, n in data[1]["nodes"].items()}
+    structure_nids = frozen
+
+    def _pairwise(nids):
+        pts = {nid: before[nid] for nid in nids}
+        return {(u, v): (pts[v][0] - pts[u][0], pts[v][1] - pts[u][1])
+                for i, u in enumerate(sorted(nids)) for v in sorted(nids)[i + 1:]}
+
+    rel_before = _pairwise(structure_nids)
+    data, rep = ca.clear_rigid_node_overlaps_escher(
+        data, blocks, use_escher_radii=True, guard_official=True)
+    after = {nid: (float(n["x"]), float(n["y"])) for nid, n in data[1]["nodes"].items()}
+    # Relative geometry of both curated structures is unchanged (not stretched).
+    for key, (dx, dy) in rel_before.items():
+        u, v = key
+        got = (after[v][0] - after[u][0], after[v][1] - after[u][1])
+        assert abs(got[0] - dx) < 1e-9 and abs(got[1] - dy) < 1e-9, (key, dx, dy, got)
+    # Contested curated nodes stay put; the free intruder may move.
+    for nid in structure_nids:
+        assert after[nid] == before[nid], nid
+
+
+def test_curated_structure_translate_includes_shared_free_metabolite():
+    """A curated structure sharing a metabolite with a free reaction translates as one unit."""
+    import curated_axes as ca
+
+    data = [
+        {"canvas": {"width": 300, "height": 200}, "metadata": {}},
+        {
+            "nodes": {
+                "h": {"node_type": "metabolite", "node_is_primary": True, "bigg_id": "H_c",
+                      "x": 100.0, "y": 100.0, "label_x": 100.0, "label_y": 80.0},
+                "a": {"node_type": "metabolite", "node_is_primary": True, "bigg_id": "A_c",
+                      "x": 40.0, "y": 100.0, "label_x": 40.0, "label_y": 80.0},
+                "b": {"node_type": "metabolite", "node_is_primary": True, "bigg_id": "B_c",
+                      "x": 160.0, "y": 100.0, "label_x": 160.0, "label_y": 80.0},
+                "m1": {"node_type": "midmarker", "x": 70.0, "y": 100.0},
+                "m2": {"node_type": "midmarker", "x": 130.0, "y": 100.0},
+                # Free reaction hanging off H (not curated).
+                "mfree": {"node_type": "midmarker", "x": 100.0, "y": 160.0},
+                "f": {"node_type": "metabolite", "node_is_primary": True, "bigg_id": "F_c",
+                      "x": 100.0, "y": 200.0, "label_x": 100.0, "label_y": 180.0},
+                "intruder": {"node_type": "metabolite", "node_is_primary": True, "bigg_id": "Z_c",
+                             "x": 105.0, "y": 100.0, "label_x": 105.0, "label_y": 80.0},
+                "mz": {"node_type": "midmarker", "x": 200.0, "y": 100.0},
+                "z2": {"node_type": "metabolite", "node_is_primary": True, "bigg_id": "Y_c",
+                       "x": 240.0, "y": 100.0, "label_x": 240.0, "label_y": 80.0},
+            },
+            "reactions": {
+                "1": {"bigg_id": "R1", "label_x": 70, "label_y": 110,
+                      "metabolites": [{"bigg_id": "A_c", "coefficient": -1},
+                                      {"bigg_id": "H_c", "coefficient": 1}],
+                      "segments": {"0": {"from_node_id": "a", "to_node_id": "m1"},
+                                   "1": {"from_node_id": "m1", "to_node_id": "h"}}},
+                "2": {"bigg_id": "R2", "label_x": 130, "label_y": 110,
+                      "metabolites": [{"bigg_id": "H_c", "coefficient": -1},
+                                      {"bigg_id": "B_c", "coefficient": 1}],
+                      "segments": {"0": {"from_node_id": "h", "to_node_id": "m2"},
+                                   "1": {"from_node_id": "m2", "to_node_id": "b"}}},
+                "3": {"bigg_id": "RFREE", "label_x": 100, "label_y": 160,
+                      "metabolites": [{"bigg_id": "H_c", "coefficient": -1},
+                                      {"bigg_id": "F_c", "coefficient": 1}],
+                      "segments": {"0": {"from_node_id": "h", "to_node_id": "mfree"},
+                                   "1": {"from_node_id": "mfree", "to_node_id": "f"}}},
+                "4": {"bigg_id": "RZ", "label_x": 200, "label_y": 110,
+                      "metabolites": [{"bigg_id": "Z_c", "coefficient": -1},
+                                      {"bigg_id": "Y_c", "coefficient": 1}],
+                      "segments": {"0": {"from_node_id": "intruder", "to_node_id": "mz"},
+                                   "1": {"from_node_id": "mz", "to_node_id": "z2"}}},
+            },
+        },
+    ]
+    blocks = [dict(id="s1", reaction_ids=["R1", "R2"])]
+    groups, nid_group, frozen = ca._curated_structure_groups(data, blocks)
+    assert len(groups) == 1
+    assert "h" in groups[0] and nid_group.get("h") == 0
+    before = {nid: (float(n["x"]), float(n["y"])) for nid, n in data[1]["nodes"].items()}
+    data, rep = ca.clear_rigid_node_overlaps_escher(
+        data, blocks, use_escher_radii=True, guard_official=False)
+    after = {nid: (float(n["x"]), float(n["y"])) for nid, n in data[1]["nodes"].items()}
+    # Structure relative geometry preserved (shared hinge included).
+    for u, v in (("a", "h"), ("h", "b"), ("a", "b"), ("m1", "m2")):
+        db = (before[v][0] - before[u][0], before[v][1] - before[u][1])
+        da = (after[v][0] - after[u][0], after[v][1] - after[u][1])
+        assert abs(da[0] - db[0]) < 1e-9 and abs(da[1] - db[1]) < 1e-9
+    shifts = [(after[nid][0] - before[nid][0], after[nid][1] - before[nid][1]) for nid in groups[0]]
+    assert all(abs(s[0] - shifts[0][0]) < 1e-9 and abs(s[1] - shifts[0][1]) < 1e-9 for s in shifts)

@@ -37,6 +37,8 @@ def test_long_edge_share():
 
 
 def test_overlaps_no_touch():
+    if not metrics.shapely_available():
+        return
     p = _toy()
     pos = {"r1": (0.0, 0.0), "A": (-100.0, 0.0), "B": (100.0, 0.0), "C": (0.0, 100.0)}
     m = metrics.overlaps(p, pos)
