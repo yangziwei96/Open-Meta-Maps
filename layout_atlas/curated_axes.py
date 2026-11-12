@@ -879,8 +879,8 @@ def clear_rigid_node_overlaps_escher(data, blocks, min_dist=12.0, max_iters=None
     Default (early pipeline): centre-gap clearance (centres ≥ ``min_dist``, 40
     iterations), matching upstream mid-pipeline behaviour including label-aware
     moves via ``map_edit``. Final official pass sets ``use_escher_radii`` and
-    ``guard_official`` so Escher footprints clear without worsening official
-    metrics. Nodes pinned by ``--previous`` (``anchors`` / ``pinned_nids``) never move.
+    ``guard_official``. Curated structures and ``--previous`` pins never move a
+    single internal node; a structure may only translate as a whole unit.
     """
     pinned = _resolve_previous_pins(data, anchors=anchors, pinned_nids=pinned_nids)
     if not use_escher_radii and not guard_official:
@@ -888,17 +888,14 @@ def clear_rigid_node_overlaps_escher(data, blocks, min_dist=12.0, max_iters=None
             data, blocks, min_dist=min_dist, pinned_nids=pinned)
     return _clear_rigid_node_overlaps_escher_official(
         data, blocks, min_dist=min_dist,
-        max_iters=12 if max_iters is None else max_iters,
-        max_moves=200 if max_moves is None else max_moves,
-        guard_official=guard_official, use_escher_radii=use_escher_radii,
-        pinned_nids=pinned)
+        max_iters=8 if max_iters is None else max_iters,
+        max_moves=80 if max_moves is None else max_moves,
+        guard_official=guard_official, pinned_nids=pinned)
 
 
 def _resolve_previous_pins(data, anchors=None, pinned_nids=None):
     """Escher node ids that ``--previous`` pinned (reaction midmarkers + metabolites)."""
     pinned = set(pinned_nids or ())
-    if anchors is None and isinstance(data, list) and data:
-        anchors = (data[0].get('metadata') or {}).get('previous_anchors')
     if not anchors:
         return pinned
     body = data[1] if isinstance(data, list) else data
@@ -921,6 +918,63 @@ def _resolve_previous_pins(data, anchors=None, pinned_nids=None):
     return pinned
 
 
+def _curated_structure_groups(data, blocks):
+    """Curated-structure node sets (blocks with ≥2 reactions).
+
+    Returns ``(groups, nid_group, frozen)``:
+    - ``groups``: exclusive node sets that may translate as a unit
+    - ``nid_group``: exclusive node → group index
+    - ``frozen``: every metabolite/midmarker that touches a curated structure
+      reaction (shared hinges included) — these never move individually
+    """
+    if not data or len(data) < 2:
+        return [], {}, set()
+    nodes = data[1].get('nodes') or {}
+    reactions = data[1].get('reactions') or {}
+    holders = defaultdict(set)
+    for rx in reactions.values():
+        rid = rx.get('bigg_id')
+        for seg in (rx.get('segments') or {}).values():
+            for nid in (seg.get('from_node_id'), seg.get('to_node_id')):
+                if nid in nodes:
+                    holders[nid].add(rid)
+    groups = []
+    nid_group = {}
+    frozen = set()
+    for b in blocks or []:
+        rids = set(b.get('reaction_ids') or [])
+        if len(rids) < 2:
+            continue
+        exclusive = set()
+        for rid in rids:
+            for rx in reactions.values():
+                if rx.get('bigg_id') != rid:
+                    continue
+                for seg in (rx.get('segments') or {}).values():
+                    for nid in (seg.get('from_node_id'), seg.get('to_node_id')):
+                        n = nodes.get(nid) or {}
+                        kind = n.get('node_type')
+                        if kind not in ('metabolite', 'midmarker'):
+                            continue
+                        frozen.add(nid)
+                        if kind == 'midmarker' or (holders.get(nid) and holders[nid].issubset(rids)):
+                            exclusive.add(nid)
+        if not exclusive:
+            continue
+        gid = len(groups)
+        groups.append(exclusive)
+        for nid in exclusive:
+            if nid in nid_group:
+                nid_group[nid] = None
+            else:
+                nid_group[nid] = gid
+    for nid, gid in list(nid_group.items()):
+        if gid is None:
+            del nid_group[nid]
+            # Contested exclusive nodes stay frozen (already in frozen).
+    return groups, nid_group, frozen
+
+
 def _nudge_escher_node(nodes, reactions, nid, dx, dy, digits=6):
     """Translate a glyph (and its labels) by ``(dx, dy)``; reaction labels follow midmarkers."""
     translate_node(nodes[nid], dx, dy, digits=digits)
@@ -933,33 +987,52 @@ def _nudge_escher_node(nodes, reactions, nid, dx, dy, digits=6):
                 break
 
 
-def _axis_prefer_step(d, dist, need):
-    """Prefer an axis-aligned separation when it clears the pair; else radial step."""
+def _separation_candidates(d, dist, need, max_len=30.0):
+    """Axis-aligned first, then 8 compass directions, then radial; capped length."""
     gap = need - dist
     radial = d / dist * gap
-    # Pure axis candidates that increase separation to ≥ need.
     dx, dy = float(d[0]), float(d[1])
-    candidates = []
-    # Horizontal: keep dy, grow |dx| so hypot(dx', dy) >= need.
+    raw = []
     if abs(dy) < need - 1e-12:
-        target_abs_x = math.sqrt(max(need * need - dy * dy, 0.0))
-        sign_x = 1.0 if dx >= 0 else -1.0
+        target = math.sqrt(max(need * need - dy * dy, 0.0))
+        sign = 1.0 if dx > 0 else -1.0
         if dx == 0.0:
-            sign_x = 1.0
-        candidates.append(np.array([sign_x * target_abs_x - dx, 0.0]))
-    # Vertical: keep dx, grow |dy|.
+            sign = 1.0
+        raw.append(np.array([sign * target - dx, 0.0]))
     if abs(dx) < need - 1e-12:
-        target_abs_y = math.sqrt(max(need * need - dx * dx, 0.0))
-        sign_y = 1.0 if dy >= 0 else -1.0
+        target = math.sqrt(max(need * need - dx * dx, 0.0))
+        sign = 1.0 if dy > 0 else -1.0
         if dy == 0.0:
-            sign_y = 1.0
-        candidates.append(np.array([0.0, sign_y * target_abs_y - dy]))
-    # Prefer the shorter axis-aligned step; fall back to radial.
-    candidates.sort(key=lambda s: float(np.hypot(s[0], s[1])))
-    for step in candidates:
-        if float(np.hypot(step[0], step[1])) <= float(np.hypot(radial[0], radial[1])) + 1e-9:
-            return step
-    return radial
+            sign = 1.0
+        raw.append(np.array([0.0, sign * target - dy]))
+    raw.sort(key=lambda s: float(np.hypot(s[0], s[1])))
+    # Compass separations that increase centre distance to ≥ need.
+    for k in range(24):
+        ang = k * math.pi / 12.0
+        u = np.array([math.cos(ang), math.sin(ang)])
+        if float(np.dot(u, d)) < 0:
+            u = -u
+        # Smallest s ≥ 0 with |d + s u| ≥ need.
+        # |d|^2 + 2 s d·u + s^2 ≥ need^2
+        dot = float(np.dot(u, d))
+        disc = dot * dot - (dist * dist - need * need)
+        if disc < 0:
+            continue
+        s = -dot + math.sqrt(disc)
+        if s > 1e-9:
+            raw.append(u * s)
+    raw.append(radial)
+    out = []
+    for step in raw:
+        step_len = float(np.hypot(step[0], step[1]))
+        if step_len < 1e-12:
+            continue
+        if step_len > max_len:
+            step = step * (max_len / step_len)
+        if any(float(np.hypot(*(step - u))) < 1e-9 for u in out):
+            continue
+        out.append(step)
+    return out
 
 
 def _clear_rigid_node_overlaps_escher_centre_gap(data, blocks, min_dist=12.0, pinned_nids=None):
@@ -968,6 +1041,8 @@ def _clear_rigid_node_overlaps_escher_centre_gap(data, blocks, min_dist=12.0, pi
         return data, dict(moved=0)
     from scipy.spatial import cKDTree
     pinned_nids = set(pinned_nids or ())
+    # Early clear matches upstream: only same_map_rigid glyphs are immovable
+    # (plus --previous pins). Full curated-structure rigidity is the final clear.
     rigid_rx = rigid_reaction_ids(blocks)
     nodes = data[1].get('nodes') or {}
     reactions = data[1].get('reactions') or {}
@@ -1041,16 +1116,15 @@ def _clear_rigid_node_overlaps_escher_centre_gap(data, blocks, min_dist=12.0, pi
             moved += 1
         if not hit:
             break
-    return data, dict(moved=moved, rigid_nodes=len(rigid_nids), pinned=len(pinned_nids), mode='centre_gap')
+    return data, dict(moved=moved, rigid_nodes=len(rigid_nids),
+                      pinned=len(pinned_nids), mode='centre_gap')
 
 
-def _clear_rigid_node_overlaps_escher_official(data, blocks, min_dist=12.0, max_iters=12, max_moves=200,
-                                              guard_official=True, use_escher_radii=True, pinned_nids=None):
-    """Final Escher-footprint clear; reject moves that worsen official metrics.
+def _clear_rigid_node_overlaps_escher_official(data, blocks, min_dist=12.0, max_iters=8, max_moves=80,
+                                              guard_official=True, pinned_nids=None):
+    """Final Escher-footprint clear; structures translate as units; guard all official metrics.
 
-    Prefers axis-aligned nudges. ``--previous`` pins never move. Accepted nudges
-    are recorded as deltas; a metric regression restores from an absolute
-    pre-clear snapshot so labels stay attached.
+    Prefers axis-aligned nudges. Individual curated-structure nodes never move.
     """
     if not data or len(data) < 2:
         return data, dict(moved=0)
@@ -1058,7 +1132,7 @@ def _clear_rigid_node_overlaps_escher_official(data, blocks, min_dist=12.0, max_
     import official_metrics as om
 
     pinned_nids = set(pinned_nids or ())
-    rigid_rx = rigid_reaction_ids(blocks)
+    groups, nid_group, structure_nids = _curated_structure_groups(data, blocks)
     nodes = data[1].get('nodes') or {}
     reactions = data[1].get('reactions') or {}
     holders = defaultdict(set)
@@ -1068,39 +1142,18 @@ def _clear_rigid_node_overlaps_escher_official(data, blocks, min_dist=12.0, max_
             for nid in (seg.get('from_node_id'), seg.get('to_node_id')):
                 if nid in nodes:
                     holders[nid].add(rid)
-    rigid_nids = set()
-    if rigid_rx:
-        for nid, hs in holders.items():
-            if hs and hs.issubset(rigid_rx) and nodes[nid].get('node_type') in ('metabolite', 'midmarker'):
-                rigid_nids.add(nid)
-        for rx in reactions.values():
-            if rx.get('bigg_id') not in rigid_rx:
-                continue
-            for seg in (rx.get('segments') or {}).values():
-                for nid in (seg.get('from_node_id'), seg.get('to_node_id')):
-                    if (nodes.get(nid) or {}).get('node_type') == 'midmarker':
-                        rigid_nids.add(nid)
     ids = [nid for nid, n in nodes.items() if n.get('node_type') in ('metabolite', 'midmarker')]
     if len(ids) < 2:
         return data, dict(moved=0)
-    if use_escher_radii:
-        radii = {nid: float(om._glyph_radius(nodes[nid]) or om.ESCHER_RADIUS['marker']) for nid in ids}
-        floor = 0.0
-        max_need = max(radii.values()) * 2.0 + 1e-3
-    else:
-        radii = {nid: float(min_dist) / 2.0 for nid in ids}
-        floor = float(min_dist)
-        max_need = float(min_dist) + 1e-3
+    radii = {nid: float(om._glyph_radius(nodes[nid]) or om.ESCHER_RADIUS['marker']) for nid in ids}
+    max_need = max(radii.values()) * 2.0 + 1e-3
+    TOL = 1e-4
 
-    def _can_move(nid):
-        if nid in pinned_nids:
-            return False
-        if nid not in rigid_nids:
-            return True
-        n = nodes[nid]
-        if n.get('node_type') == 'metabolite' and not n.get('node_is_primary', True):
-            return True
-        return False
+    def _group_pinned(gid):
+        return any(nid in pinned_nids for nid in groups[gid])
+
+    def _can_move_free(nid):
+        return nid not in pinned_nids and nid not in structure_nids
 
     def _score_bits():
         edges = om.escher_drawn_edges(data)
@@ -1111,6 +1164,8 @@ def _clear_rigid_node_overlaps_escher_official(data, blocks, min_dist=12.0, max_
             participant_consistency=om.participant_consistency(data),
             edge_length_deviation=om.edge_length_deviation(edges),
             edge_orthogonality=om.edge_orthogonality(segs),
+            angular_resolution=om.angular_resolution(data),
+            crossing_angular_resolution=om.crossing_angular_resolution(segs),
         )
 
     def _overlaps():
@@ -1141,30 +1196,55 @@ def _clear_rigid_node_overlaps_escher_official(data, blocks, min_dist=12.0, max_
             reactions[key]['label_x'] = lx
             reactions[key]['label_y'] = ly
 
-    before = _score_bits() if guard_official else dict(overlapping_pairs=_overlaps())
-    before_ov = before['overlapping_pairs']
-    origin_nodes, origin_rx = _snap_state()
-    accepted = 0
-    history = []
-
-    def _layout_ok():
+    def _layout_ok(before, now=None):
         if not guard_official:
             return True
-        now = _score_bits()
+        now = now or _score_bits()
         if now['crossings'] > before['crossings']:
             return False
         if now['overlapping_pairs'] > before['overlapping_pairs']:
             return False
         bp, np_ = before.get('participant_consistency'), now.get('participant_consistency')
-        if bp is not None and np_ is not None and np_ + 1e-15 < bp:
+        if bp is not None and np_ is not None and np_ + TOL < bp:
             return False
         bo, no = before.get('edge_orthogonality'), now.get('edge_orthogonality')
-        if bo is not None and no is not None and no + 1e-15 < bo:
+        if bo is not None and no is not None and no + TOL < bo:
             return False
         be, ne = before.get('edge_length_deviation'), now.get('edge_length_deviation')
-        if be is not None and ne is not None and ne > be + 1e-15:
+        if be is not None and ne is not None and ne > be + TOL:
+            return False
+        ba, na = before.get('angular_resolution'), now.get('angular_resolution')
+        if ba is not None and na is not None and na > ba + TOL:
+            return False
+        bc, nc = before.get('crossing_angular_resolution'), now.get('crossing_angular_resolution')
+        if bc is not None and nc is not None and nc + TOL < bc:
             return False
         return True
+
+    def _apply_deltas(deltas):
+        for nid, dx, dy in deltas:
+            _nudge_escher_node(nodes, reactions, nid, dx, dy)
+
+    def _deltas_for_pair(a, b, step, move_a, move_b, translate_gid=None, translate_sign=1.0):
+        if translate_gid is not None:
+            dx = translate_sign * step[0]
+            dy = translate_sign * step[1]
+            return [(nid, dx, dy) for nid in groups[translate_gid]]
+        deltas = []
+        if move_a and move_b:
+            deltas.append((a, -step[0] / 2, -step[1] / 2))
+            deltas.append((b, step[0] / 2, step[1] / 2))
+        elif move_a:
+            deltas.append((a, -step[0], -step[1]))
+        elif move_b:
+            deltas.append((b, step[0], step[1]))
+        return deltas
+
+    before = _score_bits() if guard_official else dict(overlapping_pairs=_overlaps())
+    before_ov = before['overlapping_pairs']
+    origin_nodes, origin_rx = _snap_state()
+    accepted = 0
+    history = []
 
     for _ in range(max_iters):
         if accepted >= max_moves:
@@ -1180,122 +1260,112 @@ def _clear_rigid_node_overlaps_escher_official(data, blocks, min_dist=12.0, max_
             if accepted >= max_moves:
                 break
             a, b = ids[int(i)], ids[int(j)]
+            ga, gb = nid_group.get(a), nid_group.get(b)
+            if ga is not None and ga == gb:
+                continue  # internal to one curated structure
             d = xy[int(j)] - xy[int(i)]
             dist = float(np.hypot(d[0], d[1]))
-            need = max(radii[a] + radii[b], floor) + 1e-3
+            need = radii[a] + radii[b] + 1e-3
             if dist >= need:
                 continue
-            move_a, move_b = _can_move(a), _can_move(b)
-            if not (move_a or move_b):
-                if ((nodes[a].get('bigg_id') or '') == (nodes[b].get('bigg_id') or '')
-                        and nodes[a].get('node_type') == 'metabolite'
-                        and b not in pinned_nids):
-                    move_b = True
-                else:
-                    continue
             if dist < 1e-6:
                 ang = ((hash(a) + hash(b)) % 360) * math.pi / 180.0
                 d = np.array([math.cos(ang), math.sin(ang)])
                 dist = 1.0
-            # Try axis-aligned separations first, then radial; keep only metric-safe nudges.
-            radial = d / dist * (need - dist)
-            steps = []
-            ax = _axis_prefer_step(d, dist, need)
-            if abs(ax[0]) < 1e-15 or abs(ax[1]) < 1e-15:
-                steps.append(ax)
-            # Explicit pure-axis retries (dominant axis first).
-            dx, dy = float(d[0]), float(d[1])
-            if abs(dx) >= abs(dy):
-                order = ('x', 'y')
-            else:
-                order = ('y', 'x')
-            for axis in order:
-                if axis == 'x' and abs(dy) < need - 1e-12:
-                    target = math.sqrt(max(need * need - dy * dy, 0.0))
-                    sign = 1.0 if dx >= 0 else -1.0
-                    if dx == 0:
-                        sign = 1.0
-                    steps.append(np.array([sign * target - dx, 0.0]))
-                if axis == 'y' and abs(dx) < need - 1e-12:
-                    target = math.sqrt(max(need * need - dx * dx, 0.0))
-                    sign = 1.0 if dy >= 0 else -1.0
-                    if dy == 0:
-                        sign = 1.0
-                    steps.append(np.array([0.0, sign * target - dy]))
-            steps.append(radial)
-            # Deduplicate near-identical steps.
-            uniq = []
-            for step in steps:
-                step_len = float(np.hypot(*step))
-                if step_len < 1e-12:
+
+            move_a = _can_move_free(a)
+            move_b = _can_move_free(b)
+            translate_gid = None
+            translate_sign = 1.0
+            if not (move_a or move_b):
+                if ga is not None and gb is not None and ga != gb:
+                    if not _group_pinned(gb):
+                        translate_gid, translate_sign = gb, 1.0
+                    elif not _group_pinned(ga):
+                        translate_gid, translate_sign = ga, -1.0
+                    else:
+                        continue
+                else:
                     continue
-                if step_len > 30.0:
-                    step = step * (30.0 / step_len)
-                if any(float(np.hypot(*(step - u))) < 1e-9 for u in uniq):
-                    continue
-                uniq.append(step)
+
             applied = False
-            for step in uniq:
-                deltas = []
-                if move_a and move_b:
-                    deltas.append((a, -step[0] / 2, -step[1] / 2))
-                    deltas.append((b, step[0] / 2, step[1] / 2))
-                elif move_a:
-                    deltas.append((a, -step[0], -step[1]))
-                elif move_b:
-                    deltas.append((b, step[0], step[1]))
+            for step in _separation_candidates(d, dist, need, max_len=(20.0 if translate_gid is not None else 30.0)):
+                deltas = _deltas_for_pair(a, b, step, move_a, move_b, translate_gid, translate_sign)
                 if not deltas:
                     continue
-                for nid, dx, dy in deltas:
-                    _nudge_escher_node(nodes, reactions, nid, dx, dy)
+                _apply_deltas(deltas)
                 ov_n = _overlaps()
-                if ov_n < cur_ov and _layout_ok():
+                ok = ov_n < cur_ov
+                if ok and guard_official:
+                    edges = om.escher_drawn_edges(data)
+                    segs = om.piece_segments(edges)
+                    part = om.participant_consistency(data)
+                    eld = om.edge_length_deviation(edges)
+                    eorth = om.edge_orthogonality(segs)
+                    ang = om.angular_resolution(data)
+                    if part is not None and before.get('participant_consistency') is not None and part + TOL < before['participant_consistency']:
+                        ok = False
+                    elif eld is not None and before.get('edge_length_deviation') is not None and eld > before['edge_length_deviation'] + TOL:
+                        ok = False
+                    elif eorth is not None and before.get('edge_orthogonality') is not None and eorth + TOL < before['edge_orthogonality']:
+                        ok = False
+                    elif ang is not None and before.get('angular_resolution') is not None and ang > before['angular_resolution'] + TOL:
+                        ok = False
+                    else:
+                        cross = om.count_piece_crossings(segs)
+                        cang = om.crossing_angular_resolution(segs)
+                        now = dict(
+                            crossings=cross, overlapping_pairs=ov_n,
+                            participant_consistency=part, edge_length_deviation=eld,
+                            edge_orthogonality=eorth, angular_resolution=ang,
+                            crossing_angular_resolution=cang,
+                        )
+                        ok = _layout_ok(before, now)
+                if ok:
                     history.append(deltas)
                     accepted += 1
                     progressed = True
                     cur_ov = ov_n
                     for nid, dx, dy in deltas:
-                        k = index[nid]
-                        xy[k] = [nodes[nid]['x'], nodes[nid]['y']]
+                        if nid in index:
+                            k = index[nid]
+                            xy[k] = [nodes[nid]['x'], nodes[nid]['y']]
                     applied = True
                     break
-                for nid, dx, dy in deltas:
-                    _nudge_escher_node(nodes, reactions, nid, -dx, -dy)
+                _apply_deltas([(nid, -dx, -dy) for nid, dx, dy in deltas])
             if not applied:
                 continue
         if not progressed:
             break
 
     report = dict(
-        moved=accepted, accepted=accepted, rigid_nodes=len(rigid_nids),
-        pinned=len(pinned_nids),
+        moved=accepted, accepted=accepted, rigid_nodes=len(structure_nids),
+        structures=len(groups), pinned=len(pinned_nids),
         mode=('escher_radii_guarded' if guard_official else 'escher_radii'),
         before_overlaps=before_ov,
         before_crossings=before.get('crossings'),
         before_participant=before.get('participant_consistency'),
         before_edge_orthogonality=before.get('edge_orthogonality'),
-        before_edge_length_deviation=before.get('edge_length_deviation'),
+        before_angular_resolution=before.get('angular_resolution'),
+        before_crossing_angular_resolution=before.get('crossing_angular_resolution'),
     )
     if guard_official:
         after = _score_bits()
-        worse = not _layout_ok()
-        if worse and history:
+        if not _layout_ok(before, after) and history:
             lo, hi, best = 0, len(history), 0
             while lo <= hi:
                 mid = (lo + hi) // 2
                 _restore_state(origin_nodes, origin_rx)
                 for deltas in history[:mid]:
-                    for nid, dx, dy in deltas:
-                        _nudge_escher_node(nodes, reactions, nid, dx, dy)
-                if _layout_ok():
+                    _apply_deltas(deltas)
+                if _layout_ok(before):
                     best = mid
                     lo = mid + 1
                 else:
                     hi = mid - 1
             _restore_state(origin_nodes, origin_rx)
             for deltas in history[:best]:
-                for nid, dx, dy in deltas:
-                    _nudge_escher_node(nodes, reactions, nid, dx, dy)
+                _apply_deltas(deltas)
             after = _score_bits()
             report.update(dict(
                 accepted=best, moved=best,
@@ -1303,7 +1373,8 @@ def _clear_rigid_node_overlaps_escher_official(data, blocks, min_dist=12.0, max_
                 after_crossings=after['crossings'],
                 after_participant=after['participant_consistency'],
                 after_edge_orthogonality=after['edge_orthogonality'],
-                after_edge_length_deviation=after['edge_length_deviation'],
+                after_angular_resolution=after['angular_resolution'],
+                after_crossing_angular_resolution=after['crossing_angular_resolution'],
                 reason='prefix keep to protect official metrics',
             ))
             return data, report
@@ -1312,7 +1383,8 @@ def _clear_rigid_node_overlaps_escher_official(data, blocks, min_dist=12.0, max_
             after_crossings=after['crossings'],
             after_participant=after['participant_consistency'],
             after_edge_orthogonality=after['edge_orthogonality'],
-            after_edge_length_deviation=after['edge_length_deviation'],
+            after_angular_resolution=after['angular_resolution'],
+            after_crossing_angular_resolution=after['crossing_angular_resolution'],
         ))
     else:
         report.update(dict(after_overlaps=_overlaps()))

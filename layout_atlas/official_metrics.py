@@ -39,9 +39,9 @@ def _xy(node: dict) -> tuple[float, float]:
     return float(node["x"]), float(node["y"])
 
 
-def _endpoint_id(p: Sequence[float]) -> tuple[float, float]:
-    """Stable geometric identity for a polyline vertex (independent rounding)."""
-    return (round(float(p[0]), 6), round(float(p[1]), 6))
+def _point_key(p: Sequence[float]) -> str:
+    """Geometric vertex id (significant digits), matching the published segment graph."""
+    return f"@{float(p[0]):.6g},{float(p[1]):.6g}"
 
 
 def _midmarker_id(nodes: dict, reaction: dict) -> str | None:
@@ -95,7 +95,7 @@ def escher_drawn_edges(data) -> list[dict[str, Any]]:
                     mid=mid,
                     met_nid=nid,
                     pts=pts,
-                    primary=bool(node.get("node_is_primary", True)),
+                    primary=bool(node.get("node_is_primary")),
                 )
             )
     return out
@@ -103,15 +103,17 @@ def escher_drawn_edges(data) -> list[dict[str, Any]]:
 
 def piece_segments(edges: Sequence[dict]) -> list[tuple[tuple[float, float], tuple[float, float]]]:
     """Unique straight pieces across drawn edges (a shared piece counts once)."""
-    seen: set[tuple[tuple[float, float], tuple[float, float]]] = set()
+    seen: set[tuple[str, str]] = set()
     segs: list[tuple[tuple[float, float], tuple[float, float]]] = []
     for edge in edges:
         pts = edge["pts"]
         for a, b in zip(pts[:-1], pts[1:]):
             if a == b:
                 continue
-            ia, ib = _endpoint_id(a), _endpoint_id(b)
-            key = (ia, ib) if ia <= ib else (ib, ia)
+            ka, kb = _point_key(a), _point_key(b)
+            if ka == kb:
+                continue
+            key = (ka, kb) if ka <= kb else (kb, ka)
             if key in seen:
                 continue
             seen.add(key)
@@ -128,18 +130,46 @@ def _segments_cross(a, b, c, d) -> bool:
     abx, aby = bx - ax, by - ay
     cdx, cdy = dx - cx, dy - cy
     den = abx * cdy - aby * cdx
-    if abs(den) < 1e-12:
+    ab2 = abx * abx + aby * aby
+    cd2 = cdx * cdx + cdy * cdy
+    if ab2 < 1e-24 or cd2 < 1e-24:
+        return False
+    # Nearly parallel / collinear: handled by overlap test instead.
+    if abs(den) <= 1e-12 * math.sqrt(ab2 * cd2):
         return False
     acx, acy = cx - ax, cy - ay
     t = (acx * cdy - acy * cdx) / den
     u = (acx * aby - acy * abx) / den
-    return 1e-9 < t < 1.0 - 1e-9 and 1e-9 < u < 1.0 - 1e-9
+    return 1e-12 < t < 1.0 - 1e-12 and 1e-12 < u < 1.0 - 1e-12
+
+
+def _collinear_overlap(a, b, c, d) -> bool:
+    """Positive-length overlap of nearly collinear pieces (counted as a crossing)."""
+    ax, ay = float(a[0]), float(a[1])
+    bx, by = float(b[0]), float(b[1])
+    cx, cy = float(c[0]), float(c[1])
+    dx, dy = float(d[0]), float(d[1])
+    abx, aby = bx - ax, by - ay
+    ab2 = abx * abx + aby * aby
+    if ab2 < 1e-24:
+        return False
+    ab_len = math.sqrt(ab2)
+    # Both endpoints of cd must lie on ab's supporting line (not just one shared vertex).
+    dist_c = abs((cx - ax) * aby - (cy - ay) * abx) / ab_len
+    dist_d = abs((dx - ax) * aby - (dy - ay) * abx) / ab_len
+    if dist_c > 1e-6 or dist_d > 1e-6:
+        return False
+    def proj(px, py):
+        return ((px - ax) * abx + (py - ay) * aby) / ab2
+    t0, t1 = sorted((proj(cx, cy), proj(dx, dy)))
+    return min(1.0, t1) - max(0.0, t0) > 1e-9
 
 
 def count_piece_crossings(segs: Sequence[tuple[tuple[float, float], tuple[float, float]]]) -> int:
-    """Count proper crossings among unique pieces (each crossing pair once).
+    """Count crossings among unique pieces (proper intersections + collinear overlaps).
 
-    Pieces that share an endpoint are adjacent route bends, not crossings.
+    Matches the published Escher drawing definition: a piece shared by several
+    edges counts once; overlapping collinear pieces count as a crossing.
     """
     n = len(segs)
     if n < 2:
@@ -159,7 +189,6 @@ def count_piece_crossings(segs: Sequence[tuple[tuple[float, float], tuple[float,
         for ii in range(m):
             i = members[ii]
             a, b = segs[i]
-            ends_i = {_endpoint_id(a), _endpoint_id(b)}
             for jj in range(ii + 1, m):
                 j = members[jj]
                 pair = (i, j) if i < j else (j, i)
@@ -167,11 +196,11 @@ def count_piece_crossings(segs: Sequence[tuple[tuple[float, float], tuple[float,
                     continue
                 seen_pairs.add(pair)
                 c, d = segs[j]
-                if ends_i & {_endpoint_id(c), _endpoint_id(d)}:
-                    continue
-                if _segments_cross(a, b, c, d):
+                if _segments_cross(a, b, c, d) or _collinear_overlap(a, b, c, d):
                     total += 1
     return total
+
+
 
 
 def edge_length_deviation(edges: Sequence[dict]) -> float | None:
@@ -197,6 +226,7 @@ def edge_orthogonality(segs: Sequence[tuple[tuple[float, float], tuple[float, fl
     if not segs:
         return None
     penalty = 0.0
+    counted = 0
     for a, b in segs:
         dx, dy = float(b[0] - a[0]), float(b[1] - a[1])
         if abs(dx) < 1e-15 and abs(dy) < 1e-15:
@@ -204,13 +234,17 @@ def edge_orthogonality(segs: Sequence[tuple[tuple[float, float], tuple[float, fl
         angle = abs(math.atan2(dy, dx)) % (math.pi / 2)
         angle = min(angle, math.pi / 2 - angle)
         penalty += angle * 4.0 / math.pi
-    return float(1.0 - penalty / len(segs))
+        counted += 1
+    if not counted:
+        return None
+    return float(1.0 - penalty / counted)
 
 
 def _glyph_radius(node: dict) -> float | None:
     kind = node.get("node_type")
     if kind == "metabolite":
-        return ESCHER_RADIUS["primary" if node.get("node_is_primary", True) else "secondary"]
+        # Match published Escher drawing: missing flag → secondary radius.
+        return ESCHER_RADIUS["primary" if bool(node.get("node_is_primary")) else "secondary"]
     if kind == "midmarker":
         return ESCHER_RADIUS["marker"]
     return None
@@ -232,7 +266,7 @@ def escher_glyphs(data) -> list[dict[str, Any]]:
                 r=float(radius),
                 kind=node.get("node_type"),
                 bigg=node.get("bigg_id"),
-                primary=node.get("node_is_primary"),
+                primary=bool(node.get("node_is_primary")),
             )
         )
     return glyphs
@@ -301,7 +335,6 @@ def _circle_box_overlap_area(x: float, y: float, r: float, box) -> float:
     nearest_y = min(max(y, y0), y1)
     if (nearest_x - x) ** 2 + (nearest_y - y) ** 2 >= r * r - 1e-12:
         return 0.0
-    # Deterministic grid estimate for area-share; pair counts only need positivity.
     n = 8
     hits = 0
     for i in range(n):
@@ -331,6 +364,7 @@ def glyph_overlaps(data, *, include_labels: bool = False) -> dict[str, float | i
         for i, j in cKDTree(centres).query_pairs(2.0 * max_r + 1e-6):
             dist = float(np.hypot(*(centres[i] - centres[j])))
             r1, r2 = glyphs[i]["r"], glyphs[j]["r"]
+            # Touching (dist == r1+r2) is not an overlap.
             if dist < r1 + r2 - 1e-9:
                 pairs += 1
                 area += _circle_overlap_area(r1, r2, dist)
@@ -396,9 +430,106 @@ def participant_consistency(data) -> float | None:
                 if nv < 1e-12:
                     continue
                 pairs += 1
-                # Angle > 90° ⇔ cos < 0 for unit vectors.
                 opposite += float(np.dot(u_hat, v / nv)) < cos_limit
     return opposite / pairs if pairs else None
+
+
+def _stub_angles_at_nodes(edges: Sequence[dict]) -> dict[Any, list[float]]:
+    """Polar angles of first/last pieces at every drawn endpoint (Purchase stubs)."""
+    angles: dict[Any, list[float]] = defaultdict(list)
+    for edge in edges:
+        pts = edge["pts"]
+        if len(pts) < 2:
+            continue
+        # Midmarker stub: toward the first bend / metabolite.
+        mx, my = pts[0]
+        tx, ty = pts[1]
+        angles[("mid", edge["mid"])].append(math.atan2(ty - my, tx - mx))
+        # Metabolite stub: toward the last bend / midmarker.
+        ex, ey = pts[-1]
+        sx, sy = pts[-2]
+        angles[("met", edge["met_nid"])].append(math.atan2(sy - ey, sx - ex))
+    return angles
+
+
+def angular_resolution(data) -> float | None:
+    """Purchase angular-resolution deviation on drawn stubs (lower is better)."""
+    angles = _stub_angles_at_nodes(escher_drawn_edges(data))
+    deviations = []
+    for vals in angles.values():
+        if len(vals) < 2:
+            continue
+        ordered = sorted(vals)
+        gaps = [ordered[i + 1] - ordered[i] for i in range(len(ordered) - 1)]
+        gaps.append(ordered[0] + 2 * math.pi - ordered[-1])
+        min_angle = min(gaps)
+        optimal = 2 * math.pi / len(vals)
+        deviations.append(abs((optimal - min_angle) / optimal))
+    if not deviations:
+        return None
+    return float(np.mean(deviations))
+
+
+def _iter_crossing_events(segs: Sequence[tuple[tuple[float, float], tuple[float, float]]]):
+    """Yield (kind, i, j) with kind 'point' (transversal) or 'line' (collinear overlap)."""
+    n = len(segs)
+    cell = 80.0
+    buckets: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for i, (a, b) in enumerate(segs):
+        x0, x1 = (a[0], b[0]) if a[0] <= b[0] else (b[0], a[0])
+        y0, y1 = (a[1], b[1]) if a[1] <= b[1] else (b[1], a[1])
+        for gx in range(int(math.floor(x0 / cell)), int(math.floor(x1 / cell)) + 1):
+            for gy in range(int(math.floor(y0 / cell)), int(math.floor(y1 / cell)) + 1):
+                buckets[gx, gy].append(i)
+    seen: set[tuple[int, int]] = set()
+    for members in buckets.values():
+        m = len(members)
+        for ii in range(m):
+            i = members[ii]
+            a, b = segs[i]
+            for jj in range(ii + 1, m):
+                j = members[jj]
+                pair = (i, j) if i < j else (j, i)
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                c, d = segs[j]
+                if _segments_cross(a, b, c, d):
+                    yield 'point', i, j
+                elif _collinear_overlap(a, b, c, d):
+                    yield 'line', i, j
+
+
+def crossing_angular_resolution(segs: Sequence[tuple[tuple[float, float], tuple[float, float]]]) -> float | None:
+    """1 − mean relative deviation of crossing angles from the optimum (higher is better).
+
+    Collinear overlapping pieces contribute a minimum angle of 0 (as in the
+    published scorer). Two pieces have optimum π/2.
+    """
+    deviations = []
+    for kind, i, j in _iter_crossing_events(segs):
+        optimal = math.pi / 2
+        if kind == 'line':
+            deviations.append(1.0)  # min angle 0 → full deviation
+            continue
+        a, b = segs[i]
+        c, d = segs[j]
+        v1 = (float(b[0] - a[0]), float(b[1] - a[1]))
+        v2 = (float(d[0] - c[0]), float(d[1] - c[1]))
+        n1 = math.hypot(*v1)
+        n2 = math.hypot(*v2)
+        if n1 < 1e-12 or n2 < 1e-12:
+            continue
+        cos = abs((v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2))
+        cos = min(1.0, max(0.0, cos))
+        angle = math.acos(cos)
+        angle = min(angle, math.pi - angle)
+        if angle > math.pi / 2:
+            angle = math.pi - angle
+        deviations.append(abs((optimal - angle) / optimal))
+    if not deviations:
+        return None
+    return float(1.0 - float(np.mean(deviations)))
 
 
 def _point_in_polygon(poly: np.ndarray, x: float, y: float) -> bool:
@@ -507,20 +638,12 @@ def score_escher_map(data) -> dict[str, Any]:
         participant_consistency=participant_consistency(data),
         edge_length_deviation=edge_length_deviation(edges),
         edge_orthogonality=edge_orthogonality(segs),
+        angular_resolution=angular_resolution(data),
+        crossing_angular_resolution=crossing_angular_resolution(segs),
         species_in_other_compartment=species_in_other_compartment(data),
         **aspect,
         note="independent implementation of published definitions; gdMetriX not used",
     )
-
-
-# Internal aliases kept for in-repo call sites (evaluation helpers / tests).
-_body = _map_body
-_reaction_mid = _midmarker_id
-_point_in_hull = _point_in_polygon
-
-
-def _proper_intersect(a, b, c, d):
-    return _segments_cross(a, b, c, d), None
 
 
 __all__ = [
@@ -528,8 +651,10 @@ __all__ = [
     "ASPECT_MIN",
     "ESCHER_RADIUS",
     "PARTICIPANT_DEG",
+    "angular_resolution",
     "content_aspect",
     "count_piece_crossings",
+    "crossing_angular_resolution",
     "edge_length_deviation",
     "edge_orthogonality",
     "escher_drawn_edges",

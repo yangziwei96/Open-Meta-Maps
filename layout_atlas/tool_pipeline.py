@@ -1119,11 +1119,8 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                 log('  hotspot repair: ' + str({k: hr.get(k) for k in ('accepted_count', 'tries', 'rounds', 'seconds', 'improved')}))
             dump(folder / 'map.json', data)
         # Final official-footprint clear (Escher radii; reject moves that raise crossings).
-        if PREVIOUS_ANCHORS:
-            data[0].setdefault('metadata', {})['previous_anchors'] = {
-                k: list(v) for k, v in PREVIOUS_ANCHORS.items()}
         data, _ov_final = _ca_es.clear_rigid_node_overlaps_escher(
-            data, blocks, max_iters=12, max_moves=200,
+            data, blocks, max_iters=8, max_moves=80,
             use_escher_radii=True, guard_official=True, anchors=PREVIOUS_ANCHORS)
         metric['official_overlap_clear'] = _ov_final
         if log and (_ov_final.get('moved') or _ov_final.get('accepted')):

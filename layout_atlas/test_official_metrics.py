@@ -40,7 +40,7 @@ def _toy_overlap():
     nodes = {
         "m1": {"node_type": "midmarker", "x": 0.0, "y": 0.0},
         "a": {"node_type": "metabolite", "x": 50.0, "y": 0.0, "bigg_id": "A_c", "node_is_primary": True},
-        "b": {"node_type": "metabolite", "x": 80.0, "y": 0.0, "bigg_id": "B_c", "node_is_primary": True},
+        "b": {"node_type": "metabolite", "x": 70.0, "y": 25.0, "bigg_id": "B_c", "node_is_primary": True},
     }
     reactions = {
         "1": {
