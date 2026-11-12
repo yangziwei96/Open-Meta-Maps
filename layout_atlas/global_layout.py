@@ -9,14 +9,13 @@ scaling for three reasons that sit in hashed files (not modified here):
   * `drawing.complete`    fCoSE subprocess with a fixed 90 s timeout
   * `drawing.export`      routing with libavoid and per-glyph scans (routing is switched off here, see `routing_status`)
 
-so this module provides `complete_global`, `scalable_scene_relax` and `deadline`, and `instance_table` (which visual node is which instance of
+so this module provides `complete_global`, `scalable_scene_relax`, and `instance_table` (which visual node is which instance of
 which GEM metabolite).  `tool_pipeline.draw_map(..., scalable=True)` uses them; the other steps (pack_modules, display_scene, export,
-integrity checks, source paths, provenance) are the unchanged ones.
+integrity checks, source paths, provenance) are the unchanged ones.  Layout search uses deterministic
+iteration / evaluation budgets only — no wall-clock stops.
 """
-import contextlib
 import copy
 import json
-import signal
 import subprocess
 from collections import Counter, defaultdict
 
@@ -29,22 +28,12 @@ import drawing
 import geometry
 
 
-@contextlib.contextmanager
-def deadline(seconds):
-    """Raise TimeoutError in the main thread after `seconds` (the pipeline runs one job per process, so SIGALRM is safe)."""
-    def handler(signum, frame):
-        raise TimeoutError(f'global layout budget of {seconds:.0f} s exceeded')
-    old = signal.signal(signal.SIGALRM, handler)
-    signal.setitimer(signal.ITIMER_REAL, seconds)
-    try:
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, old)
-
-
 def complete_global(g, anchors, seed=SEEDS[0], iterations=350, timeout=900):
-    """Same as `drawing.complete` for plain anchors (fCoSE, anchors fixed) with a timeout that fits thousands of nodes."""
+    """Same as `drawing.complete` for plain anchors (fCoSE, anchors fixed).
+
+    ``timeout`` is only a subprocess safety kill for a stuck Node backend; the
+    layout itself always runs a fixed ``iterations`` count (deterministic).
+    """
     xy = drawing.initial(g, anchors, seed)
     elements = [dict(data=dict(id=k), position=dict(x=xy[k][0], y=xy[k][1])) for k in sorted(g)]
     elements.extend(dict(data=dict(id='edge' + str(i), source=a, target=b)) for i, (a, b) in enumerate(sorted(g.edges())))
