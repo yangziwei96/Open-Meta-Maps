@@ -30,18 +30,19 @@ DEFAULT_K = 3
 MAX_ROUNDS = 4
 MAX_ACCEPTS = 20
 WINDOW_PAD = 40.0
-# Evaluation budget from window mass.  Calibrated on an unloaded machine (2026-11):
-# iIT341 completed 1815 evaluations under the former 45 s wall-clock stop
-# (1815/45 eval/s).  Constants below are the old second-scale coefficients × that rate.
-_EVALS_PER_SEC = 1815.0 / 45.0
+# Evaluation budget from window mass.  Calibrated on an unloaded agent VM (2026-11):
+# iIT341 on upstream main completed 1865 evaluations under the former 45 s
+# wall-clock stop (1865/45 eval/s).  Constants below are the old second-scale
+# coefficients × that rate.
+_EVALS_PER_SEC = 1865.0 / 45.0
 EVAL_PER_CROSS = 0.05 * _EVALS_PER_SEC   # evals per crossing in the top-k windows
 EVAL_PER_EDGE = 0.002 * _EVALS_PER_SEC    # evals per edge touching those windows
 EVAL_FLOOR = max(8, int(round(0.8 * _EVALS_PER_SEC)))
 EVAL_CAP = int(round(30.0 * _EVALS_PER_SEC))
 TRIES_PER_CROSS = 4.0  # try floor scales with window crossings
 # Pipeline raised budgets (former 35 s / 45 s wall clocks → evals).
-PIPELINE_EVALS_SMALL = int(round(35.0 * _EVALS_PER_SEC))  # 1412; e_coli_core class
-PIPELINE_EVALS_LARGE = int(round(45.0 * _EVALS_PER_SEC))  # 1815; iIT341 and up
+PIPELINE_EVALS_SMALL = int(round(35.0 * _EVALS_PER_SEC))  # ~1451; e_coli_core class
+PIPELINE_EVALS_LARGE = int(round(45.0 * _EVALS_PER_SEC))  # 1865; iIT341 and up
 
 
 def _is_currency(bigg):
