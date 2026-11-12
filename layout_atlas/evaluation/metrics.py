@@ -1,155 +1,45 @@
-"""Layout quality metrics aligned with Project 22 layout-benchmark rules.
+"""Layout metrics used by ``evaluate`` / packing helpers.
 
-Pathway-specific metrics are adapted from layout-benchmark `metrics.py` (MIT).
-General graph-drawing metrics come from gdMetriX when installed (GPL-3.0; optional
-import only — never vendored).
+Official layout-benchmark figures live in ``official_metrics`` (one shared
+implementation). This module keeps the MetaCarto-idea helpers
+(``blank_space``, ``unrelated_overlaps``) and thin wrappers that feed
+``evaluation.score`` without duplicating the official definitions.
 
-``blank_space`` and ``unrelated_overlaps`` are clean-room reimplementations of ideas
-from MetaCarto (`src/layout/metrics.py`, CC BY 4.0) — see docs/layout_evaluation.md.
+gdMetriX is never vendored. Optional external scoring against the installed
+``layout_benchmark`` package is ``evaluation.score_map``.
 """
 
 from __future__ import annotations
 
 import math
-import os
 from typing import Any, Iterable, Sequence
 
 import numpy as np
-from scipy.spatial import ConvexHull, cKDTree, procrustes
+from scipy.spatial import cKDTree
 from scipy.spatial.distance import pdist
+from scipy.spatial import procrustes
 from scipy.stats import spearmanr
 
 from .pathway import PRODUCT, REACTANT, SPECIES, Pathway
+import official_metrics as om
 
 Positions = dict[str, tuple[float, float]]
-SYMMETRY_MAX_NODES = 300
-CROSSING_MAX_EDGES = 1200  # number_of_crossings is quadratic; skip on large GEMs
-BLANK_CELL_FACTOR = 0.6  # cell size ≈ 0.6 × median reaction spacing (MetaCarto idea)
-BLANK_CLEAR_SPACINGS = 1.0  # a cell is blank if no ink within ~1× spacing
-
-try:
-    from shapely import STRtree, box
-    from shapely.geometry import Point, Polygon
-
-    _HAS_SHAPELY = True
-except ImportError:  # pragma: no cover - optional for core installs
-    _HAS_SHAPELY = False
-
-try:
-    import gdMetriX
-
-    _HAS_GDMETRIX = True
-except ImportError:  # pragma: no cover
-    gdMetriX = None  # type: ignore
-    _HAS_GDMETRIX = False
+BLANK_CELL_FACTOR = 0.6
+BLANK_CLEAR_SPACINGS = 1.0
 
 
 def gdmetrix_available() -> bool:
-    return _HAS_GDMETRIX
+    """Always False here: gdMetriX is not imported in this path (GPL-3.0)."""
+    return False
 
 
 def shapely_available() -> bool:
-    return _HAS_SHAPELY
-
-
-def general_metrics(pathway: Pathway, pos: Positions) -> dict[str, float | None]:
-    """gdMetriX metrics on the undirected graph. Values are None when gdMetriX is missing."""
-    if not _HAS_GDMETRIX:
-        return {
-            "crossings": None,
-            "crossing_density": None,
-            "crossing_angular_resolution": None,
-            "angular_resolution": None,
-            "edge_length_deviation": None,
-            "edge_orthogonality": None,
-            "stress": None,
-            "aspect_ratio": None,
-            "area_per_node": None,
-            "homogeneity": None,
-            "coherence_to_average_flow": None,
-            "visual_symmetry": None,
-            "gdmetrix": 0.0,
-        }
-    g = pathway.undirected().subgraph([n for n in pathway.undirected() if n in pos]).copy()
-    # gdMetriX needs every graph node in pos
-    missing = [n for n in g if n not in pos]
-    g.remove_nodes_from(missing)
-    n = g.number_of_nodes()
-    if n < 2 or g.number_of_edges() < 1:
-        return {k: None for k in (
-            "crossings", "crossing_density", "crossing_angular_resolution", "angular_resolution",
-            "edge_length_deviation", "edge_orthogonality", "stress", "aspect_ratio", "area_per_node",
-            "homogeneity", "coherence_to_average_flow", "visual_symmetry",
-        )} | {"gdmetrix": 1.0}
-    directed = pathway.graph.subgraph([n for n in pathway.graph if n in pos]).copy()
-    e = g.number_of_edges()
-    do_cross = e <= CROSSING_MAX_EDGES
-
-    def _f(fn, *a, **kw):
-        try:
-            return fn(*a, **kw)
-        except Exception:
-            return None
-
-    m = {
-        "crossings": _f(gdMetriX.number_of_crossings, g, pos=pos) if do_cross else None,
-        "crossing_density": _f(gdMetriX.crossing_density, g, pos=pos) if do_cross else None,
-        "crossing_angular_resolution": _f(gdMetriX.crossing_angular_resolution, g, pos=pos) if do_cross else None,
-        "angular_resolution": _f(gdMetriX.angular_resolution, g, pos=pos),
-        "edge_length_deviation": _f(gdMetriX.edge_length_deviation, g, pos=pos),
-        "edge_orthogonality": _f(gdMetriX.edge_orthogonality, g, pos=pos),
-        "stress": _f(gdMetriX.stress, g, pos=pos),
-        # gdMetriX aspect is kept under a separate key; public aspect_ratio is always W/H.
-        "gdmetrix_aspect_ratio": _f(gdMetriX.aspect_ratio, g, pos=pos),
-        "aspect_ratio": None,
-        "area_per_node": (lambda a: (a / max(n, 1)) if a is not None else None)(_f(gdMetriX.area, g, pos=pos)),
-        "homogeneity": _f(gdMetriX.homogeneity, g, pos=pos),
-        "coherence_to_average_flow": _f(gdMetriX.coherence_to_average_flow, directed, pos=pos),
-        # visual_symmetry opens a matplotlib figure; keep it opt-in via env OPM_EVAL_SYMMETRY=1
-        "visual_symmetry": (
-            _f(gdMetriX.visual_symmetry, g, pos=pos)
-            if n <= SYMMETRY_MAX_NODES and os.environ.get("OPM_EVAL_SYMMETRY") == "1"
-            else None
-        ),
-        "gdmetrix": 1.0,
-        "gdmetrix_crossings_computed": 1.0 if do_cross else 0.0,
-    }
-    return {k: (float(v) if v is not None else None) for k, v in m.items()}
-
-
-def _boxes(pathway: Pathway, pos: Positions):
-    nodes = [n for n in pathway.graph if n in pos]
-    boxes = []
-    for n in nodes:
-        d = pathway.graph.nodes[n]
-        x, y = pos[n]
-        w, h = d["width"] / 2, d["height"] / 2
-        boxes.append(box(x - w, y - h, x + w, y + h))
-    return nodes, boxes
-
-
-def overlaps(pathway: Pathway, pos: Positions) -> dict[str, float | None]:
-    """Pairs of node boxes that overlap (touching is no overlap), and overlap area share."""
-    if not _HAS_SHAPELY:
-        return {"overlapping_pairs": None, "overlap_area_share": None}
-    nodes, boxes_ = _boxes(pathway, pos)
-    if not boxes_:
-        return {"overlapping_pairs": 0.0, "overlap_area_share": 0.0}
-    tree = STRtree(boxes_)
-    pairs, area = 0, 0.0
-    for i, b in enumerate(boxes_):
-        for j in tree.query(b):
-            if j > i:
-                inter = b.intersection(boxes_[j]).area
-                if inter > 0:
-                    pairs += 1
-                    area += inter
-    total = sum(b.area for b in boxes_)
-    return {"overlapping_pairs": float(pairs), "overlap_area_share": area / total if total else 0.0}
+    """Compartment / overlap geometry no longer needs shapely."""
+    return True
 
 
 def participant_consistency(pathway: Pathway, pos: Positions) -> float | None:
-    """Share of (reactant, product) pairs on opposite sides of their reaction (>90°)."""
+    """Share of (reactant, product) pairs on opposite sides (>90°, layout-benchmark)."""
     g = pathway.graph
     opposite, pairs = 0, 0
     for r in pathway.reactions:
@@ -166,7 +56,6 @@ def participant_consistency(pathway: Pathway, pos: Positions) -> float | None:
 
 
 def participant_consistency_details(pathway: Pathway, pos: Positions, limit: int = 40) -> list[dict[str, Any]]:
-    """Worst reactions by opposite-side share (for localisation in the report)."""
     g = pathway.graph
     rows = []
     for r in pathway.reactions:
@@ -197,32 +86,59 @@ def participant_consistency_details(pathway: Pathway, pos: Positions, limit: int
     return rows[:limit]
 
 
+def overlaps(pathway: Pathway, pos: Positions) -> dict[str, float | None]:
+    """Box overlaps from pathway node width/height (evaluate CLI fallback).
+
+    Prefer ``official_metrics.glyph_overlaps`` on the Escher map when available.
+    """
+    nodes = [n for n in pathway.graph if n in pos]
+    if len(nodes) < 2:
+        return {"overlapping_pairs": 0.0, "overlap_area_share": 0.0}
+    pairs, area, total = 0, 0.0, 0.0
+    boxes = []
+    for n in nodes:
+        d = pathway.graph.nodes[n]
+        x, y = pos[n]
+        w, h = float(d.get("width", 10)) / 2, float(d.get("height", 10)) / 2
+        boxes.append((x - w, y - h, x + w, y + h))
+        total += (2 * w) * (2 * h)
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            a, b = boxes[i], boxes[j]
+            dx = min(a[2], b[2]) - max(a[0], b[0])
+            dy = min(a[3], b[3]) - max(a[1], b[1])
+            if dx > 0 and dy > 0:
+                pairs += 1
+                area += dx * dy
+    return {"overlapping_pairs": float(pairs), "overlap_area_share": area / total if total else 0.0}
+
+
 def compartment_metrics(pathway: Pathway, pos: Positions) -> dict[str, float | None]:
-    """Share of species inside another compartment's hull (0 = well separated)."""
-    if not _HAS_SHAPELY:
-        return {"species_in_other_compartment": None}
+    """Share of species inside another compartment hull (ConvexHull; no shapely)."""
     by_comp: dict[str, list[str]] = {}
     for n, d in pathway.graph.nodes(data=True):
         if d["kind"] == SPECIES and d.get("compartment") and n in pos:
             by_comp.setdefault(d["compartment"], []).append(n)
     if len(by_comp) < 2:
         return {"species_in_other_compartment": None}
+    from scipy.spatial import ConvexHull
+
     hulls = {}
     for c, members in by_comp.items():
-        pts = np.array([pos[n] for n in members])
+        pts = np.array([pos[n] for n in members], float)
         if len(pts) >= 3:
             try:
-                hulls[c] = Polygon(pts[ConvexHull(pts).vertices])
+                hulls[c] = pts[ConvexHull(pts).vertices]
             except (ValueError, RuntimeError):
                 continue
     species = [n for members in by_comp.values() for n in members]
-    if not species:
+    if not species or not hulls:
         return {"species_in_other_compartment": None}
     intruders = sum(
         1
         for n in species
         if any(
-            c != pathway.graph.nodes[n]["compartment"] and h.contains(Point(pos[n]))
+            c != pathway.graph.nodes[n]["compartment"] and om._point_in_hull(h, pos[n][0], pos[n][1])
             for c, h in hulls.items()
         )
     )
@@ -230,7 +146,6 @@ def compartment_metrics(pathway: Pathway, pos: Positions) -> dict[str, float | N
 
 
 def reference_similarity(pos: Positions, reference: Positions, k: int = 5) -> dict[str, float | None]:
-    """Similarity after Procrustes alignment: disparity, distance Spearman, kNN preservation."""
     common = sorted(set(pos) & set(reference))
     if len(common) < 3:
         return {"procrustes": None, "distance_correlation": None, "knn_preservation": None}
@@ -257,7 +172,6 @@ def reference_similarity(pos: Positions, reference: Positions, k: int = 5) -> di
 
 
 def long_edge_metrics(pathway: Pathway, pos: Positions, long_factor: float = 3.0) -> dict[str, float | None]:
-    """Edge-length statistics on placed undirected edges. ``long`` = length > long_factor × median."""
     lengths = []
     for u, v in pathway.undirected().edges():
         if u in pos and v in pos:
@@ -314,11 +228,6 @@ def long_edge_details(pathway: Pathway, pos: Positions, long_factor: float = 3.0
 
 
 def compactness_fallback(pos: Positions) -> dict[str, float | None]:
-    """Aspect ratio (W/H) and area per node without gdMetriX (axis-aligned bbox).
-
-    ``aspect_ratio`` is always width÷height (Project 22 / transfer-check definition),
-    not max/min. gdMetriX may still report its own aspect under ``gdmetrix_aspect_ratio``.
-    """
     if len(pos) < 2:
         return {"aspect_ratio": None, "aspect_ratio_bbox": None, "area_per_node_bbox": None}
     xy = np.array(list(pos.values()), float)
@@ -333,7 +242,6 @@ def compactness_fallback(pos: Positions) -> dict[str, float | None]:
 
 
 def _largest_empty_rectangle(empty: np.ndarray) -> int:
-    """Largest-area axis-aligned rectangle of True cells (histogram stack method)."""
     if empty.size == 0:
         return 0
     rows, cols = empty.shape
@@ -363,19 +271,7 @@ def blank_space(
     clear_spacings: float = BLANK_CLEAR_SPACINGS,
     pad_spacings: float = 0.5,
 ) -> dict[str, float | None]:
-    """Raster blank-space share and largest empty rectangle (MetaCarto idea; clean-room).
-
-    Grid cell size is ``cell_factor ×`` median reaction spacing (default 0.6). Nodes,
-    polyline segments and label boxes are stamped as ink. A cell counts as blank only
-    if no ink lies within ``clear_spacings ×`` spacing (default 1). Returns:
-
-    - ``blank_space_share`` — blank cells / cells
-    - ``largest_empty_rect_share`` — largest empty axis-aligned rectangle / canvas cells
-    - ``cell_px``, ``spacing_px``, ``grid`` shape metadata
-
-    Single implementation for the evaluation CLI, the Layout quality panel, and any
-    component-packing work that needs the same whitespace definition.
-    """
+    """Raster blank-space share and largest empty rectangle (MetaCarto idea; clean-room)."""
     pts = np.asarray(points if points is not None else np.zeros((0, 2)), float).reshape(-1, 2)
     segs = [] if segments is None else list(segments)
     boxes = [] if label_boxes is None else [tuple(map(float, b)) for b in label_boxes if len(b) >= 4]
@@ -413,7 +309,6 @@ def blank_space(
     y1 = float(all_xy[:, 1].max()) + pad
     ncols = max(int(math.ceil((x1 - x0) / cell)), 1)
     nrows = max(int(math.ceil((y1 - y0) / cell)), 1)
-    # Cap very large grids (huge GEMs) to keep evaluation interactive.
     max_cells = 400_000
     if ncols * nrows > max_cells:
         scale = math.sqrt((ncols * nrows) / max_cells)
@@ -447,7 +342,6 @@ def blank_space(
         r1 = min(int((max(y_a, y_b) - y0) // cell), nrows - 1)
         ink[r0 : r1 + 1, c0 : c1 + 1] = True
 
-    # Dilate ink: cell is non-blank if any ink is within clear_r.
     rad = int(math.ceil(clear_r / cell))
     occupied = ink.copy()
     if rad > 0 and ink.any():
@@ -485,7 +379,6 @@ def blank_space_from_positions(
     spacing: float | None = None,
     **kwargs: Any,
 ) -> dict[str, float | None]:
-    """``blank_space`` from node id→(x,y) and undirected edges (component-packing friendly)."""
     points = np.array(list(pos.values()), float).reshape(-1, 2) if pos else np.zeros((0, 2))
     segs = []
     if edges is not None:
@@ -500,13 +393,6 @@ def _collinear_edge_overlaps(
     related_sets: dict[str, set[str]],
     collinear_tol: float,
 ) -> int:
-    """Count nearly collinear overlapping segment pairs of unrelated reactions.
-
-    Same predicate as the previous all-pairs loop. Candidates are generated by a
-    uniform spatial grid over axis-aligned boxes grown by ``collinear_tol``: any
-    pair whose grown boxes are disjoint cannot satisfy the geometric tests, so the
-    result matches the all-pairs count exactly.
-    """
     n = len(seg_list)
     if n < 2:
         return 0
@@ -522,10 +408,8 @@ def _collinear_edge_overlaps(
     ok = N >= 1e-6
     U = np.zeros_like(D)
     U[ok] = D[ok] / N[ok, None]
-    # Grown AABB of each segment (pad = collinear_tol).
     lo = np.minimum(A, B) - collinear_tol
     hi = np.maximum(A, B) + collinear_tol
-    # Cell size ≈ typical segment extent so buckets stay small but cover the pad.
     span = hi - lo
     cell = float(max(4.0 * collinear_tol, np.median(np.maximum(span[:, 0], span[:, 1])) if n else 4.0 * collinear_tol))
     if cell < 1e-6:
@@ -556,14 +440,13 @@ def _collinear_edge_overlaps(
                 if key in seen:
                     continue
                 seen.add(key)
-                # Grown-AABB rejection (exact filter for the distance/overlap tests).
                 if hi[i, 0] < lo[j, 0] or hi[j, 0] < lo[i, 0] or hi[i, 1] < lo[j, 1] or hi[j, 1] < lo[i, 1]:
                     continue
                 ra, rb = rid[i], rid[j]
                 if ra == rb or rb in related_sets.get(ra, ()) or ra in related_sets.get(rb, ()):
                     continue
                 u1, a1, n1 = U[i], A[i], N[i]
-                if abs(float(u1 @ U[j])) < 0.98:  # not nearly parallel
+                if abs(float(u1 @ U[j])) < 0.98:
                     continue
                 off = A[j] - a1
                 if abs(float(off[0] * u1[1] - off[1] * u1[0])) > collinear_tol:
@@ -572,7 +455,7 @@ def _collinear_edge_overlaps(
                 pb = float((B[j] - a1) @ u1)
                 lo_p = max(0.0, min(pa, pb))
                 hi_p = min(n1, max(pa, pb))
-                if hi_p - lo_p > collinear_tol:  # overlapping run
+                if hi_p - lo_p > collinear_tol:
                     collinear += 1
     return collinear
 
@@ -587,14 +470,6 @@ def unrelated_overlaps(
     node_radius: float = 7.0,
     collinear_tol: float = 3.0,
 ) -> dict[str, float | None]:
-    """Overlaps between reactions that share no non-currency metabolite (MetaCarto idea).
-
-    Counts:
-    - ``unrelated_node_overlaps`` — node centres of unrelated reactions closer than 2×radius
-    - ``unrelated_edge_through_node`` — a segment of reaction A passes near a node of unrelated B
-    - ``unrelated_collinear_edge_overlaps`` — nearly collinear overlapping segment pairs of unrelated reactions,
-      measured on ``chords`` when given (one straight piece per connection), else on ``segments``
-    """
     ids = [n for n in node_xy if n in node_reaction]
     if len(ids) < 2:
         return {
@@ -613,7 +488,6 @@ def unrelated_overlaps(
             return True
         return b in related_sets.get(a, ()) or a in related_sets.get(b, ())
 
-    # node-on-node
     xy = np.array([node_xy[n] for n in ids], float)
     tree = cKDTree(xy)
     node_hits = 0
@@ -621,7 +495,6 @@ def unrelated_overlaps(
         if not related_pair(node_reaction[ids[i]], node_reaction[ids[j]]):
             node_hits += 1
 
-    # edge through node (query nearby node centres only)
     through = 0
     for rid_a, _nid_u, a, b in segments:
         ab = b - a
@@ -643,7 +516,6 @@ def unrelated_overlaps(
             if float(np.hypot(*(p - proj))) <= node_radius:
                 through += 1
 
-    # collinear edge-on-edge (unrelated): spatial grid, same count as all-pairs
     collinear = _collinear_edge_overlaps(
         list(segments if chords is None else chords), related_sets, collinear_tol
     )
@@ -656,6 +528,43 @@ def unrelated_overlaps(
     }
 
 
+def general_metrics(pathway: Pathway, pos: Positions) -> dict[str, float | None]:
+    """Purchase-style general metrics without importing gdMetriX.
+
+    ``edge_length_deviation`` / ``edge_orthogonality`` use straight undirected
+    edges of the placed pathway graph (evaluate CLI). Final-map figures use
+    ``official_metrics`` on Escher polylines.
+    """
+    g = pathway.undirected().subgraph([n for n in pathway.undirected() if n in pos]).copy()
+    missing = [n for n in g if n not in pos]
+    g.remove_nodes_from(missing)
+    if g.number_of_nodes() < 2 or g.number_of_edges() < 1:
+        return {
+            "crossings": None,
+            "edge_length_deviation": None,
+            "edge_orthogonality": None,
+            "aspect_ratio": None,
+            "gdmetrix": 0.0,
+        }
+    segs = []
+    lengths = []
+    for u, v in g.edges():
+        a, b = pos[u], pos[v]
+        segs.append((a, b))
+        lengths.append(float(np.hypot(a[0] - b[0], a[1] - b[1])))
+    mean = float(np.mean(lengths)) if lengths else 0.0
+    eld = float(np.mean([abs(mean - x) / mean for x in lengths])) if mean else None
+    eorth = om.edge_orthogonality(segs)
+    compact = compactness_fallback(pos)
+    return {
+        "crossings": None,  # use official_metrics on the Escher map
+        "edge_length_deviation": eld,
+        "edge_orthogonality": eorth,
+        "aspect_ratio": compact.get("aspect_ratio"),
+        "gdmetrix": 0.0,
+    }
+
+
 def all_benchmark_metrics(pathway: Pathway, pos: Positions, reference: Positions | None = None) -> dict[str, float | None]:
     m = general_metrics(pathway, pos)
     m.update(overlaps(pathway, pos))
@@ -664,12 +573,10 @@ def all_benchmark_metrics(pathway: Pathway, pos: Positions, reference: Positions
     m.update(long_edge_metrics(pathway, pos))
     compact = compactness_fallback(pos)
     m.update(compact)
-    # Prefer W/H bbox aspect; leave gdMetriX value only under gdmetrix_aspect_ratio.
     if compact.get("aspect_ratio") is not None:
         m["aspect_ratio"] = compact["aspect_ratio"]
     if m.get("area_per_node") is None and compact.get("area_per_node_bbox") is not None:
         m["area_per_node"] = compact["area_per_node_bbox"]
-    # Raster blank space on the placed undirected graph (same function the panel uses).
     m.update(
         {
             k: v

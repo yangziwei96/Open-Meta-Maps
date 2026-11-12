@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import escher_bridge, findings, metrics
+from . import escher_bridge, findings, metrics, score_map
 from .pathway import read_sbml
 from .stability import position_displacement, reproducibility
 
@@ -97,6 +97,23 @@ def score_escher_map(
     sub_pathway = Pathway(name=pathway.name, graph=sub, compartments=pathway.compartments, source=pathway.source)
 
     benchmark = metrics.all_benchmark_metrics(sub_pathway, pos_metric, reference=ref_pos)
+    # Prefer shared official_metrics on the final Escher geometry (one implementation).
+    official = score_map.score_official(escher_map)
+    for key in (
+        "crossings",
+        "overlapping_pairs",
+        "overlap_area_share",
+        "participant_consistency",
+        "edge_length_deviation",
+        "edge_orthogonality",
+        "species_in_other_compartment",
+        "aspect_ratio",
+    ):
+        if official.get(key) is not None:
+            benchmark[key] = official[key]
+    benchmark["official"] = official
+    if score_map.layout_benchmark_available():
+        benchmark["layout_benchmark_external"] = score_map.score_with_layout_benchmark(gem_path, escher_map)
     geom_summary, geom_issues = (None, None)
     structures = _structures_near_map(Path(map_path) if map_path else None, escher_map)
     # Final-geometry (curve sampling) is O(segments²); skip automatically on large GEMs.
@@ -162,7 +179,11 @@ def score_escher_map(
         coverage=cov,
         runtime_seconds=seconds,
         metric_seconds=round(time.perf_counter() - t0, 3),
-        dependencies=dict(gdmetrix=metrics.gdmetrix_available(), shapely=metrics.shapely_available()),
+        dependencies=dict(
+            gdmetrix=metrics.gdmetrix_available(),
+            shapely=metrics.shapely_available(),
+            layout_benchmark=score_map.layout_benchmark_available(),
+        ),
         benchmark=benchmark,
         geometry=geom_summary,
         structure_continuity=continuity,
@@ -170,10 +191,10 @@ def score_escher_map(
         note=(
             "Development evaluation (not a fair tool comparison). "
             "Atlas sources are never excluded for evaluation overlap. "
-            "Pathway metrics adapted from elixir2026-project22/layout-benchmark (MIT); "
+            "Official figures from official_metrics (layout-benchmark definitions, MIT; "
+            "gdMetriX never vendored); optional layout-benchmark import via score_map; "
             "transfer-check field names for cofactor/cycle/flow rules; "
-            "120° opposite-side threshold is a Project 22 first guess; "
-            "gdMetriX is optional (GPL-3.0, CLI-only extras)."
+            "participant consistency uses >90°."
         ),
     )
 

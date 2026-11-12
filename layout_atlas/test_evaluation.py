@@ -37,12 +37,43 @@ def test_long_edge_share():
 
 
 def test_overlaps_no_touch():
-    if not metrics.shapely_available():
-        return
     p = _toy()
     pos = {"r1": (0.0, 0.0), "A": (-100.0, 0.0), "B": (100.0, 0.0), "C": (0.0, 100.0)}
     m = metrics.overlaps(p, pos)
     assert m["overlapping_pairs"] == 0.0
+
+
+def test_score_map_official_path():
+    from evaluation import score_map
+    import official_metrics as om
+
+    data = [
+        {"metadata": {}},
+        {
+            "nodes": {
+                "m1": {"node_type": "midmarker", "x": 0.0, "y": 0.0},
+                "a": {"node_type": "metabolite", "x": -40.0, "y": 0.0, "bigg_id": "A_c", "node_is_primary": True},
+                "b": {"node_type": "metabolite", "x": 40.0, "y": 0.0, "bigg_id": "B_c", "node_is_primary": True},
+            },
+            "reactions": {
+                "1": {
+                    "bigg_id": "R1",
+                    "metabolites": [
+                        {"bigg_id": "A_c", "coefficient": -1},
+                        {"bigg_id": "B_c", "coefficient": 1},
+                    ],
+                    "segments": {
+                        "0": {"from_node_id": "m1", "to_node_id": "a"},
+                        "1": {"from_node_id": "m1", "to_node_id": "b"},
+                    },
+                }
+            },
+            "canvas": {"width": 100, "height": 40},
+        },
+    ]
+    out = score_map.score_map("examples/e_coli_core.xml", escher_map=data, use_layout_benchmark=False)
+    assert out["official"]["participant_consistency"] == 1.0
+    assert out["official"]["crossings"] == om.score_escher_map(data)["crossings"]
 
 
 def test_blank_space_empty_canvas_mostly_blank():

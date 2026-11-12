@@ -26,7 +26,9 @@ CURRENCY_LONG_SPACING_FACTOR = 3.0
 OPPOSITE_DEG = 120.0  # transfer-check / OpenMetaMaps orientation default
 PARTICIPANT_CONSISTENCY_DEG = 90.0  # layout-benchmark participant_consistency
 PERIPHERY_BAND = 0.2  # outer 20% of component hull radius
-ASPECT_RATIO_TARGET = 1.0
+ASPECT_RATIO_TARGET = "4:3–16:9"  # packing band; miss only outside ASPECT_MIN–ASPECT_MAX
+ASPECT_MIN = 4.0 / 3.0
+ASPECT_MAX = 16.0 / 9.0
 BEND_TURN_DEG = 20.0
 AXIS_ALIGN_DEG = 10.0  # ±10° of horizontal or vertical
 # Small fraction of median nearest-neighbour main-metabolite distance (not the full
@@ -650,24 +652,30 @@ def content_bbox(body: dict, canvas: dict | None = None) -> dict[str, float | No
     if len(xy) < 2:
         if canvas and canvas.get("width") and canvas.get("height"):
             w, h = float(canvas["width"]), float(canvas["height"])
+            aspect = w / max(h, 1e-9)
+            in_band = ASPECT_MIN - 1e-9 <= aspect <= ASPECT_MAX + 1e-9
             return dict(
                 width=round(w, 1),
                 height=round(h, 1),
-                aspect_ratio=round(w / max(h, 1e-9), 4),
+                aspect_ratio=round(aspect, 4),
                 aspect_ratio_target=ASPECT_RATIO_TARGET,
-                aspect_ratio_vs_target=round(abs(w / max(h, 1e-9) - ASPECT_RATIO_TARGET), 4),
+                aspect_ratio_vs_target=0.0 if in_band else round(min(abs(aspect - ASPECT_MIN), abs(aspect - ASPECT_MAX)), 4),
+                aspect_in_band=in_band,
                 source="canvas",
             )
         return dict(width=None, height=None, aspect_ratio=None, aspect_ratio_target=ASPECT_RATIO_TARGET,
-                    aspect_ratio_vs_target=None, source=None)
+                    aspect_ratio_vs_target=None, aspect_in_band=None, source=None)
     w = float(xy[:, 0].max() - xy[:, 0].min())
     h = float(xy[:, 1].max() - xy[:, 1].min())
+    aspect = w / max(h, 1e-9)
+    in_band = ASPECT_MIN - 1e-9 <= aspect <= ASPECT_MAX + 1e-9
     return dict(
         width=round(w, 1),
         height=round(h, 1),
-        aspect_ratio=round(w / max(h, 1e-9), 4),
+        aspect_ratio=round(aspect, 4),
         aspect_ratio_target=ASPECT_RATIO_TARGET,
-        aspect_ratio_vs_target=round(abs(w / max(h, 1e-9) - ASPECT_RATIO_TARGET), 4),
+        aspect_ratio_vs_target=0.0 if in_band else round(min(abs(aspect - ASPECT_MIN), abs(aspect - ASPECT_MAX)), 4),
+        aspect_in_band=in_band,
         source="content_nodes",
     )
 
@@ -678,45 +686,14 @@ def aspect_ratio_wh(body: dict, canvas: dict | None = None) -> dict[str, float |
 
 
 def species_in_other_compartment(body: dict) -> float | None:
-    """Share of metabolite glyphs inside another compartment's hull (map-native ids)."""
-    try:
-        from shapely.geometry import Point, Polygon
-    except ImportError:
-        return None
-    by_comp: dict[str, list[tuple[float, float]]] = defaultdict(list)
-    members: list[tuple[str, float, float]] = []
-    for n in body["nodes"].values():
-        if n.get("node_type") != "metabolite":
-            continue
-        mid = n.get("bigg_id") or ""
-        c = None
-        m = re.search(r"_([a-z][0-9]?)$", mid)
-        if m:
-            c = m.group(1)
-        if not c:
-            continue
-        xy = (float(n["x"]), float(n["y"]))
-        by_comp[c].append(xy)
-        members.append((c, xy[0], xy[1]))
-    if len(by_comp) < 2 or not members:
-        return None
-    hulls = {}
-    for c, pts in by_comp.items():
-        arr = np.array(pts, float)
-        if len(arr) < 3:
-            continue
-        try:
-            hulls[c] = Polygon(arr[ConvexHull(arr).vertices])
-        except Exception:
-            continue
-    if not hulls:
-        return None
-    intruders = sum(
-        1
-        for c, x, y in members
-        if any(oc != c and h.contains(Point(x, y)) for oc, h in hulls.items())
-    )
-    return intruders / len(members)
+    """Share of metabolite glyphs inside another compartment's hull (map-native ids).
+
+    Delegates to ``official_metrics.species_in_other_compartment`` (ConvexHull +
+    ray casting; no optional shapely).
+    """
+    import official_metrics as om
+
+    return om.species_in_other_compartment([{}, body])
 
 
 def collect_map_rule_details(
@@ -754,11 +731,11 @@ def collect_map_rule_details(
         round(v, 4) if (v := species_in_other_compartment(body)) is not None else None
     )
     out["thresholds_note"] = (
-        f"inout opposite ≥{OPPOSITE_DEG}° is a Project 22 first guess; "
-        f"participant_consistency >{PARTICIPANT_CONSISTENCY_DEG}° stays on the evaluate CLI; "
+        f"official participant_consistency >{PARTICIPANT_CONSISTENCY_DEG}° on the panel; "
+        f"orientation diagnostic still reports ≥{OPPOSITE_DEG}° under details.orientation; "
         "hub/long currency thresholds are relative to median reaction spacing; "
         "blank_space / unrelated_overlaps follow MetaCarto ideas (CC BY 4.0; reimplemented, not copied); "
-        "map size, aspect W/H and blank/utilisation share one content-node bbox; "
+        "map size, aspect W/H (4:3–16:9 band) and blank/utilisation share one content-node bbox; "
         f"orderliness axis tolerance ±{AXIS_ALIGN_DEG:g}° (count-weighted gate; length-weighted reported); "
         f"grid tolerance {GRID_TOL_NN_FRAC:g} × median nearest-neighbour "
         f"main-metabolite distance (floor {GRID_TOL_FLOOR_PX:g} px)"

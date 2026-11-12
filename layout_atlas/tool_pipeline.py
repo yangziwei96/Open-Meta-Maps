@@ -1117,6 +1117,12 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                 hr = metric['hotspot_repair']
                 log('  hotspot repair: ' + str({k: hr.get(k) for k in ('accepted_count', 'tries', 'rounds', 'seconds', 'improved')}))
             dump(folder / 'map.json', data)
+        # Final Escher-radius overlap clear so the quality gate sees official footprints.
+        data, _ov_final = _ca_es.clear_rigid_node_overlaps_escher(data, blocks)
+        metric['official_overlap_clear'] = _ov_final
+        if log and _ov_final.get('moved'):
+            log(f"  clear official Escher overlaps: moved {_ov_final['moved']} nodes")
+        dump(folder / 'map.json', data)
         # Shrink canvas to content so empty frame padding does not inflate blank/empty gates.
         if not PREVIOUS_SKIP_PACK:
             import composition as _comp_fit

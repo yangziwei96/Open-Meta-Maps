@@ -55,7 +55,9 @@ def _score(data, skip_edges, structures=None):
     cross = summary['core']['crossings']
     coll = summary['core'].get('collisions') or summary['core'].get('overlaps') or {}
     cont = summary['core']['structure_continuity'] or {}
-    alg = int(cross.get('counted') or (cross['algorithm_algorithm'] + cross.get('algorithm_curated', cross.get('algorithm_expert', 0))))
+    # Local repair still tracks algorithm×algorithm + algorithm×curated curve crossings
+    # (not the official all-pieces headline) so budgets stay comparable across branches.
+    alg = int(cross.get('algorithm_counted') or (cross['algorithm_algorithm'] + cross.get('algorithm_curated', cross.get('algorithm_expert', 0))))
     windows = list(summary.get('worst_regions') or [])
     return dict(
         summary=summary,

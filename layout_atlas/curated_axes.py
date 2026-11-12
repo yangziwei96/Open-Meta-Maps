@@ -871,16 +871,20 @@ def clear_rigid_node_overlaps(scene, blocks, min_dist=12.0):
     return scene, dict(moved=moved, rigid_keys=len(rigid_keys))
 
 
-def clear_rigid_node_overlaps_escher(data, blocks, min_dist=12.0):
-    """Nudge Escher metabolite nodes so centres stay ≥ ``min_dist`` after rigid restore.
+def clear_rigid_node_overlaps_escher(data, blocks, min_dist=None):
+    """Nudge Escher nodes so official glyph footprints no longer overlap after rigid restore.
 
-    Prefers moving glyphs that are not exclusive to ``same_map_rigid`` reactions;
-    if both ends are rigid (duplicate same-bigg), nudges the non-primary copy.
-    Uses a KD-tree so mid/large maps stay cheap (brute pairs cost minutes on iIT341).
+    Separation uses Escher radii (primary 20 / secondary 10 / marker 5): centres must
+    stay strictly farther than r_i + r_j (touching is allowed). Prefers moving glyphs
+    that are not exclusive to ``same_map_rigid`` reactions; if both ends are rigid
+    (duplicate same-bigg), nudges the non-primary copy. Curated rigid pairs that both
+    refuse to move are left for translation-only module repair. Uses a KD-tree so
+    mid/large maps stay cheap.
     """
     if not data or len(data) < 2:
         return data, dict(moved=0)
     from scipy.spatial import cKDTree
+    import official_metrics as om
     rigid_rx = rigid_reaction_ids(blocks)
     nodes = data[1].get('nodes') or {}
     reactions = data[1].get('reactions') or {}
@@ -906,6 +910,13 @@ def clear_rigid_node_overlaps_escher(data, blocks, min_dist=12.0):
     ids = [nid for nid, n in nodes.items() if n.get('node_type') in ('metabolite', 'midmarker')]
     if len(ids) < 2:
         return data, dict(moved=0)
+    radii = []
+    for nid in ids:
+        r = om._glyph_radius(nodes[nid])
+        radii.append(float(r if r is not None else om.ESCHER_RADIUS['marker']))
+    # Optional legacy floor (old 12 px centre gap) when explicitly requested.
+    floor = float(min_dist) if min_dist is not None else 0.0
+    max_need = max(radii) * 2.0 + 1e-3
     moved = 0
 
     def _can_move(nid):
@@ -916,9 +927,9 @@ def clear_rigid_node_overlaps_escher(data, blocks, min_dist=12.0):
             return True
         return False
 
-    for _ in range(40):
+    for _ in range(60):
         xy = np.asarray([[float(nodes[i]['x']), float(nodes[i]['y'])] for i in ids], float)
-        pairs = cKDTree(xy).query_pairs(min_dist, output_type='ndarray')
+        pairs = cKDTree(xy).query_pairs(max_need, output_type='ndarray')
         if len(pairs) == 0:
             break
         hit = False
@@ -926,7 +937,8 @@ def clear_rigid_node_overlaps_escher(data, blocks, min_dist=12.0):
             a, b = ids[int(i)], ids[int(j)]
             d = xy[int(j)] - xy[int(i)]
             dist = float(np.hypot(d[0], d[1]))
-            if dist >= min_dist:
+            need = max(radii[int(i)] + radii[int(j)], floor) + 1e-3  # strict: no positive-area overlap
+            if dist >= need:
                 continue
             move_a, move_b = _can_move(a), _can_move(b)
             if not (move_a or move_b):
@@ -940,7 +952,7 @@ def clear_rigid_node_overlaps_escher(data, blocks, min_dist=12.0):
                 ang = ((hash(a) + hash(b)) % 360) * math.pi / 180.0
                 d = np.array([math.cos(ang), math.sin(ang)])
                 dist = 1.0
-            step = d / dist * (min_dist - dist)
+            step = d / dist * (need - dist)
             # Track midmarker deltas so reaction labels stay with their anchors.
             mid_delta = {}
             if move_a and move_b:
@@ -972,7 +984,7 @@ def clear_rigid_node_overlaps_escher(data, blocks, min_dist=12.0):
             moved += 1
         if not hit:
             break
-    return data, dict(moved=moved, rigid_nodes=len(rigid_nids))
+    return data, dict(moved=moved, rigid_nodes=len(rigid_nids), mode='escher_radii')
 
 
 def restore_rigid_group(scene, blocks):

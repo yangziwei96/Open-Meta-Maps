@@ -1,12 +1,17 @@
 # Attribution
 
-Pathway-specific layout metrics in this package (`metrics.py` overlaps, participant
-consistency, compartment metrics, reference similarity; `pathway.py` SBML graph
-reading; `escher_bridge.py` Escher map → drawing positions) are adapted from
+Official layout-benchmark metric *definitions* are reimplemented in
+`layout_atlas/official_metrics.py` (clean-room; MIT definitions from
 [layout-benchmark](https://github.com/elixir2026-project22/layout-benchmark)
-(`src/layout_benchmark/metrics.py`, `graph.py`, `external.py` `escher_drawing`,
-`reference.py`), Copyright 2026 the layout-benchmark copyright holders, licensed
-under the MIT License (see that repository's `LICENSE.md`).
+at commit `837067d`). That shared module is the single implementation used by
+the quality gate, the Layout quality panel, and `evaluation.score` /
+`evaluation.score_map`.
+
+Pathway graph reading (`pathway.py`), Escher position helpers
+(`escher_bridge.py`), and optional external scoring (`score_map.py` importing
+`layout_benchmark` when installed) remain adapted from the same project
+(Copyright 2026 the layout-benchmark copyright holders, MIT — see that
+repository's `LICENSE.md`).
 
 Transfer-check field names (`currency_hub_violations`, `currency_long_arc_share`,
 `inout_opposite_share`, `edge_len_max_rel`, `bends_per_arc`, `cycle_circularity`,
@@ -18,5 +23,6 @@ and are reimplemented in `map_rules.py` / `layout_quality.py` (no GPL code copie
 [MetaCarto](https://github.com/forxhunter/MetaCarto) (`src/layout/metrics.py`,
 CC BY 4.0). MetaCarto code is not copied; see `docs/layout_evaluation.md`.
 
-gdMetriX is **not** included here. When installed separately it may be imported at
-runtime for general graph-drawing metrics; it remains GPL-3.0 and optional.
+gdMetriX is **not** included here and is never imported on the default evaluate
+path (GPL-3.0). Install layout-benchmark separately if you want its external
+scorer via `evaluation.score_map`.

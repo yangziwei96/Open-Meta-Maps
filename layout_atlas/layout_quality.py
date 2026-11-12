@@ -1,9 +1,10 @@
 """Final-geometry measures used by the quality gate and the Layout quality panel.
 
 One computation path: ``evaluate()`` feeds the quality gate, the tool panel, and
-``python3 project.py evaluate`` (via ``evaluation.score``). Project 22
-layout-benchmark / layout-transfer-check field names are used where they exist;
-gdMetriX extras stay CLI-only (optional GPL import, never vendored).
+``python3 project.py evaluate`` (via ``evaluation.score``). Official
+layout-benchmark figures (crossings on all pieces, Escher glyph overlaps,
+90° participant consistency, edge length deviation, edge orthogonality) come
+from ``official_metrics`` (clean-room definitions; gdMetriX never vendored).
 
 User-facing wording uses **curated**, not "expert". Internal aliases
 ``algorithm_expert`` / ``expert_expert`` remain for the quality gate.
@@ -12,6 +13,7 @@ Also contains metric_details and assert_chemistry (used by compose).
 """
 import numpy as np
 
+import official_metrics as om
 import source_paths as sp
 
 try:
@@ -186,16 +188,16 @@ def evaluate(data, skip_edges=None, orientation_kinds=None, max_issues=4000, str
                     found_label = True
                     hit_points.append(dict(kind='label', reaction=e['rid'], metabolite=e['met'], label=label_of[c], x=round(float(a[0]), 1), y=round(float(a[1]), 1)))
         node_hits += int(found_node); label_hits += int(found_label)
-    # ---- glyph overlaps and label collisions
+    # ---- official Escher glyph overlaps (+ labels for the quality gate)
     from scipy.spatial import cKDTree
     centres = np.array([[n['x'], n['y']] for n in nodes.values() if n.get('node_type') in ('metabolite', 'midmarker')], float)
+    official = om.score_escher_map(data)
+    ov_official = om.glyph_overlaps(data, include_labels=False)
+    ov_gate = om.glyph_overlaps(data, include_labels=True)
+    node_overlap_n = int(ov_official['glyph_pairs'])
+    label_overlap = int(ov_gate['label_pairs']) + int(ov_gate['glyph_label_pairs'])
+    # Legacy centre pairs kept only for worst-region node_overlap pins (approximate).
     node_overlap = list(cKDTree(centres).query_pairs(10)) if len(centres) > 1 else []
-    lab_idx = [i for i, k in enumerate(kind) if k == 'label']
-    label_overlap = 0
-    for ii, i in enumerate(lab_idx):
-        for j in _grid_query(grid_r, rects[i][:2], rects[i][2:]):
-            if j > i and kind[j] == 'label' and rects[j][0] < rects[i][2] and rects[i][0] < rects[j][2] and rects[j][1] < rects[i][3] and rects[i][1] < rects[j][3]:
-                label_overlap += 1
     # ---- length, detour, Bezier representation, curve anomalies
     lengths, detours = [], []
     bez_edges = poly_edges = ortho_edges = straight_edges = hooks = sharp = selfx = 0
@@ -280,19 +282,36 @@ def evaluate(data, skip_edges=None, orientation_kinds=None, max_issues=4000, str
         densest_cell = int(max(counts.values()))
         outlier_rows = [dict(x=round(float(mids_xy[i][0]), 1), y=round(float(mids_xy[i][1]), 1), neighbour5_px=round(float(d5[i]))) for i in outliers[:200]]
     n_alg = max(len(algo), 1)
+    # Source-split curve crossings stay for diagnostics / hotspot windows; the
+    # Layout quality headline uses the official all-pieces count.
     counted_cross = cross['algorithm_algorithm'] + cross['algorithm_curated']
+    official_cross = int(official['crossings'])
     continuity = _structure_continuity(data, structures=structures)
     # Keep the card payload small; full per-structure rows go under details.
     continuity_core = {k: continuity.get(k) for k in (
         'contiguous_pair_share', 'pairs', 'contiguous_pairs', 'structures', 'split_structures',
         'split_structure_share', 'reaction_spacing_px', 'adjacency_factor', 'note')}
-    # Participant placement: ≥120° (transfer-check first guess); core = non-currency only.
+    # Participant placement: official >90° (layout-benchmark); core = non-currency (120° diagnostic retained under orientation).
     place_all = ori.get('all_participants') or {}
     place_core = ori.get('core_participants') or {}
+    official_participant = official.get('participant_consistency')
     p90_px = float(np.percentile(all_len, 90)) if len(all_len) else 0.0
     med_len = float(np.median(all_len)) if len(all_len) else 0.0
     max_rel = round(float(np.max(all_len) / max(med_len, 1e-9)), 3) if len(all_len) else None
     rules = collect_map_rule_details(data, edges, all_len, spacing)
+    # Official aspect band (4:3–16:9) overrides the old target-1.0 miss flag.
+    aspect_info = om.content_aspect(data)
+    rules['aspect_ratio'] = aspect_info.get('aspect_ratio')
+    rules['aspect_ratio_target'] = aspect_info.get('aspect_band_label')
+    rules['aspect_ratio_vs_target'] = None if aspect_info.get('aspect_in_band') is None else (
+        0.0 if aspect_info.get('aspect_in_band') else abs(float(aspect_info['aspect_ratio']) - om.ASPECT_MIN)
+    )
+    rules['aspect_in_band'] = aspect_info.get('aspect_in_band')
+    rules['aspect_min'] = aspect_info.get('aspect_min')
+    rules['aspect_max'] = aspect_info.get('aspect_max')
+    rules['species_in_other_compartment'] = official.get('species_in_other_compartment')
+    rules['edge_length_deviation'] = official.get('edge_length_deviation')
+    rules['edge_orthogonality'] = official.get('edge_orthogonality')
     # One content bbox for map size / aspect / blank·utilisation (see map_rules.content_bbox).
     bbox_w, bbox_h = rules.get('width'), rules.get('height')
     blank_share = rules.get('blank_space_share')
@@ -301,10 +320,11 @@ def evaluate(data, skip_edges=None, orientation_kinds=None, max_issues=4000, str
     if bbox_w is not None and bbox_h is not None:
         comp = dict(
             canvas=[round(float(bbox_w)), round(float(bbox_h))],
-            aspect=rules.get('aspect_ratio'),
-            aspect_ratio=rules.get('aspect_ratio'),
-            aspect_ratio_target=rules.get('aspect_ratio_target'),
+            aspect=aspect_info.get('aspect_ratio'),
+            aspect_ratio=aspect_info.get('aspect_ratio'),
+            aspect_ratio_target=aspect_info.get('aspect_band_label'),
             aspect_ratio_vs_target=rules.get('aspect_ratio_vs_target'),
+            aspect_in_band=aspect_info.get('aspect_in_band'),
             blank_space_share=blank_share,
             space_utilisation=space_util,
             largest_empty_rect_share=rules.get('largest_empty_rect_share'),
@@ -320,9 +340,13 @@ def evaluate(data, skip_edges=None, orientation_kinds=None, max_issues=4000, str
         long_threshold_spacings=rules.get('long_threshold_spacings'),
     )
     overlaps = dict(
-        overlapping_pairs=len(node_overlap) + label_overlap,
-        node_overlap_pairs=len(node_overlap),
+        overlapping_pairs=int(ov_gate['overlapping_pairs']),
+        node_overlap_pairs=node_overlap_n,
         label_overlap_pairs=label_overlap,
+        official_glyph_pairs=int(ov_official['overlapping_pairs']),
+        gate_glyph_pairs=int(ov_gate['glyph_pairs']),
+        gate_label_pairs=int(ov_gate['label_pairs']),
+        gate_glyph_label_pairs=int(ov_gate['glyph_label_pairs']),
         curves_through_nodes=node_hits,
         curves_through_labels=label_hits,
     )
@@ -332,7 +356,10 @@ def evaluate(data, skip_edges=None, orientation_kinds=None, max_issues=4000, str
     if bezier['share'] < 0.999:
         warnings.append(dict(code='bezier_coverage', message='algorithm connections as Bézier must be 100%', share=bezier['share']))
     cross_out = dict(
-        counted=counted_cross,
+        counted=official_cross,
+        official=official_cross,
+        pieces=int(official.get('pieces') or 0),
+        algorithm_counted=counted_cross,
         total=counted_cross + cross['curated_curated'] + cross['same_reaction'] + cross['same_reaction_curated'],
         same_reaction=cross['same_reaction'],
         same_reaction_curated=cross['same_reaction_curated'],
@@ -344,7 +371,7 @@ def evaluate(data, skip_edges=None, orientation_kinds=None, max_issues=4000, str
         expert_expert=cross['curated_curated'],  # alias
         main_metabolite=cross['main_metabolite'],
         currency_involved=cross['currency_involved'],
-        per_100_edges=round(100.0 * counted_cross / n_alg, 2),
+        per_100_edges=round(100.0 * official_cross / max(int(official.get('drawn_edges') or n_alg), 1), 2),
     )
     line_shape = dict(
         detour_median=round(float(np.median(detours)), 3) if detours else None,
@@ -403,13 +430,22 @@ def evaluate(data, skip_edges=None, orientation_kinds=None, max_issues=4000, str
         space_utilisation=space_util,
         largest_empty_rect_share=rules.get('largest_empty_rect_share'),
         unrelated_overlaps=unrelated,
-        aspect_ratio=rules.get('aspect_ratio'),
-        aspect_ratio_target=rules.get('aspect_ratio_target'),
+        aspect_ratio=aspect_info.get('aspect_ratio'),
+        aspect_ratio_target=aspect_info.get('aspect_band_label'),
         aspect_ratio_vs_target=rules.get('aspect_ratio_vs_target'),
-        species_in_other_compartment=rules.get('species_in_other_compartment'),
-        thresholds_note=rules.get('thresholds_note'),
+        aspect_in_band=aspect_info.get('aspect_in_band'),
+        edge_length_deviation=official.get('edge_length_deviation'),
+        edge_orthogonality=official.get('edge_orthogonality'),
+        species_in_other_compartment=official.get('species_in_other_compartment'),
+        thresholds_note=(
+            'Connection crossings / participant / edge length deviation / edge orthogonality follow '
+            'layout-benchmark definitions (all drawn pieces; Escher radii; >90°); '
+            'aspect passes inside the 4:3–16:9 band; compartment hulls use ConvexHull (no optional shapely); '
+            + (rules.get('thresholds_note') or '')
+        ),
         crossing_density=crossing_density,
         orientation=ori, composition=comp, structure_continuity=continuity,
+        official=official,
         edges_footnote=dict(algorithm=len(algo), curated=len(edges) - len(algo), total=len(edges)),
         warnings=warnings,
         bezier_coverage=bezier,
@@ -432,24 +468,26 @@ def evaluate(data, skip_edges=None, orientation_kinds=None, max_issues=4000, str
             ),
             length_p90=dict(px=round(p90_px, 1), in_reaction_spacings=round(p90_px / max(spacing, 1.0), 2), reaction_spacing_px=round(spacing, 1)),
             participant_placement=dict(
-                inout_opposite_share=place_all.get('opposite_sides_share'),
+                inout_opposite_share=round(float(official_participant), 3) if official_participant is not None else None,
                 inout_opposite_share_core=place_core.get('opposite_sides_share'),
                 reactions_all=place_all.get('reactions'),
                 reactions_core=place_core.get('reactions'),
-                threshold_deg=ori.get('threshold_deg', 120.0),
+                threshold_deg=om.PARTICIPANT_DEG,
+                official_participant_consistency=official_participant,
             ),
             core_orientation=dict(opposite_sides_share=place_core.get('opposite_sides_share'), reactions=place_core.get('reactions')),
+            edge_length_deviation=official.get('edge_length_deviation'),
+            edge_orthogonality=official.get('edge_orthogonality'),
             cofactor_clones=cofactor,
             structure_continuity=continuity_core,
             bezier_coverage=bezier),  # not a card; quality-gate hard check + warning
         details=details,
         worst_regions=windows,
-        note='computed from the final map.json; crossings are counted on sampled final curves, source-split '
-             '(algorithm×algorithm + algorithm×curated; curated×curated not in the headline) and role-split '
-             '(main-metabolite vs currency-involved); worst_regions use uncapped counted crossings in true '
-             '400 px / stride-200 boxes; structure continuity scores reused curated structures; '
-             '120° opposite-side threshold is a Project 22 first guess; '
-             'Detailed metrics keep only layout goals (one content bbox for size/aspect/blank)')
+        note='computed from the final map.json; Layout quality headlines use official layout-benchmark '
+             'definitions (all drawn edge pieces; Escher glyph sizes; >90° participant consistency; '
+             'Purchase edge length deviation / orthogonality); worst_regions still use algorithm×algorithm '
+             '+ algorithm×curated curve crossings for local repair; aspect passes inside 4:3–16:9; '
+             'Detailed metrics keep layout goals (one content bbox for size/aspect/blank)')
     issues = dict(isolated_reactions=outlier_rows, crossings=cross_points, obstacle_hits=hit_points, curve_anomalies=anomalies, worst_regions=windows,
                   node_overlaps=[dict(x=round(float(centres[i][0]), 1), y=round(float(centres[i][1]), 1)) for i, _ in node_overlap][:max_issues],
                   split_structures=[d for d in continuity.get('details') or [] if d.get('components', 1) > 1][:max_issues],
@@ -665,13 +703,31 @@ def _detailed_metrics_panel(details, *, line_shape, cycles, unrelated, crossing_
                 miss=False,
             ),
             _row(
-                'Aspect ratio (W/H) vs target',
-                f"{_na(aspect)} · target {_na(aspect_t)} · |Δ| {_na(aspect_d)}",
+                'Aspect ratio (W/H) vs 4:3–16:9',
+                f"{_na(aspect)} · band {_na(aspect_t)} · {'pass' if details.get('aspect_in_band') else ('miss' if details.get('aspect_in_band') is False else '—')}",
                 code='aspect_ratio',
-                tip='Content width ÷ height versus target 1.0. Closer to the target is better.',
-                better='closer to target', target='1.0',
+                tip='Content width ÷ height. Passes when inside the packing band 4:3–16:9.',
+                better='inside band', target='4:3–16:9',
                 stage='composition & packing',
-                miss=(aspect_d is not None and float(aspect_d) > 0.5),
+                miss=(details.get('aspect_in_band') is False),
+            ),
+            _row(
+                'Edge length deviation',
+                _na(None if details.get('edge_length_deviation') is None else round(float(details['edge_length_deviation']), 4)),
+                code='edge_length_deviation',
+                tip='Purchase edge-length deviation on drawn polylines (layout-benchmark definition). Lower is better.',
+                better='lower', target='lower',
+                stage='Bézier routing · packing',
+                miss=False,
+            ),
+            _row(
+                'Edge orthogonality',
+                _na(None if details.get('edge_orthogonality') is None else round(float(details['edge_orthogonality']), 4)),
+                code='edge_orthogonality',
+                tip='Purchase edge orthogonality on unique drawn pieces (layout-benchmark definition). Higher is better (1 = all axis-parallel).',
+                better='higher', target='higher',
+                stage='Bézier routing · packing',
+                miss=False,
             ),
             _row(
                 'Blank space / space utilisation',
@@ -1084,23 +1140,9 @@ def longest_links_report(data=None, skip_edges=None, top=10, edges=None, nodes=N
 
 
 def overlap_counts(data):
-    """Node and label overlap pair counts (same geometry as ``evaluate``)."""
-    from scipy.spatial import cKDTree
-    body = data[1]
-    nodes = body['nodes']
-    centres = np.array([[n['x'], n['y']] for n in nodes.values() if n.get('node_type') in ('metabolite', 'midmarker')], float)
-    node_overlap = list(cKDTree(centres).query_pairs(10)) if len(centres) > 1 else []
-    rects, owner, kind, label_of = _final_obstacles(data)
-    grid_r = _dd(list)
-    for i, r in enumerate(rects):
-        _grid_add(grid_r, i, r[:2], r[2:])
-    lab_idx = [i for i, k in enumerate(kind) if k == 'label']
-    label_overlap = 0
-    for i in lab_idx:
-        for j in _grid_query(grid_r, rects[i][:2], rects[i][2:]):
-            if j > i and kind[j] == 'label' and rects[j][0] < rects[i][2] and rects[i][0] < rects[j][2] and rects[j][1] < rects[i][3] and rects[i][1] < rects[j][3]:
-                label_overlap += 1
-    return len(node_overlap), label_overlap
+    """Official Escher glyph overlaps and label/glyph–label pairs (same as ``evaluate`` gate)."""
+    ov = om.glyph_overlaps(data, include_labels=True)
+    return int(ov['glyph_pairs']), int(ov['label_pairs']) + int(ov['glyph_label_pairs'])
 
 
 def _pair_is_headline(ei, ej):

@@ -14,20 +14,18 @@ python3 project.py evaluate --gem examples/e_coli_core.xml --map results/eval_ru
 
 One computation path:
 
-1. **`layout_quality.evaluate`** — final-geometry block shared by the quality gate, the tool
-   **Layout quality** panel, and `evaluate` (curve crossings with main/currency split, overlaps,
-   long lines, participant placement ≥120°, cofactor clones, curated-structure continuity, plus
-   a curated **Detailed metrics** table aligned with layout goals).
-2. **`layout_atlas/evaluation/`** — pathway metrics aligned with layout-benchmark (MIT; see
-   `ATTRIBUTION.md`) plus optional gdMetriX (GPL-3.0, **import only**, never vendored; CLI extras).
+1. **`official_metrics`** — shared clean-room implementation of layout-benchmark definitions
+   (all drawn edge pieces for crossings; Escher glyph sizes for overlaps; >90° participant
+   consistency; Purchase edge length deviation / orthogonality; 4:3–16:9 aspect band;
+   compartment hulls without optional shapely). Feeds the quality gate, the Layout quality
+   panel, and `evaluate`.
+2. **`layout_quality.evaluate`** — final-geometry block (official headlines plus algorithm
+   curve diagnostics, cofactor clones, curated-structure continuity, Detailed metrics).
+3. **`evaluation.score_map`** — optional external import of `layout_benchmark` when installed;
+   gdMetriX is never vendored (GPL-3.0).
 
-User-facing panel strings use **curated** (not “expert”). The 120° opposite-side threshold is the
-transfer-check first guess. Benchmark `participant_consistency` (>90°) stays on the evaluate CLI
-only (not duplicated on the panel).
-
-gdMetriX straight-line `crossings` are skipped when the undirected graph has more than 1200
-edges. For maps with more than 800 reactions the curve geometry block is skipped in `evaluate`
-and should be read from compose’s `layout_issues.json` / `report.json`.
+User-facing panel strings use **curated** (not “expert”). Participant placement on the panel
+uses the official >90° rule.
 
 ## Metric table (e_coli_core · iIT341)
 
@@ -56,10 +54,11 @@ Refresh notes (2026-11-11): rebased iCH360 onto atlas-extraction-1 + compactness
 
 | Card | Definition |
 |---|---|
-| Connection crossings | algorithm×algorithm + algorithm×curated; tooltip splits main-metabolite vs currency-involved; curated×curated not counted |
-| Overlaps | node + label overlap pairs; curves through nodes/labels in the subtitle |
+| Connection crossings | official all-pieces count (layout-benchmark); tooltip also lists algorithm×algorithm / algorithm×curated / curated×curated |
+| Overlaps | official Escher glyph pairs; gate uses glyphs + labels; curves through nodes/labels in the subtitle |
 | Long lines | length p90 in median reaction spacings; `edge_len_max_rel` = max/median |
-| Participant placement | share of reactant/product pairs ≥120° apart (all and core-only) |
+| Participant placement | official share of reactant/product pairs >90° apart |
+| Edge length deviation / orthogonality | Purchase metrics on drawn polylines / pieces |
 | Cofactor clones | `currency_hub_violations` (currency instance linking reactions farther than 4× median spacing); `currency_long_arc_share` (currency lines >3× spacing) |
 | Curated-structure continuity | contiguous pair share of reused curated structures (3× median reaction spacing) |
 
@@ -78,7 +77,7 @@ amber highlight.
 | Connections | Local crossing hotspot; Unrelated overlaps | Bézier routing · quality gate; spacing / relaxation · Bézier routing |
 | Line shape | Detour; Hooks / sharp turns / self-intersections; Bends per connection | Bézier routing |
 | Structure & flow | Exchange reactions on the periphery; Axis-aligned main segments; Axis-aligned reaction axes; Grid-aligned metabolites; Median chain turn angle; Cycle circularity / direction / order; Species in another compartment | composition & peripherals; **not yet optimised** (orderliness / octilinear snap; ring/cycle placement; compartment packing) |
-| Space & shape | Map size; Aspect ratio vs target; Blank space / space utilisation; Largest empty rectangle; Isolated reactions; Most reactions in one cell | composition & packing |
+| Space & shape | Map size; Aspect ratio vs 4:3–16:9; Edge length deviation; Edge orthogonality; Blank space / space utilisation; Largest empty rectangle; Isolated reactions; Most reactions in one cell | composition & packing |
 | Reproducibility | Procrustes / mean displacement (when `evaluate --compare-map`) | **not yet optimised** (detail row) |
 | Debug diagnostics (hidden by default) | Main flow-direction share | Debug diagnostic |
 | Pipeline diagnostics (collapsed) | Composition-pass counts; Peripheral-module counts | composition & peripherals |
