@@ -190,3 +190,34 @@ if __name__ == "__main__":
     test_fixture_file_roundtrip()
     test_layout_quality_uses_official()
     print("ok")
+
+def test_previous_pins_not_moved_by_official_clear():
+    import curated_axes as ca
+    data = [
+        {"canvas": {"width": 200, "height": 200}, "metadata": {}},
+        {
+            "nodes": {
+                "a": {"node_type": "metabolite", "node_is_primary": True, "bigg_id": "A_c",
+                      "x": 0, "y": 0, "label_x": 0, "label_y": -20},
+                "b": {"node_type": "metabolite", "node_is_primary": True, "bigg_id": "B_c",
+                      "x": 10, "y": 0, "label_x": 10, "label_y": -20},
+                "m": {"node_type": "midmarker", "x": 5, "y": 40},
+            },
+            "reactions": {
+                "1": {
+                    "bigg_id": "R1", "label_x": 5, "label_y": 50,
+                    "metabolites": [{"bigg_id": "A_c", "coefficient": -1},
+                                    {"bigg_id": "B_c", "coefficient": 1}],
+                    "segments": {"s1": {"from_node_id": "a", "to_node_id": "m"},
+                                 "s2": {"from_node_id": "m", "to_node_id": "b"}},
+                }
+            },
+        },
+    ]
+    anchors = {"m:A_c": [0, 0], "r:R1": [5, 40]}
+    data, rep = ca.clear_rigid_node_overlaps_escher(
+        data, [], use_escher_radii=True, guard_official=True, anchors=anchors)
+    nodes = data[1]["nodes"]
+    assert nodes["a"]["x"] == 0 and nodes["a"]["y"] == 0
+    assert nodes["m"]["x"] == 5 and nodes["m"]["y"] == 40
+    assert rep.get("pinned") == 2

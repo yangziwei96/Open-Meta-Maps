@@ -1026,7 +1026,8 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             data, _rr_es = _ca_es.restore_rigid_group_escher(data, blocks)
             if log and _rr_es.get('restored'):
                 log(f"  same-map rigid restore (escher after arms): {_rr_es['restored']} nodes")
-            data, _ov_es = _ca_es.clear_rigid_node_overlaps_escher(data, blocks)
+            data, _ov_es = _ca_es.clear_rigid_node_overlaps_escher(
+                data, blocks, anchors=PREVIOUS_ANCHORS)
             if log and _ov_es.get('moved'):
                 log(f"  clear rigid node overlaps (escher): moved {_ov_es['moved']} nodes")
             dump(folder / 'map.json', data)
@@ -1118,9 +1119,12 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                 log('  hotspot repair: ' + str({k: hr.get(k) for k in ('accepted_count', 'tries', 'rounds', 'seconds', 'improved')}))
             dump(folder / 'map.json', data)
         # Final official-footprint clear (Escher radii; reject moves that raise crossings).
+        if PREVIOUS_ANCHORS:
+            data[0].setdefault('metadata', {})['previous_anchors'] = {
+                k: list(v) for k, v in PREVIOUS_ANCHORS.items()}
         data, _ov_final = _ca_es.clear_rigid_node_overlaps_escher(
             data, blocks, max_iters=12, max_moves=200,
-            use_escher_radii=True, guard_official=True)
+            use_escher_radii=True, guard_official=True, anchors=PREVIOUS_ANCHORS)
         metric['official_overlap_clear'] = _ov_final
         if log and (_ov_final.get('moved') or _ov_final.get('accepted')):
             log(f"  clear official Escher overlaps: {_ov_final}")
