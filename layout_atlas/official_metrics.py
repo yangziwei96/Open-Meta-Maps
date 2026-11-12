@@ -234,8 +234,8 @@ def escher_glyphs(data) -> list[dict[str, Any]]:
     return out
 
 
-def _label_boxes(data) -> list[tuple[float, float, float, float]]:
-    """Axis-aligned label boxes (same geometry as layout_quality obstacles)."""
+def _label_boxes(data) -> list[dict[str, Any]]:
+    """Axis-aligned label boxes with owning node ids (exclude self glyph–label pairs)."""
     import drawing
 
     font = drawing.FONT
@@ -249,12 +249,20 @@ def _label_boxes(data) -> list[tuple[float, float, float, float]]:
         if "label_x" not in n or n.get("label_hidden") or nid in hidden:
             continue
         w = font.getlength(n.get("bigg_id", ""))
-        boxes.append((n["label_x"] - 2, n["label_y"] - 14, n["label_x"] + w + 2, n["label_y"] + 4))
+        boxes.append(dict(
+            box=(n["label_x"] - 2, n["label_y"] - 14, n["label_x"] + w + 2, n["label_y"] + 4),
+            owners={nid},
+        ))
     for rx in body.get("reactions", {}).values():
         if "label_x" not in rx or rx.get("label_hidden"):
             continue
+        mid = _reaction_mid(body["nodes"], rx)
         w = font.getlength(rx.get("bigg_id", ""))
-        boxes.append((rx["label_x"] - 2, rx["label_y"] - 14, rx["label_x"] + w + 2, rx["label_y"] + 4))
+        owners = {mid} if mid else set()
+        boxes.append(dict(
+            box=(rx["label_x"] - 2, rx["label_y"] - 14, rx["label_x"] + w + 2, rx["label_y"] + 4),
+            owners=owners,
+        ))
     return boxes
 
 
@@ -331,21 +339,25 @@ def glyph_overlaps(data, *, include_labels: bool = False) -> dict[str, float | i
     if include_labels and boxes:
         for i in range(len(boxes)):
             for j in range(i + 1, len(boxes)):
-                inter = _box_overlap_area(boxes[i], boxes[j])
+                inter = _box_overlap_area(boxes[i]["box"], boxes[j]["box"])
                 if inter > 0:
                     label_pairs += 1
                     area += inter
                     pairs += 1
-        for gi, g in enumerate(glyphs):
-            for box in boxes:
-                inter = _circle_box_overlap_area(g["x"], g["y"], g["r"], box)
+        for g in glyphs:
+            for lb in boxes:
+                if g["id"] in lb["owners"]:
+                    continue  # a label may sit on its own glyph
+                inter = _circle_box_overlap_area(g["x"], g["y"], g["r"], lb["box"])
                 if inter > 0:
                     glyph_label_pairs += 1
                     area += inter
                     pairs += 1
     total_area = sum(math.pi * g["r"] ** 2 for g in glyphs)
     if include_labels:
-        total_area += sum(max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1]) for b in boxes)
+        total_area += sum(
+            max(0.0, b["box"][2] - b["box"][0]) * max(0.0, b["box"][3] - b["box"][1]) for b in boxes
+        )
     return dict(
         overlapping_pairs=int(pairs),
         overlap_area_share=(area / total_area) if total_area else 0.0,

@@ -625,7 +625,7 @@ def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K
     # Setup (not charged to the search budget): shared index + light metrics (no full evaluate).
     # Use the same skip set as evaluate (preserved + source_paths), not the raw caller list.
     index = lq.CrossingIndex(data, skip)
-    node_ov0, lab_ov0 = lq.overlap_counts(data)
+    node_ov0, lab_ov0 = lq.overlap_counts(data, mode='legacy')
     windows = _windows_from_index(index, k)
     spacing = _spacing_from_nodes(index.nodes)
     lengths = [float(np.sum(np.hypot(*np.diff(e['pts'], axis=0).T))) for e in index.edges if len(e['pts']) > 1]
@@ -708,7 +708,7 @@ def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K
                     report['reject_reasons']['no_crossing_drop'] = report['reject_reasons'].get('no_crossing_drop', 0) + 1
                     continue
                 # Overlap check only for promising (crossing-reducing) moves.
-                n_ov, l_ov = lq.overlap_counts(data)
+                n_ov, l_ov = lq.overlap_counts(data, mode='legacy')
                 if n_ov > node_ov0 or l_ov > lab_ov0:
                     undo()
                     report['rejected'] += 1
@@ -758,7 +758,7 @@ def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K
     windows = _windows_from_index(index, k)
     lengths = [float(np.sum(np.hypot(*np.diff(e['pts'], axis=0).T))) for e in index.edges if len(e['pts']) > 1]
     length_p90 = float(np.percentile(lengths, 90)) if lengths else length_p90
-    node_ov1, lab_ov1 = lq.overlap_counts(data)
+    node_ov1, lab_ov1 = lq.overlap_counts(data, mode='legacy')
     after = _metrics_from_index(index, windows, node_ov1, lab_ov1, cont, length_p90, spacing)
     report['after'] = {kk: after[kk] for kk in (
         'crossings', 'top_window_crossings', 'worst_window', 'node_overlaps', 'label_overlaps',

@@ -871,20 +871,42 @@ def clear_rigid_node_overlaps(scene, blocks, min_dist=12.0):
     return scene, dict(moved=moved, rigid_keys=len(rigid_keys))
 
 
-def clear_rigid_node_overlaps_escher(data, blocks, min_dist=None):
-    """Nudge Escher nodes so official glyph footprints no longer overlap after rigid restore.
+def clear_rigid_node_overlaps_escher(data, blocks, min_dist=12.0, max_iters=None, max_moves=None,
+                                     guard_official=False, use_escher_radii=False):
+    """Nudge Escher glyphs after rigid restore.
 
-    Separation uses Escher radii (primary 20 / secondary 10 / marker 5): centres must
-    stay strictly farther than r_i + r_j (touching is allowed). Prefers moving glyphs
-    that are not exclusive to ``same_map_rigid`` reactions; if both ends are rigid
-    (duplicate same-bigg), nudges the non-primary copy. Curated rigid pairs that both
-    refuse to move are left for translation-only module repair. Uses a KD-tree so
-    mid/large maps stay cheap.
+    Default (early pipeline): centre-gap clearance (centres ≥ ``min_dist``, 40
+    iterations), matching upstream mid-pipeline behaviour including label-aware
+    moves via ``map_edit``. Final official pass sets ``use_escher_radii`` and
+    optionally ``guard_official`` so Escher footprints clear without raising
+    official piece crossings; curated rigid glyphs stay translation-only.
     """
+    if not use_escher_radii and not guard_official:
+        return _clear_rigid_node_overlaps_escher_centre_gap(data, blocks, min_dist=min_dist)
+    return _clear_rigid_node_overlaps_escher_official(
+        data, blocks, min_dist=min_dist,
+        max_iters=12 if max_iters is None else max_iters,
+        max_moves=200 if max_moves is None else max_moves,
+        guard_official=guard_official, use_escher_radii=use_escher_radii)
+
+
+def _nudge_escher_node(nodes, reactions, nid, dx, dy, digits=6):
+    """Translate a glyph (and its labels) by ``(dx, dy)``; reaction labels follow midmarkers."""
+    translate_node(nodes[nid], dx, dy, digits=digits)
+    if nodes[nid].get('node_type') != 'midmarker':
+        return
+    for rx in reactions.values():
+        for seg in (rx.get('segments') or {}).values():
+            if nid in (seg.get('from_node_id'), seg.get('to_node_id')):
+                translate_reaction_label(rx, dx, dy, digits=digits)
+                break
+
+
+def _clear_rigid_node_overlaps_escher_centre_gap(data, blocks, min_dist=12.0):
+    """Centre-gap clear with label-aware moves (upstream mid-pipeline behaviour)."""
     if not data or len(data) < 2:
         return data, dict(moved=0)
     from scipy.spatial import cKDTree
-    import official_metrics as om
     rigid_rx = rigid_reaction_ids(blocks)
     nodes = data[1].get('nodes') or {}
     reactions = data[1].get('reactions') or {}
@@ -910,13 +932,6 @@ def clear_rigid_node_overlaps_escher(data, blocks, min_dist=None):
     ids = [nid for nid, n in nodes.items() if n.get('node_type') in ('metabolite', 'midmarker')]
     if len(ids) < 2:
         return data, dict(moved=0)
-    radii = []
-    for nid in ids:
-        r = om._glyph_radius(nodes[nid])
-        radii.append(float(r if r is not None else om.ESCHER_RADIUS['marker']))
-    # Optional legacy floor (old 12 px centre gap) when explicitly requested.
-    floor = float(min_dist) if min_dist is not None else 0.0
-    max_need = max(radii) * 2.0 + 1e-3
     moved = 0
 
     def _can_move(nid):
@@ -927,9 +942,9 @@ def clear_rigid_node_overlaps_escher(data, blocks, min_dist=None):
             return True
         return False
 
-    for _ in range(60):
+    for _ in range(40):
         xy = np.asarray([[float(nodes[i]['x']), float(nodes[i]['y'])] for i in ids], float)
-        pairs = cKDTree(xy).query_pairs(max_need, output_type='ndarray')
+        pairs = cKDTree(xy).query_pairs(min_dist, output_type='ndarray')
         if len(pairs) == 0:
             break
         hit = False
@@ -937,8 +952,7 @@ def clear_rigid_node_overlaps_escher(data, blocks, min_dist=None):
             a, b = ids[int(i)], ids[int(j)]
             d = xy[int(j)] - xy[int(i)]
             dist = float(np.hypot(d[0], d[1]))
-            need = max(radii[int(i)] + radii[int(j)], floor) + 1e-3  # strict: no positive-area overlap
-            if dist >= need:
+            if dist >= min_dist:
                 continue
             move_a, move_b = _can_move(a), _can_move(b)
             if not (move_a or move_b):
@@ -952,39 +966,190 @@ def clear_rigid_node_overlaps_escher(data, blocks, min_dist=None):
                 ang = ((hash(a) + hash(b)) % 360) * math.pi / 180.0
                 d = np.array([math.cos(ang), math.sin(ang)])
                 dist = 1.0
-            step = d / dist * (need - dist)
-            # Track midmarker deltas so reaction labels stay with their anchors.
-            mid_delta = {}
+            step = d / dist * (min_dist - dist)
             if move_a and move_b:
-                dx_a, dy_a = -step[0] / 2, -step[1] / 2
-                dx_b, dy_b = step[0] / 2, step[1] / 2
-                translate_node(nodes[a], dx_a, dy_a, digits=6)
-                translate_node(nodes[b], dx_b, dy_b, digits=6)
-                if nodes[a].get('node_type') == 'midmarker':
-                    mid_delta[a] = (dx_a, dy_a)
-                if nodes[b].get('node_type') == 'midmarker':
-                    mid_delta[b] = (dx_b, dy_b)
+                _nudge_escher_node(nodes, reactions, a, -step[0] / 2, -step[1] / 2)
+                _nudge_escher_node(nodes, reactions, b, step[0] / 2, step[1] / 2)
             elif move_a:
-                dx_a, dy_a = -step[0], -step[1]
-                translate_node(nodes[a], dx_a, dy_a, digits=6)
-                if nodes[a].get('node_type') == 'midmarker':
-                    mid_delta[a] = (dx_a, dy_a)
+                _nudge_escher_node(nodes, reactions, a, -step[0], -step[1])
             else:
-                dx_b, dy_b = step[0], step[1]
-                translate_node(nodes[b], dx_b, dy_b, digits=6)
-                if nodes[b].get('node_type') == 'midmarker':
-                    mid_delta[b] = (dx_b, dy_b)
-            if mid_delta:
-                for rx in reactions.values():
-                    for seg in (rx.get('segments') or {}).values():
-                        for end in (seg.get('from_node_id'), seg.get('to_node_id')):
-                            if end in mid_delta and nodes.get(end, {}).get('node_type') == 'midmarker':
-                                translate_reaction_label(rx, *mid_delta[end], digits=6)
-                                break
+                _nudge_escher_node(nodes, reactions, b, step[0], step[1])
             moved += 1
         if not hit:
             break
-    return data, dict(moved=moved, rigid_nodes=len(rigid_nids), mode='escher_radii')
+    return data, dict(moved=moved, rigid_nodes=len(rigid_nids), mode='centre_gap')
+
+
+def _clear_rigid_node_overlaps_escher_official(data, blocks, min_dist=12.0, max_iters=12, max_moves=200,
+                                              guard_official=True, use_escher_radii=True):
+    """Final Escher-footprint clear; optional reject of moves that raise official crossings.
+
+    All glyph moves go through ``map_edit`` helpers so metabolite and reaction labels
+    stay with their nodes. Accepted nudges are recorded as deltas so a crossings
+    regression can be rolled back without detaching labels.
+    """
+    if not data or len(data) < 2:
+        return data, dict(moved=0)
+    from scipy.spatial import cKDTree
+    import official_metrics as om
+
+    rigid_rx = rigid_reaction_ids(blocks)
+    nodes = data[1].get('nodes') or {}
+    reactions = data[1].get('reactions') or {}
+    holders = defaultdict(set)
+    for rx in reactions.values():
+        rid = rx.get('bigg_id')
+        for seg in (rx.get('segments') or {}).values():
+            for nid in (seg.get('from_node_id'), seg.get('to_node_id')):
+                if nid in nodes:
+                    holders[nid].add(rid)
+    rigid_nids = set()
+    if rigid_rx:
+        for nid, hs in holders.items():
+            if hs and hs.issubset(rigid_rx) and nodes[nid].get('node_type') in ('metabolite', 'midmarker'):
+                rigid_nids.add(nid)
+        for rx in reactions.values():
+            if rx.get('bigg_id') not in rigid_rx:
+                continue
+            for seg in (rx.get('segments') or {}).values():
+                for nid in (seg.get('from_node_id'), seg.get('to_node_id')):
+                    if (nodes.get(nid) or {}).get('node_type') == 'midmarker':
+                        rigid_nids.add(nid)
+    ids = [nid for nid, n in nodes.items() if n.get('node_type') in ('metabolite', 'midmarker')]
+    if len(ids) < 2:
+        return data, dict(moved=0)
+    if use_escher_radii:
+        radii = {nid: float(om._glyph_radius(nodes[nid]) or om.ESCHER_RADIUS['marker']) for nid in ids}
+        floor = 0.0
+        max_need = max(radii.values()) * 2.0 + 1e-3
+    else:
+        radii = {nid: float(min_dist) / 2.0 for nid in ids}
+        floor = float(min_dist)
+        max_need = float(min_dist) + 1e-3
+
+    def _can_move(nid):
+        if nid not in rigid_nids:
+            return True
+        n = nodes[nid]
+        if n.get('node_type') == 'metabolite' and not n.get('node_is_primary', True):
+            return True
+        return False
+
+    def _overlaps():
+        return int(om.glyph_overlaps(data, include_labels=False)['overlapping_pairs'])
+
+    def _crossings():
+        return om.count_piece_crossings(om.piece_segments(om.escher_drawn_edges(data)))
+
+    before_ov = _overlaps()
+    before_cross = _crossings() if guard_official else None
+    accepted = 0
+    # Each history entry: list of (nid, dx, dy) applied for that nudge.
+    history = []
+
+    for _ in range(max_iters):
+        if accepted >= max_moves:
+            break
+        xy = np.asarray([[float(nodes[i]['x']), float(nodes[i]['y'])] for i in ids], float)
+        index = {nid: k for k, nid in enumerate(ids)}
+        pairs = cKDTree(xy).query_pairs(max_need, output_type='ndarray')
+        if len(pairs) == 0:
+            break
+        progressed = False
+        cur_ov = _overlaps()
+        for i, j in pairs:
+            if accepted >= max_moves:
+                break
+            a, b = ids[int(i)], ids[int(j)]
+            d = xy[int(j)] - xy[int(i)]
+            dist = float(np.hypot(d[0], d[1]))
+            need = max(radii[a] + radii[b], floor) + 1e-3
+            if dist >= need:
+                continue
+            move_a, move_b = _can_move(a), _can_move(b)
+            if not (move_a or move_b):
+                if ((nodes[a].get('bigg_id') or '') == (nodes[b].get('bigg_id') or '')
+                        and nodes[a].get('node_type') == 'metabolite'):
+                    move_b = True
+                else:
+                    continue
+            if dist < 1e-6:
+                ang = ((hash(a) + hash(b)) % 360) * math.pi / 180.0
+                d = np.array([math.cos(ang), math.sin(ang)])
+                dist = 1.0
+            step = d / dist * (need - dist)
+            step_len = float(np.hypot(*step))
+            if step_len > 30.0:
+                step = step * (30.0 / step_len)
+            deltas = []
+            if move_a and move_b:
+                deltas.append((a, -step[0] / 2, -step[1] / 2))
+                deltas.append((b, step[0] / 2, step[1] / 2))
+            elif move_a:
+                deltas.append((a, -step[0], -step[1]))
+            elif move_b:
+                deltas.append((b, step[0], step[1]))
+            if not deltas:
+                continue
+            for nid, dx, dy in deltas:
+                _nudge_escher_node(nodes, reactions, nid, dx, dy)
+            ov_n = _overlaps()
+            if ov_n < cur_ov:
+                history.append(deltas)
+                accepted += 1
+                progressed = True
+                cur_ov = ov_n
+                for nid, dx, dy in deltas:
+                    k = index[nid]
+                    xy[k] = [nodes[nid]['x'], nodes[nid]['y']]
+            else:
+                for nid, dx, dy in deltas:
+                    _nudge_escher_node(nodes, reactions, nid, -dx, -dy)
+        if not progressed:
+            break
+
+    report = dict(
+        moved=accepted, accepted=accepted, rigid_nodes=len(rigid_nids),
+        mode=('escher_radii_guarded' if guard_official else 'escher_radii'),
+        before_overlaps=before_ov, before_crossings=before_cross,
+    )
+    if guard_official:
+        after_cross = _crossings()
+        after_ov = _overlaps()
+        if after_cross > before_cross and history:
+            # Keep the longest prefix of nudges that does not raise crossings.
+            lo, hi, best = 0, len(history), 0
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                # Reset to pre-clear geometry by undoing all accepted nudges.
+                for deltas in reversed(history):
+                    for nid, dx, dy in reversed(deltas):
+                        _nudge_escher_node(nodes, reactions, nid, -dx, -dy)
+                for deltas in history[:mid]:
+                    for nid, dx, dy in deltas:
+                        _nudge_escher_node(nodes, reactions, nid, dx, dy)
+                if _crossings() <= before_cross:
+                    best = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            for deltas in reversed(history):
+                for nid, dx, dy in reversed(deltas):
+                    _nudge_escher_node(nodes, reactions, nid, -dx, -dy)
+            for deltas in history[:best]:
+                for nid, dx, dy in deltas:
+                    _nudge_escher_node(nodes, reactions, nid, dx, dy)
+            report.update(dict(
+                accepted=best, moved=best,
+                after_overlaps=_overlaps(), after_crossings=_crossings(),
+                reason='prefix keep to protect crossings',
+            ))
+            return data, report
+        report.update(dict(after_overlaps=after_ov, after_crossings=after_cross))
+    else:
+        report.update(dict(after_overlaps=_overlaps()))
+    return data, report
+
 
 
 def restore_rigid_group(scene, blocks):

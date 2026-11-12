@@ -192,10 +192,8 @@ def evaluate(data, skip_edges=None, orientation_kinds=None, max_issues=4000, str
     from scipy.spatial import cKDTree
     centres = np.array([[n['x'], n['y']] for n in nodes.values() if n.get('node_type') in ('metabolite', 'midmarker')], float)
     official = om.score_escher_map(data)
-    ov_official = om.glyph_overlaps(data, include_labels=False)
-    ov_gate = om.glyph_overlaps(data, include_labels=True)
-    node_overlap_n = int(ov_official['glyph_pairs'])
-    label_overlap = int(ov_gate['label_pairs']) + int(ov_gate['glyph_label_pairs'])
+    node_overlap_n = int(official.get('overlapping_pairs') or 0)
+    label_overlap = int(official.get('gate_label_pairs') or 0) + int(official.get('gate_glyph_label_pairs') or 0)
     # Legacy centre pairs kept only for worst-region node_overlap pins (approximate).
     node_overlap = list(cKDTree(centres).query_pairs(10)) if len(centres) > 1 else []
     # ---- length, detour, Bezier representation, curve anomalies
@@ -340,13 +338,13 @@ def evaluate(data, skip_edges=None, orientation_kinds=None, max_issues=4000, str
         long_threshold_spacings=rules.get('long_threshold_spacings'),
     )
     overlaps = dict(
-        overlapping_pairs=int(ov_gate['overlapping_pairs']),
+        overlapping_pairs=int(official.get('gate_overlapping_pairs') or 0),
         node_overlap_pairs=node_overlap_n,
         label_overlap_pairs=label_overlap,
-        official_glyph_pairs=int(ov_official['overlapping_pairs']),
-        gate_glyph_pairs=int(ov_gate['glyph_pairs']),
-        gate_label_pairs=int(ov_gate['label_pairs']),
-        gate_glyph_label_pairs=int(ov_gate['glyph_label_pairs']),
+        official_glyph_pairs=int(official.get('overlapping_pairs') or 0),
+        gate_glyph_pairs=int(official.get('gate_glyph_pairs') or 0),
+        gate_label_pairs=int(official.get('gate_label_pairs') or 0),
+        gate_glyph_label_pairs=int(official.get('gate_glyph_label_pairs') or 0),
         curves_through_nodes=node_hits,
         curves_through_labels=label_hits,
     )
@@ -1139,8 +1137,35 @@ def longest_links_report(data=None, skip_edges=None, top=10, edges=None, nodes=N
              'p90_ex_intra_curated is the packing-relevant long-line gate')
 
 
-def overlap_counts(data):
-    """Official Escher glyph overlaps and label/glyph–label pairs (same as ``evaluate`` gate)."""
+def overlap_counts(data, mode='official'):
+    """Overlap pair counts for gates and hotspot repair.
+
+    ``mode='official'``: Escher glyph footprints (+ labels) — quality gate / panel.
+    ``mode='legacy'``: upstream 10 px centre pairs + label boxes — hotspot local
+    don't-worsen so crossing-repair budgets stay comparable (final official clear
+    still removes Escher collisions).
+    """
+    if mode == 'legacy':
+        from scipy.spatial import cKDTree
+        body = data[1]
+        nodes = body['nodes']
+        centres = np.array(
+            [[n['x'], n['y']] for n in nodes.values()
+             if n.get('node_type') in ('metabolite', 'midmarker')], float)
+        node_overlap = list(cKDTree(centres).query_pairs(10)) if len(centres) > 1 else []
+        rects, owner, kind, label_of = _final_obstacles(data)
+        grid_r = _dd(list)
+        for i, r in enumerate(rects):
+            _grid_add(grid_r, i, r[:2], r[2:])
+        lab_idx = [i for i, k in enumerate(kind) if k == 'label']
+        label_overlap = 0
+        for i in lab_idx:
+            for j in _grid_query(grid_r, rects[i][:2], rects[i][2:]):
+                if (j > i and kind[j] == 'label'
+                        and rects[j][0] < rects[i][2] and rects[i][0] < rects[j][2]
+                        and rects[j][1] < rects[i][3] and rects[i][1] < rects[j][3]):
+                    label_overlap += 1
+        return len(node_overlap), label_overlap
     ov = om.glyph_overlaps(data, include_labels=True)
     return int(ov['glyph_pairs']), int(ov['label_pairs']) + int(ov['glyph_label_pairs'])
 
