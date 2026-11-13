@@ -64,7 +64,9 @@ BLOCK_GAP = 90.0
 ATTEMPT_BUDGET = 80
 # How many relocate slots to try per movable module (deterministic generators below).
 RELOCATE_SLOTS = 6
-# Report-only: set True before plan_global to also refine every initial arrangement.
+# Extra slots reserved for modules that still have a cross-structure pair > LONG_LINK.
+FAR_RELOCATE_SLOTS = 10
+# When arrangements are present, always refine each (report only; winner selection unchanged).
 DIAGNOSTIC = False
 
 _EPS = 1e-9
@@ -488,10 +490,114 @@ def cross_structure_far_delta(before_pairs, after_pairs) -> dict[str, Any]:
         shortened_rows=shortened[:40],
         threshold=LONG_LINK,
         note=(
-            'Cross-structure shared-metabolite MST edges longer than LONG_LINK; '
-            'only block translation can shorten them. Compare to ~12/54 far edges '
-            'measured on main iIT341 (measurement scripts on the box).'
+            'Skeleton MST attachment pairs (shared_metabolite, cross_structure) '
+            'longer than LONG_LINK. Distinct from final_map_cross_structure_far '
+            '(drawn edges to multi-copy metabolites; ~12 on main iIT341).'
         ),
+    )
+
+
+def final_map_cross_structure_far(map_json, threshold: float | None = None) -> dict[str, Any]:
+    """Far edges on the finished drawing whose metabolite is a reused copy.
+
+    Distinct from skeleton MST ``links_over_1000`` / ``cross_structure_far``:
+    this walks routed polylines on the Escher map.  An edge counts when its
+    length exceeds ``threshold`` (default ``LONG_LINK``) and the metabolite
+    ``bigg_id`` appears on more than one metabolite glyph (a copy reused by
+    another structure).  On main iIT341 this yields the reported ~12 edges.
+    """
+    import layout_quality as LQ
+
+    thr = float(LONG_LINK if threshold is None else threshold)
+    body = map_json[1] if isinstance(map_json, list) else map_json
+    nodes = body.get('nodes') or {}
+    from collections import defaultdict
+    by_bigg = defaultdict(list)
+    for nid, n in nodes.items():
+        if n.get('node_type') == 'metabolite' and n.get('bigg_id'):
+            by_bigg[n['bigg_id']].append(nid)
+    multi = {mid for mid, nids in by_bigg.items() if len(nids) > 1}
+    edges, _ = LQ.build_edges(map_json, None)
+    rows = []
+    for e in edges:
+        pts = e.get('pts')
+        if pts is None:
+            continue
+        pts = np.asarray(pts, float)
+        if len(pts) < 2:
+            continue
+        mid = e.get('met')
+        if mid not in multi:
+            continue
+        length = float(np.sum(np.hypot(*np.diff(pts, axis=0).T)))
+        if length <= thr:
+            continue
+        a, b = pts[0], pts[-1]
+        rows.append(dict(
+            reaction=e.get('rid'), metabolite=mid,
+            length_px=round(length, 2),
+            straight_px=round(float(np.hypot(*(a - b))), 2),
+            n_copies=len(by_bigg[mid]),
+            curated=bool(e.get('curated')),
+        ))
+    rows.sort(key=lambda r: (-r['length_px'], r['reaction'] or '', r['metabolite'] or ''))
+    return dict(
+        threshold=thr,
+        far_count=len(rows),
+        multi_copy_metabolites=len(multi),
+        edges=rows,
+        note=('Final drawn-map edges > threshold whose metabolite bigg_id has '
+              'multiple glyphs (copy reused across structures). Not the skeleton MST count.'),
+    )
+
+
+def final_map_far_delta(before_map, after_map, threshold: float | None = None) -> dict[str, Any]:
+    """How many final-map multi-copy far edges shortened vs ``before_map``."""
+    thr = float(LONG_LINK if threshold is None else threshold)
+    before = final_map_cross_structure_far(before_map, threshold=thr)
+    after = final_map_cross_structure_far(after_map, threshold=thr)
+
+    def key(r):
+        return (r.get('reaction'), r.get('metabolite'))
+
+    b = {key(r): float(r['length_px']) for r in before['edges']}
+    a = {key(r): float(r['length_px']) for r in after['edges']}
+    # Lengths for every after edge (including those no longer far).
+    import layout_quality as LQ
+    edges, _ = LQ.build_edges(after_map, None)
+    after_len = {}
+    for e in edges:
+        pts = e.get('pts')
+        if pts is None:
+            continue
+        pts = np.asarray(pts, float)
+        if len(pts) < 2:
+            continue
+        after_len[(e.get('rid'), e.get('met'))] = float(np.sum(np.hypot(*np.diff(pts, axis=0).T)))
+    shortened = []
+    for k, d0 in sorted(b.items(), key=lambda kv: (-kv[1], kv[0][0] or '', kv[0][1] or '')):
+        d1 = after_len.get(k)
+        if d1 is None:
+            continue
+        if d1 < d0 - 1e-6:
+            shortened.append(dict(
+                reaction=k[0], metabolite=k[1],
+                before=round(d0, 2), after=round(d1, 2),
+                delta=round(d0 - d1, 2),
+                still_far=d1 > thr,
+            ))
+    return dict(
+        far_before=before['far_count'],
+        far_after=after['far_count'],
+        shortened=len(shortened),
+        no_longer_far=len(set(b) - set(a)),
+        newly_far=len(set(a) - set(b)),
+        shortened_rows=shortened[:40],
+        threshold=thr,
+        before_edges=before['edges'][:40],
+        after_edges=after['edges'][:40],
+        note=('Final-map multi-copy far edges vs a baseline map (fresh main). '
+              'Distinct from skeleton MST cross_structure_far_edges.'),
     )
 
 
@@ -536,25 +642,20 @@ def _swap_candidates(n, pinned):
 
 
 def _relocate_slots(i, centres, sizes, pairs, pinned):
-    """Deterministic free-slot proposals for module ``i``."""
+    """Deterministic free-slot proposals for module ``i``.
+
+    Far cross-structure pairs (distance > ``LONG_LINK``) are expanded first with
+    more anchor-alignment and compass offsets so long copy-reuse links get slots
+    before generic boundary / gap samples truncate the list.
+    """
+    # (slot, priority): priority 0 = far-pair driven, 1 = other. Within a priority
+    # band, nearer proposals are tried first under the fixed relocate budget.
     slots = []
     ci = centres[i]
     si = sizes[i]
-    # 1) Flush against other module boundaries.
-    for j in range(len(centres)):
-        if j == i:
-            continue
-        cj, sj = centres[j], sizes[j]
-        for axis, sign in ((0, 1), (0, -1), (1, 1), (1, -1)):
-            pos = ci.copy()
-            if axis == 0:
-                pos[0] = cj[0] + sign * (sj[0] / 2.0 + si[0] / 2.0)
-                pos[1] = cj[1]
-            else:
-                pos[1] = cj[1] + sign * (sj[1] / 2.0 + si[1] / 2.0)
-                pos[0] = cj[0]
-            slots.append(pos)
-    # 2) Beside attachment-partner anchors: put this module so its pair anchor meets the partner.
+    half_i = si / 2.0
+    far_pairs = []
+    near_pairs = []
     for p in pairs:
         if p['block_a'] == i:
             partner, local, other = p['block_b'], p['local_a'], p['anchor_b']
@@ -562,39 +663,92 @@ def _relocate_slots(i, centres, sizes, pairs, pinned):
             partner, local, other = p['block_a'], p['local_b'], p['anchor_a']
         else:
             continue
-        if partner in pinned and False:
-            pass
+        row = (float(p['distance']), partner, np.asarray(local, float), np.asarray(other, float), p)
+        if float(p['distance']) > LONG_LINK:
+            far_pairs.append(row)
+        else:
+            near_pairs.append(row)
+    far_pairs.sort(key=lambda t: (-t[0], t[1]))
+    near_pairs.sort(key=lambda t: (-t[0], t[1]))
+
+    def _add(pos, priority):
+        slots.append((np.asarray(pos, float), priority))
+
+    def _add_partner_slots(partner, local, other, far=False):
+        pri = 0 if far else 1
         # Desire: centre + local ≈ other  →  centre ≈ other - local
-        desire = np.asarray(other, float) - np.asarray(local, float)
-        slots.append(desire)
-        # Also a CLEAR step away along the current separation.
-        cur = centres[i] + np.asarray(local, float)
-        delta = np.asarray(other, float) - cur
+        desire = other - local
+        _add(desire, pri)
+        cur = centres[i] + local
+        delta = other - cur
         nrm = float(np.linalg.norm(delta))
         if nrm > 1e-6:
-            step = delta / nrm * (si.max() / 2.0 + 40.0)
-            slots.append(centres[i] + step)
-    # 3) Free-gap samples: corners of the current bounding box expanded by one module.
+            u = delta / nrm
+            # Pull toward the partner (more fractions when the pair is still far).
+            for scale in (0.25, 0.45, 0.65, 0.85, 1.0) if far else (0.75, 1.0):
+                # Fraction of the remaining gap — stays on the line to the partner.
+                _add(centres[i] + delta * scale, pri)
+            if far:
+                # Lateral nudges (perpendicular to the link) around desire / mid-pull.
+                perp = np.array([-u[1], u[0]], float)
+                lat = half_i.max() + 40.0
+                mid = centres[i] + delta * 0.5
+                for base in (desire, mid):
+                    for sign in (-1.0, 1.0):
+                        _add(base + perp * lat * sign, pri)
+                # Flush this module against the partner block, matching the partner's anchor axis.
+                pj, sj = centres[partner], sizes[partner]
+                for axis, sign in ((0, 1), (0, -1), (1, 1), (1, -1)):
+                    pos = desire.copy()
+                    if axis == 0:
+                        pos[0] = pj[0] + sign * (sj[0] / 2.0 + half_i[0])
+                        pos[1] = other[1] - local[1]
+                    else:
+                        pos[1] = pj[1] + sign * (sj[1] / 2.0 + half_i[1])
+                        pos[0] = other[0] - local[0]
+                    _add(pos, pri)
+
+    # 1) Far cross-structure pairs first (widened).
+    for _d, partner, local, other, _p in far_pairs:
+        _add_partner_slots(partner, local, other, far=True)
+    # 2) Remaining attachment partners.
+    for _d, partner, local, other, _p in near_pairs:
+        _add_partner_slots(partner, local, other, far=False)
+    # 3) Flush against other module boundaries.
+    for j in range(len(centres)):
+        if j == i:
+            continue
+        cj, sj = centres[j], sizes[j]
+        for axis, sign in ((0, 1), (0, -1), (1, 1), (1, -1)):
+            pos = ci.copy()
+            if axis == 0:
+                pos[0] = cj[0] + sign * (sj[0] / 2.0 + half_i[0])
+                pos[1] = cj[1]
+            else:
+                pos[1] = cj[1] + sign * (sj[1] / 2.0 + half_i[1])
+                pos[0] = cj[0]
+            _add(pos, 1)
+    # 4) Free-gap samples: corners of the current bounding box expanded by one module.
     lo, hi = _rects(centres, sizes)
     bb0 = lo.min(0) - si
     bb1 = hi.max(0) + si
     for x in (bb0[0], (bb0[0] + bb1[0]) / 2.0, bb1[0]):
         for y in (bb0[1], (bb0[1] + bb1[1]) / 2.0, bb1[1]):
-            slots.append(np.array([x, y], float))
-    # Dedup (rounded) and keep order; skip near-identical to current.
+            _add(np.array([x, y], float), 1)
+    # Dedup (rounded); far-driven slots keep a higher cap. Nearer first within band.
+    limit = RELOCATE_SLOTS + (FAR_RELOCATE_SLOTS if far_pairs else 0)
     seen = set()
-    out = []
-    for s in slots:
+    uniq = []
+    for s, pri in slots:
         key = (round(float(s[0]), 1), round(float(s[1]), 1))
         if key in seen:
             continue
         if _dist(s, ci) < 1.0:
             continue
         seen.add(key)
-        out.append(np.asarray(s, float))
-        if len(out) >= RELOCATE_SLOTS:
-            break
-    return out
+        uniq.append((pri, _dist(s, ci), key[0], key[1], s))
+    uniq.sort()
+    return [t[-1] for t in uniq[:limit]]
 
 
 def local_search(items, centres, model, cur, blocks=None, hub: int = 30,
@@ -762,17 +916,23 @@ class CounterLike:
         return dict(sorted(self._c.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
+_ARRANGEMENT_NAMES = ('spring', 'stress', 'stress_wide', 'skyline')
+
+
 def refine(items, centres, model, cur, blocks=None, hub: int = 30,
            weights=None, links=None, pinned=(), arrangements=None,
-           diagnostic: bool | None = None, log=None) -> tuple[np.ndarray, dict]:
+           arrangement_names=None, diagnostic: bool | None = None,
+           log=None) -> tuple[np.ndarray, dict]:
     """Run inter-skeleton refinement on ``centres``. Returns (centres, report).
 
-    When ``diagnostic`` (or module ``DIAGNOSTIC``) is True and ``arrangements`` holds
-    the four initial canvases, each is refined and the report records whether another
-    start would finish better.  Default path refines only the winning arrangement.
+    When ``arrangements`` holds the four initial canvases, each is refined with the
+    same attempt budget and the report records side-by-side display metrics.  That
+    diagnostic never changes which arrangement was chosen; the returned centres are
+    still the refined winner.  ``diagnostic=False`` skips the extra searches (tests).
     """
     if diagnostic is None:
-        diagnostic = DIAGNOSTIC
+        # Always refine every initial arrangement when present (report only).
+        diagnostic = True if arrangements is not None else DIAGNOSTIC
     centres0 = np.asarray(centres, float).copy()
     refined, report = local_search(
         items, centres0, model, cur, blocks=blocks, hub=hub,
@@ -812,6 +972,7 @@ def refine(items, centres, model, cur, blocks=None, hub: int = 30,
     report.pop('_pairs_after', None)
 
     if diagnostic and arrangements:
+        names = list(arrangement_names or _ARRANGEMENT_NAMES)
         diag_rows = []
         best_i, best_L = None, None
         for idx, arr in enumerate(arrangements):
@@ -821,19 +982,50 @@ def refine(items, centres, model, cur, blocks=None, hub: int = 30,
                 weights=weights, links=links, pinned=pinned, log=None,
             )
             final = r2['after'] if r2['stage_accepted'] else r2['before']
-            row = dict(index=idx, stage_accepted=r2['stage_accepted'],
-                       total_L=final['total_L'], long_links=final['long_links'],
-                       aspect=final['aspect'], canvas=final['canvas'])
+            disp = final.get('display') or {}
+            name = names[idx] if idx < len(names) else f'arrangement_{idx}'
+            row = dict(
+                index=idx, name=name,
+                stage_accepted=r2['stage_accepted'],
+                moves=r2.get('moves'),
+                # Objective (normalised).
+                total_L=final['total_L'], long_links=final['long_links'],
+                # Unnormalised display metrics (side-by-side across starts).
+                display=dict(
+                    total_length=disp.get('total_length'),
+                    max=disp.get('max'), p90=disp.get('p90'),
+                    links_over_250=disp.get('links_over_250'),
+                    links_over_1000=disp.get('links_over_1000'),
+                    cross_structure_far=disp.get('cross_structure_far'),
+                    structure_overlaps=disp.get('structure_overlaps'),
+                    module_crossings=disp.get('module_crossings'),
+                    canvas_area=disp.get('canvas_area'),
+                    aspect=disp.get('aspect'), canvas=disp.get('canvas'),
+                    compactness=disp.get('compactness'),
+                    module_links_over_250=disp.get('module_links_over_250'),
+                    module_links_over_1000=disp.get('module_links_over_1000'),
+                ),
+                aspect=final['aspect'], canvas=final['canvas'],
+            )
             diag_rows.append(row)
             if best_L is None or final['total_L'] < best_L - 1e-6:
                 best_L, best_i = final['total_L'], idx
+            if log:
+                d = row['display']
+                log(f"  inter-skeleton diagnostic {name}: L {row['total_L']}, "
+                    f">1000 {d.get('links_over_1000')}, "
+                    f"cs_far {d.get('cross_structure_far')}, "
+                    f"accepted={r2['stage_accepted']}")
         winner_L = report['after']['total_L']
         report['diagnostic'] = dict(
             arrangements=diag_rows,
             best_index=best_i,
+            best_name=(names[best_i] if best_i is not None and best_i < len(names) else None),
             best_total_L=best_L,
             winning_start_is_best=(best_i is None or abs(best_L - winner_L) <= 1e-4),
-            note='diagnostic only; default compose refines the winning arrangement alone',
+            note=('Same ATTEMPT_BUDGET on each initial arrangement (spring / stress / '
+                  'stress_wide / skyline). Report only — winner selection unchanged; '
+                  'final chooser waits for LayoutQualityEvaluator.'),
         )
     return refined, report
 
@@ -1069,9 +1261,21 @@ def refine_packed_blocks(model, blocks, cur, hub: int = 30, pinned_reaction_ids=
     # Deep-copy nested absolute geometry for the internals check.
     import copy as _copy
     before_blocks = [_copy.deepcopy(b) for b in blocks]
+    # Report-only: same four arrangement starts as plan_global (winner stays ELK pack).
+    arrangements = arrangement_names = None
+    try:
+        import global_layout as _gl
+        _, _placement = BC.place(items, weights, links, _gl.layout_blocks, log=None)
+        arrangements = (_placement or {}).get('arrangements')
+        arrangement_names = [c.get('name') for c in (_placement or {}).get('candidates') or ()]
+        if arrangements is not None and len(arrangement_names) != len(arrangements):
+            arrangement_names = list(_ARRANGEMENT_NAMES)
+    except Exception:
+        arrangements = arrangement_names = None
     new_centres, report = refine(
         items, centres, model, cur, blocks=blocks, hub=hub,
-        weights=weights, links=links, pinned=pinned, log=log,
+        weights=weights, links=links, pinned=pinned,
+        arrangements=arrangements, arrangement_names=arrangement_names, log=log,
     )
     if report.get('stage_accepted') and not report.get('rolled_back'):
         for i, (old_c, new_c) in enumerate(zip(centres, new_centres)):

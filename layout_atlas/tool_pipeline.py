@@ -1300,6 +1300,7 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             metric['inter_skeleton'] = dict(
                 inter_skeleton_report,
                 routed_final=_is.routed_attachment_length(data),
+                final_map_cross_structure_far=_is.final_map_cross_structure_far(data),
             )
         except Exception:
             pass
@@ -1602,9 +1603,11 @@ def run_job(folder):
     import global_layout as _gl
     _gl.BACKBONE = (LAYOUT_STYLE == 'curated')
     _gl.BLOCK_LAYOUT = options.get('block_layout') if options.get('block_layout') in ('auto', 'single') else 'auto'
-    # Report-only diagnostic (not a CLI flag): refine all four initial arrangements.
+    # Optional override: skip the four-arrangement diagnostic (default is on when
+    # arrangements are present). Not a CLI flag.
     import inter_skeleton as _is_opt
-    _is_opt.DIAGNOSTIC = bool(options.get('inter_skeleton_diagnostic'))
+    if 'inter_skeleton_diagnostic' in options:
+        _is_opt.DIAGNOSTIC = bool(options.get('inter_skeleton_diagnostic'))
     REACTION_STYLE = options.get('reaction_style') if options.get('reaction_style') in ('line', 'marker') else 'line'
     COMPLETION = options.get('completion') if options.get('completion') in ('spaced', 'classic') else 'spaced'
     PREVIOUS_ANCHORS = None

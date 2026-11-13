@@ -792,10 +792,15 @@ def plan_global(model, selected, bridges, g, log=None):
     except Exception:
         pinned = set()
     far_before = inter_skeleton.far_from_reaction_copies(blocks, model, cur)
+    arrangement_names = None
+    if arrangements is not None:
+        arrangement_names = [c.get('name') for c in (placement or {}).get('candidates') or ()]
+        if len(arrangement_names) != len(arrangements):
+            arrangement_names = ['spring', 'stress', 'stress_wide', 'skyline']
     centres, is_report = inter_skeleton.refine(
         items, centres, model, cur, blocks=blocks, hub=HUB,
         weights=weights, links=links, pinned=pinned,
-        arrangements=arrangements, log=log,
+        arrangements=arrangements, arrangement_names=arrangement_names, log=log,
     )
     centres = np.asarray(centres, float)
     placement = dict(placement or {}, same_map_weights=SAME_MAP_W, link_weight_scale=1.30,
