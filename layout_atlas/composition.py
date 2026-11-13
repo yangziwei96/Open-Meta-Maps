@@ -1088,24 +1088,10 @@ def relocation_gate_not_worse(before, after, eps=_GATE_EPS):
     """True when tip-nudge gate metrics do not worsen beyond ``eps``.
 
     Crossings / angular / ELD / overlaps ↓; PC / ortho / aspect_ratio ↑.
-    Missing (None) fields are skipped.
+    Missing (None) fields are skipped.  Shared with ``layout_quality_evaluator``.
     """
-    lower = ('crossings', 'overlapping_pairs', 'angular_resolution',
-             'edge_length_deviation')
-    higher = ('participant_consistency', 'edge_orthogonality', 'aspect_ratio')
-    for k in lower:
-        a, b = before.get(k), after.get(k)
-        if a is None or b is None:
-            continue
-        if float(b) > float(a) + eps:
-            return False
-    for k in higher:
-        a, b = before.get(k), after.get(k)
-        if a is None or b is None:
-            continue
-        if float(b) + eps < float(a):
-            return False
-    return True
+    from layout_quality_evaluator import TIP_DIRS, metrics_not_worse
+    return metrics_not_worse(before, after, TIP_DIRS, eps)
 
 
 def _escher_gate_metrics(data, model, pathway=None):

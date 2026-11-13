@@ -697,12 +697,6 @@ def score_trial(
 
 def no_regression(before: dict, after: dict, tol: float = 1e-4) -> bool:
     """True when no gated metric is worse than ``before`` beyond ``tol``."""
-    for key, better in _GATE_DIRS.items():
-        bv, av = before.get(key), after.get(key)
-        if bv is None or av is None:
-            continue
-        if better == "lower" and float(av) > float(bv) + tol:
-            return False
-        if better == "higher" and float(av) < float(bv) - tol:
-            return False
-    return True
+    from layout_quality_evaluator import metrics_not_worse
+
+    return metrics_not_worse(before, after, _GATE_DIRS, tol)
