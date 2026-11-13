@@ -1080,53 +1080,20 @@ def _expand_move_with_multimarkers(body, move):
     return out
 
 
-# Tip-nudge no-worse tolerance (same scale as official layout-benchmark gates).
-_GATE_EPS = 1e-4
-
-
-def relocation_gate_not_worse(before, after, eps=_GATE_EPS):
+def relocation_gate_not_worse(before, after, eps=None):
     """True when tip-nudge gate metrics do not worsen beyond ``eps``.
 
     Crossings / angular / ELD / overlaps ↓; PC / ortho / aspect_ratio ↑.
-    Missing (None) fields are skipped.
+    Missing (None) fields are skipped.  Routed through ``layout_quality_evaluator``.
     """
-    lower = ('crossings', 'overlapping_pairs', 'angular_resolution',
-             'edge_length_deviation')
-    higher = ('participant_consistency', 'edge_orthogonality', 'aspect_ratio')
-    for k in lower:
-        a, b = before.get(k), after.get(k)
-        if a is None or b is None:
-            continue
-        if float(b) > float(a) + eps:
-            return False
-    for k in higher:
-        a, b = before.get(k), after.get(k)
-        if a is None or b is None:
-            continue
-        if float(b) + eps < float(a):
-            return False
-    return True
+    from layout_quality_evaluator import METRIC_EPS, TIP_DIRS, metrics_not_worse
+    return metrics_not_worse(before, after, TIP_DIRS, METRIC_EPS if eps is None else eps)
 
 
 def _escher_gate_metrics(data, model, pathway=None):
-    """Tip-nudge gates from compose-safe counters (no evaluation / gdMetriX).
-
-    PC / ELD / angular from ``orthogonal_route.gate_metrics``; crossings from
-    ``layout_quality.algorithm_crossings``; orthogonality from
-    ``orthogonal_route.piece_axis_alignment`` on the same drawn pieces.
-    """
-    import layout_quality as lq
-    import orthogonal_route as ortho
-    gm = ortho.gate_metrics(data, pathway=pathway)
-    return dict(
-        crossings=int(lq.algorithm_crossings(data)[0]),
-        participant_consistency=gm.get('participant_consistency'),
-        angular_resolution=gm.get('angular_resolution'),
-        edge_length_deviation=gm.get('edge_length_deviation'),
-        edge_orthogonality=ortho.piece_axis_alignment(data, pathway=pathway),
-        aspect_ratio=_content_aspect_ratio(data[1]),
-        overlapping_pairs=glyph_circle_overlapping_pairs(data),
-    )
+    """Tip-nudge gates via ``layout_quality_evaluator.measure_tip``."""
+    from layout_quality_evaluator import measure_tip
+    return measure_tip(data, pathway=pathway)
 
 
 def _apply_tip_move(tbody, move, dx, dy):
@@ -1195,8 +1162,10 @@ def nudge_frontier_escher(data, model, previous_anchors=None, skip_edges=(),
     """
     import copy as _copy
     import edge_style
-    import layout_quality as lq
     import orthogonal_route as ortho
+    from layout_quality_evaluator import (
+        METRIC_EPS, LayoutQualityEvaluator, measure_tip, metrics_not_worse, TIP_DIRS,
+    )
     if not isinstance(data[0], dict):
         data[0] = {}
     data[0].setdefault('metadata', {})
@@ -1209,7 +1178,13 @@ def nudge_frontier_escher(data, model, previous_anchors=None, skip_edges=(),
         data, previous_anchors)
     asp0 = (x1 - x0) / max(y1 - y0, 1e-9)
     pathway = ortho.load_pathway(gem_path) if gem_path else None
-    baseline = _escher_gate_metrics(data, model, pathway=pathway)
+    skip = list(skip_edges or ())
+    tip_ev = LayoutQualityEvaluator(
+        data, skip_edges=skip, previous_anchors=previous_anchors,
+        model=model, pathway=pathway, rule='tip',
+        require_local_improvement=False, eps=METRIC_EPS,
+    )
+    baseline = tip_ev.snapshot(copy_data=False)
     accepted = rejected = 0
     face_delta = {
         'right': (-float(step), 0.0),
@@ -1221,7 +1196,6 @@ def nudge_frontier_escher(data, model, previous_anchors=None, skip_edges=(),
         else ('right', 'left', 'top', 'bottom')
     # Nodes whose marker-sized disk touches a content-bbox face.
     edge_tol = _TIP_MARKER_R
-    skip = list(skip_edges or ())
     while True:
         progressed = False
         x0, y0, x1, y1 = _escher_content_bbox(body)
@@ -1256,26 +1230,28 @@ def nudge_frontier_escher(data, model, previous_anchors=None, skip_edges=(),
                 rejected += 1
                 continue
             # Cheap rejects before re-routing (same directions as the full gate).
-            if glyph_circle_overlapping_pairs(trial) > int(baseline['overlapping_pairs']):
+            if tip_ev.prefilter(
+                trial,
+                max_overlaps=int(baseline['overlapping_pairs']),
+                max_crossings=int(baseline['crossings']),
+            ) is not None:
                 rejected += 1
                 continue
-            if float(_content_aspect_ratio(tbody)) + _GATE_EPS < float(baseline['aspect_ratio']):
-                rejected += 1
-                continue
-            if int(lq.algorithm_crossings(trial)[0]) > int(baseline['crossings']):
+            if float(_content_aspect_ratio(tbody)) + METRIC_EPS < float(baseline['aspect_ratio']):
                 rejected += 1
                 continue
             only = _reactions_touching(tbody, move)
             edge_style.apply(
                 trial, skip, mode='orthogonal', only=only or None,
                 gem_path=gem_path, pathway=pathway)
-            gate1 = _escher_gate_metrics(trial, model, pathway=pathway)
-            if not relocation_gate_not_worse(baseline, gate1):
+            gate1 = measure_tip(trial, pathway=pathway)
+            if not metrics_not_worse(baseline, gate1, TIP_DIRS, METRIC_EPS):
                 rejected += 1
                 continue
             # Keep the trial's re-route metadata; do not route again.
             data[0], data[1] = trial[0], trial[1]
             body = data[1]
+            tip_ev.data = data
             accepted += 1
             progressed = True
             break
