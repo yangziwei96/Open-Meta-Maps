@@ -49,9 +49,12 @@ MAX_COLL_RISE, MAX_CROSS_RISE = 5, 10
 
 
 def _accept(old, new):
-    import quality_gate as qg
     if ACCEPT != 'balanced':
-        return qg.accept(old, new)
+        from layout_quality_evaluator import LayoutQualityEvaluator
+        gate = LayoutQualityEvaluator([], rule='peripheral', require_local_improvement=True)
+        gate.begin_report(old)
+        decision = gate.evaluate(None, metrics=new)
+        return decision.accepted, decision.reason
     if new['hard'] > old['hard']:
         return False, 'hard constraint broken'
     dc, do, dl = new['crossings'] - old['crossings'], new['collisions'] - old['collisions'], new['long_edges'] - old['long_edges']

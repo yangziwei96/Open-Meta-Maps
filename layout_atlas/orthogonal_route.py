@@ -33,12 +33,8 @@ import edge_routing as er
 import line_render
 from core import CURRENCY
 
-# Local accept gates (same directions as official layout-benchmark 837067d).
-# angular_resolution is Purchase deviation (lower better); participant_consistency
-# is higher better.
-_GATE_LOWER = ('crossings', 'edge_length_deviation', 'angular_resolution')
-_GATE_HIGHER = ('participant_consistency',)
-_GATE_EPS = 1e-4
+# Local accept gates: layout_quality_evaluator.ORTHO_DIRS + METRIC_EPS.
+
 
 STUB_MAX = 90.0          # px: short cofactor spokes stay as stubs
 LONG_EDGE = 160.0        # px: long algorithm edges always get orthogonal routes
@@ -324,23 +320,13 @@ def _gate_metrics(data, pathway=None):
     }
 
 
-def _gate_ok(pre, cur, eps=_GATE_EPS):
+def _gate_ok(pre, cur, eps=None):
     """True when no gated metric is worse than ``pre`` beyond ``eps``."""
+    from layout_quality_evaluator import METRIC_EPS, ORTHO_DIRS, metrics_not_worse
+
     if not pre or not cur:
         return False
-    for k in _GATE_LOWER:
-        a, b = pre.get(k), cur.get(k)
-        if a is None or b is None:
-            continue
-        if b > a + eps:
-            return False
-    for k in _GATE_HIGHER:
-        a, b = pre.get(k), cur.get(k)
-        if a is None or b is None:
-            continue
-        if b < a - eps:
-            return False
-    return True
+    return metrics_not_worse(pre, cur, ORTHO_DIRS, METRIC_EPS if eps is None else eps)
 
 
 def _path_hits(pts, rects, pad=CLEAR):
@@ -773,7 +759,8 @@ def apply_orthogonal(data, skip_edges=(), only=None, bezier_stub_fn=None, gem_pa
             if edge_key in key_index:
                 trial = list(lengths)
                 trial[key_index[edge_key]] = plen
-                if _length_deviation(trial) > pre_dev + _GATE_EPS:
+                from layout_quality_evaluator import METRIC_EPS
+                if _length_deviation(trial) > pre_dev + METRIC_EPS:
                     report['unresolved'] += 1
                     continue
             write_polyline(rx, mid_id, met_nid, path, nodes, counter)
@@ -804,7 +791,8 @@ def apply_orthogonal(data, skip_edges=(), only=None, bezier_stub_fn=None, gem_pa
     report['gate_after'] = {k: (None if v is None else round(v, 6)) for k, v in after_gate.items()}
     report['gate_ok'] = _gate_ok(pre_gate, after_gate)
     # Hard length-cap check on the final map (independent of gate metric rounding).
-    if report['length_deviation_after'] > pre_dev + _GATE_EPS:
+    from layout_quality_evaluator import METRIC_EPS
+    if report['length_deviation_after'] > pre_dev + METRIC_EPS:
         report['gate_ok'] = False
     if not report['gate_ok']:
         data[0], data[1] = copy.deepcopy(pre_snap)[0], copy.deepcopy(pre_snap)[1]

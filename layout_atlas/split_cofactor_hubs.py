@@ -16,7 +16,13 @@ import math
 from core import currency
 from cofactor_hubs import cofactor_hubs
 from hub_drawing import drawing_graph, stub_endpoints
-from layout_gate import CrossingIndex, no_regression, score_map, score_trial
+from layout_gate import CrossingIndex, score_map, score_trial
+from layout_quality_evaluator import HUB_DIRS, METRIC_EPS, metrics_not_worse
+
+
+def no_regression(before, after, tol=None):
+    """Hub-split no-regression via the shared evaluator tolerance and directions."""
+    return metrics_not_worse(before, after, HUB_DIRS, METRIC_EPS if tol is None else tol)
 
 
 def _midmarker(nodes, rx):

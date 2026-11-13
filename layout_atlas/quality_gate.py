@@ -161,10 +161,14 @@ def translate_module(data, scene, keys, delta, reactions, skip_edges):
 def peripheral_pass(data, scene, proposals, skip_edges, budget_s=150.0, max_candidates=24, log=None):
     """Try each proposed module move on a copy of the map, keep it only when `accept` says the final geometry is not worse.  Returns (data, report)."""
     import edge_style
+    from layout_quality_evaluator import LayoutQualityEvaluator
     t0 = time.time()
     far = len(proposals)
     base, summary, issues = evaluate_map(data, skip_edges, disconnected=far)
     rows, accepted = [], 0
+    gate = LayoutQualityEvaluator(
+        data, skip_edges=skip_edges, rule='peripheral', require_local_improvement=True,
+    )
     for prop in sorted(proposals, key=lambda p: -p.get('connection_px', [0, 0])[0])[:max_candidates]:
         if time.time() - t0 > budget_s:
             rows.append(dict(exchange=prop['exchange'], decision='budget_exhausted'))
@@ -175,7 +179,9 @@ def peripheral_pass(data, scene, proposals, skip_edges, budget_s=150.0, max_cand
         if time.time() - t0 > budget_s:
             rows.append(dict(exchange=prop['exchange'], decision='budget_exhausted'))
             continue
-        ok, why = accept(base, new)
+        gate.begin_report(base)
+        decision = gate.evaluate(d2, metrics=new, disconnected=far - 1)
+        ok, why = decision.accepted, decision.reason
         rows.append(dict(exchange=prop['exchange'], transports=prop['transports'], decision='accepted' if ok else 'rejected', reason=why, moved_px=prop.get('moved_px'),
                          before={k: base[k] for k in ('collisions', 'crossings', 'long_edges')}, after={k: new[k] for k in ('collisions', 'crossings', 'long_edges')}))
         if ok:

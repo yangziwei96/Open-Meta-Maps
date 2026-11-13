@@ -695,8 +695,12 @@ def score_trial(
     return after
 
 
-def no_regression(before: dict, after: dict, tol: float = 1e-4) -> bool:
-    """True when no gated metric is worse than ``before`` beyond ``tol``."""
-    from layout_quality_evaluator import metrics_not_worse
+def no_regression(before: dict, after: dict, tol: float | None = None) -> bool:
+    """True when no gated metric is worse than ``before`` beyond ``tol``.
 
-    return metrics_not_worse(before, after, _GATE_DIRS, tol)
+    Routed through ``layout_quality_evaluator.metrics_not_worse`` with the shared
+    ``METRIC_EPS`` (and the same columns as ``HUB_DIRS``).
+    """
+    from layout_quality_evaluator import METRIC_EPS, metrics_not_worse
+
+    return metrics_not_worse(before, after, _GATE_DIRS, METRIC_EPS if tol is None else tol)

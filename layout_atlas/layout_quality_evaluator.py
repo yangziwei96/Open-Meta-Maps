@@ -1,24 +1,27 @@
 """Shared layout-quality evaluator for compose-stage accept / reject.
 
-One implementation for the pipeline quality gate, gap-packing ``_GATE_EPS``
-checks, tip nudge, hub split, hotspot repair, and orthogonal routing.
+Wired into compose today:
+  - tip nudge + aspect check (``composition.nudge_frontier_escher``) via
+    ``rule="tip"`` / ``TIP_DIRS`` / ``measure_tip`` / ``METRIC_EPS``
+  - hub split (``layout_gate.no_regression`` / ``split_cofactor_hubs``) via
+    ``HUB_DIRS`` / ``metrics_not_worse`` / ``METRIC_EPS``
+  - peripheral / block relocation (``quality_gate.peripheral_pass``,
+    ``block_relocation._accept`` when not balanced) via ``rule="peripheral"``
+  - orthogonal routing (``orthogonal_route._gate_ok`` and length-deviation
+    caps) via ``ORTHO_DIRS`` / ``metrics_not_worse`` / ``METRIC_EPS``
 
-Canonical measurements:
-  - crossings: ``layout_quality.CrossingIndex(data, skip_edges).headline()``
-    (pipeline edge set, filters and geometry)
-  - pins: both ``r:`` and ``m:`` ``--previous`` anchors unchanged vs snapshot
-  - curated structures: translation-only vs snapshot
+One shared tolerance: ``METRIC_EPS`` (replaces the former per-module
+``_GATE_EPS`` copies).
 
 API: ``snapshot()`` a baseline, ``evaluate()`` a candidate, then ``commit()``
-or ``rollback()``.  Final acceptance always uses the full evaluation; callers
-may cheap-reject with ``prefilter()`` first.
+or ``rollback()``.  Callers may cheap-reject with ``prefilter()`` first;
+final acceptance uses the full evaluation.
 
-Official rule (three tiers, no weighted sum):
+Accept rule (three tiers, no weighted sum):
   1. Hard constraints reject immediately.
-  2. None of the 11 official metrics may worsen by more than ``METRIC_EPS``.
-  3. The candidate must improve its local objective.
-Candidates are compared constraint-first, then by Pareto dominance on the
-official metrics.
+  2. None of the directed score metrics may worsen by more than ``METRIC_EPS``.
+  3. The candidate must improve its local objective (Pareto on the gated
+     metrics when no scalar objective is set).
 """
 from __future__ import annotations
 
@@ -32,8 +35,10 @@ import numpy as np
 
 METRIC_EPS = 1e-4
 
-# Official layout-benchmark directions used by the compose accept rule.
-OFFICIAL_DIRS: dict[str, str] = {
+# Hub ``score_map`` columns plus pipeline crossings and coverage ratios.
+# Values come from ``layout_gate.score_map`` / ``orthogonal_route.gate_metrics``
+# and ``pipeline_crossings`` — not from an external official scorer.
+SCORE_DIRS: dict[str, str] = {
     "crossings": "lower",
     "overlapping_pairs": "lower",
     "overlap_area_share": "lower",
@@ -47,9 +52,9 @@ OFFICIAL_DIRS: dict[str, str] = {
     # drawn_per_node is undirected in the benchmark; still reported, not gated.
 }
 
-OFFICIAL_METRICS: tuple[str, ...] = tuple(OFFICIAL_DIRS) + ("drawn_per_node",)
+SCORE_METRICS: tuple[str, ...] = tuple(SCORE_DIRS) + ("drawn_per_node",)
 
-# Gap-packing / tip-nudge metric directions (subset + aspect_ratio).
+# Tip-nudge metric directions (subset + aspect_ratio).
 TIP_DIRS: dict[str, str] = {
     "crossings": "lower",
     "overlapping_pairs": "lower",
@@ -60,7 +65,7 @@ TIP_DIRS: dict[str, str] = {
     "aspect_ratio": "higher",
 }
 
-# Hub-split gate columns (layout_gate._GATE_DIRS).
+# Hub-split gate columns (same set as ``layout_gate._GATE_DIRS``).
 HUB_DIRS: dict[str, str] = {
     "crossings": "lower",
     "crossing_density": "higher",
@@ -243,27 +248,6 @@ def previous_pinned_node_ids(data, previous_anchors) -> set:
     return out
 
 
-def curated_structure_node_ids(data) -> set:
-    """Escher node ids that belong to curated-structure reactions."""
-    curated_rx = set()
-    for s in (data[0].get("metadata") or {}).get("expert_structures") or []:
-        curated_rx.update(s.get("reactions") or s.get("reaction_ids") or [])
-    if not curated_rx:
-        return set()
-    body = data[1]
-    nodes = body.get("nodes") or {}
-    out = set()
-    for rxn in (body.get("reactions") or {}).values():
-        if rxn.get("bigg_id") not in curated_rx:
-            continue
-        for seg in (rxn.get("segments") or {}).values():
-            for end in ("from_node_id", "to_node_id"):
-                nid = seg.get(end)
-                if nid is not None and nid in nodes:
-                    out.add(nid)
-    return out
-
-
 def _structure_reaction_sets(data) -> list[tuple[str, frozenset]]:
     rows = []
     for s in (data[0].get("metadata") or {}).get("expert_structures") or []:
@@ -362,22 +346,25 @@ def coverage_metrics(data, model) -> dict[str, float | None]:
     )
 
 
-def measure_official(
+def measure_scores(
     data,
     *,
     skip_edges=None,
     model=None,
     pathway=None,
 ) -> dict[str, Any]:
-    """Full official metric vector used by the three-tier accept rule."""
+    """Score-map + pipeline-crossing metric vector for the three-tier accept rule.
+
+    Failures propagate; callers that need a soft path must catch themselves.
+    """
     import layout_gate as lg
     import layout_quality as lq
+    import orthogonal_route as ortho
 
     skip = _skip_from_data(data, skip_edges)
     out: dict[str, Any] = {
         "crossings": float(pipeline_crossings(data, skip)),
     }
-    # Overlaps + geometric metrics from the hub drawing graph when a pathway is available.
     if pathway is not None:
         scored = lg.score_map(pathway, data)
         for k in (
@@ -394,22 +381,31 @@ def measure_official(
         node_ov, _lab = lq.overlap_counts(data)
         out["overlapping_pairs"] = float(node_ov)
         out["overlap_area_share"] = None
-        try:
-            import orthogonal_route as ortho
-
-            gm = ortho.gate_metrics(data, pathway=None)
-            out["participant_consistency"] = gm.get("participant_consistency")
-            out["edge_length_deviation"] = gm.get("edge_length_deviation")
-            out["angular_resolution"] = gm.get("angular_resolution")
-            out["edge_orthogonality"] = ortho.piece_axis_alignment(data, pathway=None)
-        except Exception:
-            out.setdefault("participant_consistency", None)
-            out.setdefault("edge_length_deviation", None)
-            out.setdefault("angular_resolution", None)
-            out.setdefault("edge_orthogonality", None)
+        gm = ortho.gate_metrics(data, pathway=None)
+        out["participant_consistency"] = gm.get("participant_consistency")
+        out["edge_length_deviation"] = gm.get("edge_length_deviation")
+        out["angular_resolution"] = gm.get("angular_resolution")
+        out["edge_orthogonality"] = ortho.piece_axis_alignment(data, pathway=None)
         out["crossing_angular_resolution"] = None
     out.update(coverage_metrics(data, model))
     return out
+
+
+def measure_tip(data, *, pathway=None) -> dict[str, Any]:
+    """Tip-nudge gate metrics; crossings match compose ``algorithm_crossings`` (no skip)."""
+    import layout_quality as lq
+    import orthogonal_route as ortho
+
+    gm = ortho.gate_metrics(data, pathway=pathway)
+    return dict(
+        crossings=int(lq.algorithm_crossings(data)[0]),
+        participant_consistency=gm.get("participant_consistency"),
+        angular_resolution=gm.get("angular_resolution"),
+        edge_length_deviation=gm.get("edge_length_deviation"),
+        edge_orthogonality=ortho.piece_axis_alignment(data, pathway=pathway),
+        aspect_ratio=_content_aspect(data[1]),
+        overlapping_pairs=int(_glyph_overlaps(data)),
+    )
 
 
 @dataclass
@@ -448,14 +444,14 @@ class LayoutQualityEvaluator:
         model=None,
         pathway=None,
         local_objective: Callable[[Any], float] | None = None,
-        rule: str = "official",
+        rule: str = "scores",
         metric_dirs: Mapping[str, str] | None = None,
         cross_tol: float = 0.0,
         require_local_improvement: bool = True,
         eps: float = METRIC_EPS,
     ):
         self.data = data
-        self.skip_edges = _skip_from_data(data, skip_edges)
+        self.skip_edges = _skip_from_data(data, skip_edges) if data else list(skip_edges or [])
         self.previous_anchors = previous_anchors or {}
         self.model = model
         self.pathway = pathway
@@ -473,7 +469,7 @@ class LayoutQualityEvaluator:
         elif rule == "ortho":
             self.metric_dirs = dict(ORTHO_DIRS)
         else:
-            self.metric_dirs = dict(OFFICIAL_DIRS)
+            self.metric_dirs = dict(SCORE_DIRS)
         self._snap: _Snapshot | None = None
         self.accepted = 0
         self.rejected = 0
@@ -485,10 +481,8 @@ class LayoutQualityEvaluator:
         if self.rule == "peripheral":
             return self._measure_peripheral(data)
         if self.rule == "tip":
-            return self._measure_tip(data)
+            return measure_tip(data, pathway=self.pathway)
         if self.rule in ("hub", "hotspot"):
-            # Hub/hotspot callers usually pass precomputed metric dicts; still
-            # expose official crossings for hard checks / reports.
             if self.pathway is not None and self.rule == "hub":
                 import layout_gate as lg
 
@@ -496,7 +490,7 @@ class LayoutQualityEvaluator:
                 m["crossings"] = float(pipeline_crossings(data, self.skip_edges))
                 return m
             return dict(crossings=float(pipeline_crossings(data, self.skip_edges)))
-        return measure_official(
+        return measure_scores(
             data,
             skip_edges=self.skip_edges,
             model=self.model,
@@ -509,36 +503,9 @@ class LayoutQualityEvaluator:
         row, _summary, _issues = qg.evaluate_map(data, self.skip_edges)
         return row
 
-    def _measure_tip(self, data) -> dict[str, Any]:
-        import orthogonal_route as ortho
-
-        gm = ortho.gate_metrics(data, pathway=self.pathway)
-        # Tip historically used algorithm_crossings without skip; consolidate
-        # onto the pipeline CrossingIndex with skip_edges.
-        return dict(
-            crossings=float(pipeline_crossings(data, self.skip_edges)),
-            participant_consistency=gm.get("participant_consistency"),
-            angular_resolution=gm.get("angular_resolution"),
-            edge_length_deviation=gm.get("edge_length_deviation"),
-            edge_orthogonality=ortho.piece_axis_alignment(data, pathway=self.pathway),
-            aspect_ratio=_content_aspect(data[1]),
-            overlapping_pairs=float(_glyph_overlaps(data)),
-        )
-
     def _hard_state(self, data) -> dict[str, Any]:
-        pinned = previous_pinned_node_ids(data, self.previous_anchors)
         return dict(
-            pinned=sorted(pinned),
-            pin_xy={
-                nid: (
-                    float((data[1]["nodes"][nid])["x"]),
-                    float((data[1]["nodes"][nid])["y"]),
-                )
-                for nid in pinned
-                if nid in (data[1].get("nodes") or {})
-            },
             canvas=canvas_area(data),
-            content=content_area(data),
             cropped=cropped_label_count(data),
             coverage=coverage_metrics(data, self.model),
         )
@@ -561,7 +528,6 @@ class LayoutQualityEvaluator:
             if bv is None or av is None:
                 continue
             if float(av) + self.eps < float(bv) or float(av) + self.eps < 1.0:
-                # Everything drawn: coverage must stay complete when it was complete.
                 if float(bv) >= 1.0 - self.eps and float(av) < 1.0 - self.eps:
                     fails.append("not_everything_drawn")
                     break
@@ -572,10 +538,6 @@ class LayoutQualityEvaluator:
             fails.append("canvas_grew")
         if cropped_label_count(candidate) > int(self._snap.hard["cropped"]):
             fails.append("new_cropped_labels")
-        if self.rule == "peripheral":
-            # Peripheral hard flag from evaluate_map (bezier coverage).
-            row = candidate if isinstance(candidate, dict) and "hard" in candidate else None
-            # checked in evaluate via metrics path
         return fails
 
     # --- snapshot / evaluate / commit ------------------------------------
@@ -583,9 +545,8 @@ class LayoutQualityEvaluator:
     def snapshot(self, local=None, *, copy_data: bool = True) -> dict[str, Any]:
         """Freeze baseline geometry + metrics. Returns the measured metrics.
 
-        ``copy_data=False`` records metrics only (no map deepcopy). Use that for
-        stage bookkeeping when hard-constraint rollback is not needed, so
-        budget-bound compose stages stay within their try counts.
+        ``copy_data=False`` records metrics only (no map deepcopy) when hard
+        constraint rollback is not needed.
         """
         metrics = self.measure(self.data)
         local_val = local
@@ -624,17 +585,25 @@ class LayoutQualityEvaluator:
         if self._snap is None:
             raise RuntimeError("snapshot() before prefilter()")
         if max_content_area is not None and content_area(candidate) >= max_content_area:
-            return self._reject("prefilter_content_area", candidate)
+            return self._reject("prefilter_content_area")
         if max_overlaps is not None and _glyph_overlaps(candidate) > max_overlaps:
-            return self._reject("prefilter_overlaps", candidate)
+            return self._reject("prefilter_overlaps")
         if max_aspect_drop is not None:
             asp0 = float(self._snap.metrics.get("aspect_ratio") or 0.0)
             asp1 = _content_aspect(candidate[1])
             if asp1 + self.eps < asp0 - float(max_aspect_drop):
-                return self._reject("prefilter_aspect", candidate)
+                return self._reject("prefilter_aspect")
         if max_crossings is not None:
-            if pipeline_crossings(candidate, self.skip_edges) > max_crossings:
-                return self._reject("prefilter_crossings", candidate)
+            import layout_quality as lq
+
+            # Tip cheap-reject uses algorithm_crossings (no skip), matching measure_tip.
+            cross = (
+                int(lq.algorithm_crossings(candidate)[0])
+                if self.rule == "tip"
+                else pipeline_crossings(candidate, self.skip_edges)
+            )
+            if cross > max_crossings:
+                return self._reject("prefilter_crossings")
         return None
 
     def evaluate(
@@ -662,14 +631,7 @@ class LayoutQualityEvaluator:
         if self.rule == "ortho":
             return self._evaluate_dirs(candidate, metrics=metrics, require_improve=False)
 
-        # Official / tip: hard → official/tip metrics → local improvement.
         hard_fails = self.hard_failures(candidate)
-        # Tip also forbids content growth (canvas content bbox).
-        if self.rule == "tip":
-            if content_area(candidate) >= content_area(self._snap.data) - 0.0:
-                # Tip requires a strict content shrink; recorded separately when used
-                # as a prefilter. Here treat non-shrink as local failure below.
-                pass
         after = dict(metrics) if metrics is not None else self.measure(candidate)
         before = self._snap.metrics
         metric_fails = metric_regressions(before, after, self.metric_dirs, self.eps)
@@ -682,8 +644,7 @@ class LayoutQualityEvaluator:
             candidate, local=local, local_before=local_before, local_after=local_after, after=after
         )
         if self.rule == "tip":
-            # Tip gate is no-worse only (improvement is the content-area shrink
-            # checked by the caller / prefilter); do not demand metric improvement.
+            # Tip gate is no-worse on metrics; content shrink is checked by the caller.
             local_ok = True
             local_reason = ""
 
@@ -722,10 +683,12 @@ class LayoutQualityEvaluator:
         metric_fails = metric_regressions(before, after, self.metric_dirs, self.eps)
         ok = not metric_fails
         if require_improve and ok:
-            ok = dominates(after, before, self.metric_dirs, self.eps) or any(
-                after.get(k) != before.get(k) for k in self.metric_dirs
-            )
-        reason = "accepted" if ok else ("metrics:" + ",".join(metric_fails) if metric_fails else "no_improvement")
+            ok = dominates(after, before, self.metric_dirs, self.eps)
+        reason = (
+            "accepted"
+            if ok
+            else ("metrics:" + ",".join(metric_fails) if metric_fails else "no_improvement")
+        )
         ev = Evaluation(ok, reason, True, not metric_fails, True, after, before, [], metric_fails)
         self._record(ev)
         return ev
@@ -758,8 +721,6 @@ class LayoutQualityEvaluator:
     def _evaluate_hub(self, candidate, *, metrics=None) -> Evaluation:
         after = dict(metrics) if metrics is not None else self.measure(candidate)
         before = self._snap.metrics
-        # Hub split: no regression vs original snapshot AND (caller may also
-        # compare against a moving current score separately).
         ok = metrics_not_worse(before, after, self.metric_dirs, self.eps)
         fails = metric_regressions(before, after, self.metric_dirs, self.eps)
         reason = "accepted" if ok else "metrics:" + ",".join(fails)
@@ -768,7 +729,6 @@ class LayoutQualityEvaluator:
         return ev
 
     def _evaluate_hotspot(self, candidate, *, metrics=None, local_before=None, local_after=None) -> Evaluation:
-        # Hotspot local objective: headline crossings must drop; overlaps not up.
         import layout_quality as lq
 
         before_cross = (
@@ -792,21 +752,29 @@ class LayoutQualityEvaluator:
         local_ok = after_cross < before_cross
         if hard_fails:
             reason = hard_fails[0]
-            ev = Evaluation(False, reason, False, True, local_ok, {"crossings": after_cross}, self._snap.metrics, hard_fails, [], after_cross - before_cross)
+            ev = Evaluation(
+                False, reason, False, True, local_ok, {"crossings": after_cross},
+                self._snap.metrics, hard_fails, [], after_cross - before_cross,
+            )
             self._record(ev)
             return ev
         if not local_ok:
-            ev = Evaluation(False, "no_crossing_drop", True, True, False, {"crossings": after_cross}, self._snap.metrics, [], [], after_cross - before_cross)
+            ev = Evaluation(
+                False, "no_crossing_drop", True, True, False, {"crossings": after_cross},
+                self._snap.metrics, [], [], after_cross - before_cross,
+            )
             self._record(ev)
             return ev
-        ev = Evaluation(True, "accepted", True, True, True, {"crossings": after_cross}, self._snap.metrics, [], [], after_cross - before_cross)
+        ev = Evaluation(
+            True, "accepted", True, True, True, {"crossings": after_cross},
+            self._snap.metrics, [], [], after_cross - before_cross,
+        )
         self._record(ev)
         return ev
 
     def _local_ok(self, candidate, *, local, local_before, local_after, after) -> tuple[bool, float | None, str]:
         if local_before is not None and local_after is not None:
             delta = float(local_after) - float(local_before)
-            # Lower-is-better local scalars (crossings, area, …).
             return delta < -self.eps, delta, ("no_local_improvement" if delta >= -self.eps else "")
         if self.local_objective is not None:
             before = self._snap.local
@@ -818,15 +786,11 @@ class LayoutQualityEvaluator:
         if local is not None and self._snap.local is not None:
             delta = float(local) - float(self._snap.local)
             return delta < -self.eps, delta, ("no_local_improvement" if delta >= -self.eps else "")
-        # Default local objective: Pareto improvement on the gated metrics.
         if dominates(after, self._snap.metrics, self.metric_dirs, self.eps):
             return True, None, ""
         if not self.require_local_improvement:
             return True, None, ""
         return False, None, "no_local_improvement"
-
-    def accept(self, evaluation: Evaluation) -> bool:
-        return bool(evaluation.accepted)
 
     def prefer(self, a: Evaluation, b: Evaluation) -> int:
         """Constraint-first + Pareto. -1 if ``a`` better, 1 if ``b`` better, 0 else."""
@@ -864,13 +828,13 @@ class LayoutQualityEvaluator:
             rule=self.rule,
         )
 
-    def far_edges(self, *, p90: float | None = None, top: int = 20) -> dict[str, Any]:
+    def far_edges(self, *, length_threshold: float | None = None, top: int = 20) -> dict[str, Any]:
         """Far-edge report on the working map (mutually exclusive classes)."""
         return far_edge_report(
-            self.data, skip_edges=self.skip_edges, p90=p90, top=top
+            self.data, skip_edges=self.skip_edges, length_threshold=length_threshold, top=top
         )
 
-    def _reject(self, reason: str, candidate) -> Evaluation:
+    def _reject(self, reason: str) -> Evaluation:
         ev = Evaluation(False, reason, True, True, False, {}, self._snap.metrics if self._snap else {})
         self._record(ev)
         return ev
@@ -893,30 +857,40 @@ def _content_aspect(body) -> float:
 
 
 def _glyph_overlaps(data) -> int:
-    try:
-        from composition import glyph_circle_overlapping_pairs
+    from composition import glyph_circle_overlapping_pairs
 
-        return int(glyph_circle_overlapping_pairs(data))
-    except Exception:
-        import layout_quality as lq
-
-        return int(lq.overlap_counts(data)[0])
+    return int(glyph_circle_overlapping_pairs(data))
 
 
 # --- far-edge classification (mutually exclusive + exhaustive) -----------
 
 # Priority order: first match wins. Every far edge gets exactly one label.
+# Count order used in reports: within, copy_noncur, copy_cur, inst, m, side_other.
 FAR_EDGE_CLASSES: tuple[str, ...] = (
-    "within_structure_curated",  # curated geometry inside one structure
-    "copy_reused_by_curated",  # copy: glyph shared with another curated structure
-    "copy_reused_by_noncurated",  # copy: glyph used by a non-curated reaction
-    "movable_inst_or_m",  # edge endpoint is a movable inst: or m: glyph
-    "other",  # side: stubs and remaining algorithm edges
+    "within_structure_curated",
+    "copy_reused_by_noncurated",
+    "copy_reused_by_curated",
+    "inst",
+    "m",
+    "side_other",
 )
 
 
+def _norm_structure_id(sid: str | None) -> str | None:
+    """Strip ``#…`` suffixes so reaction-side and copy-side structure ids compare equal."""
+    if not sid:
+        return None
+    return str(sid).split("#", 1)[0]
+
+
 def _metabolite_node_keys(data) -> dict[str, str]:
-    """Escher metabolite node id → scene instance key (copy:/inst:/m:/side:)."""
+    """Escher metabolite node id → scene instance key (copy:/inst:/m:/side:).
+
+    Prefers ``metadata.metabolite_instances``. When that table is missing
+    (e.g. e_coli_core), rebuilds keys from ``glyph_identity`` plus the export
+    id order (sorted scene keys ↔ non-multimarker node ids), then falls back
+    to reaction-topology inference from ``glyph_identity``.
+    """
     out = {}
     table = (data[0].get("metadata") or {}).get("metabolite_instances") or {}
     for row in table.values():
@@ -925,11 +899,98 @@ def _metabolite_node_keys(data) -> dict[str, str]:
             key = inst.get("key")
             if nid is not None and key:
                 out[str(nid)] = str(key)
+    if out:
+        return out
+    return _metabolite_node_keys_from_glyph_identity(data)
+
+
+def _metabolite_node_keys_from_glyph_identity(data) -> dict[str, str]:
+    meta = (data[0].get("metadata") or {}) if isinstance(data[0], dict) else {}
+    gi = meta.get("glyph_identity") or {}
+    if not gi:
+        return {}
+    body = data[1]
+    nodes = body.get("nodes") or {}
+    # Export assigned ids = enumerate(sorted(positions)); multimarkers are appended later.
+    rids = sorted({rx.get("bigg_id") for rx in (body.get("reactions") or {}).values() if rx.get("bigg_id")})
+    all_keys = sorted(list(gi.keys()) + [f"r:{rid}" for rid in rids])
+    non_multi = sorted(
+        (nid for nid, n in nodes.items() if n.get("node_type") != "multimarker"),
+        key=lambda x: int(x),
+    )
+    if len(all_keys) == len(non_multi):
+        out = {}
+        for k, nid in zip(all_keys, non_multi):
+            if k in gi:
+                out[str(nid)] = str(k)
+        if out:
+            return out
+    # Topology inference when node counts drifted after routing.
+    touch: dict[str, set] = defaultdict(set)
+    for rx in (body.get("reactions") or {}).values():
+        rid = rx.get("bigg_id")
+        if not rid:
+            continue
+        for seg in (rx.get("segments") or {}).values():
+            for end in ("from_node_id", "to_node_id"):
+                nid = seg.get(end)
+                if (nodes.get(nid) or {}).get("node_type") == "metabolite":
+                    touch[str(nid)].add(rid)
+    structs = _reaction_structure_ids(data)
+    by_mid: dict[str, list[str]] = defaultdict(list)
+    for k, mid in gi.items():
+        by_mid[str(mid)].append(str(k))
+    out = {}
+    for nid, n in nodes.items():
+        if n.get("node_type") != "metabolite":
+            continue
+        mid = n.get("bigg_id")
+        if not mid:
+            continue
+        rids_here = touch.get(str(nid), set())
+        cands = by_mid.get(str(mid)) or []
+        chosen = ""
+        for rid in rids_here:
+            sk = f"side:{rid}:{mid}"
+            if sk in gi:
+                chosen = sk
+                break
+        if not chosen:
+            for rid in rids_here:
+                sid = structs.get(rid)
+                sn = _norm_structure_id(sid)
+                if not sn:
+                    continue
+                for k in cands:
+                    if not k.startswith("copy:"):
+                        continue
+                    cs = _norm_structure_id(k.split(":")[1] if k.count(":") >= 2 else None)
+                    if cs == sn:
+                        chosen = k
+                        break
+                if chosen:
+                    break
+        if not chosen:
+            mk = f"m:{mid}"
+            if mk in gi:
+                chosen = mk
+        if not chosen:
+            insts = [k for k in cands if k.startswith("inst:")]
+            if len(insts) == 1:
+                chosen = insts[0]
+            elif len(cands) == 1:
+                chosen = cands[0]
+            else:
+                copies = [k for k in cands if k.startswith("copy:")]
+                if len(copies) == 1:
+                    chosen = copies[0]
+        if chosen:
+            out[str(nid)] = chosen
     return out
 
 
 def _reaction_structure_ids(data) -> dict[str, str]:
-    """Reaction bigg_id → curated structure id."""
+    """Reaction bigg_id → curated structure id (raw; compare via ``_norm_structure_id``)."""
     out = {}
     for s in (data[0].get("metadata") or {}).get("expert_structures") or []:
         sid = str(s.get("id") or s.get("code") or "")
@@ -947,14 +1008,19 @@ def _copy_structure_id(key: str) -> str | None:
     return parts[1] if len(parts) >= 3 else None
 
 
-def _edge_length_px(edge) -> float:
-    pts = edge.get("pts")
-    if pts is None:
-        return 0.0
-    arr = np.asarray(pts, float)
-    if len(arr) < 2:
-        return 0.0
-    return float(np.sum(np.hypot(*np.diff(arr, axis=0).T)))
+def _chord_length_px(edge, nodes) -> float | None:
+    """Reaction-centre (midmarker) → metabolite Euclidean length."""
+    mid = met = None
+    for nid in edge.get("ends") or ():
+        n = nodes.get(nid) or {}
+        nt = n.get("node_type")
+        if nt == "midmarker":
+            mid = n
+        elif nt == "metabolite":
+            met = n
+    if mid is None or met is None:
+        return None
+    return float(math.hypot(float(mid["x"]) - float(met["x"]), float(mid["y"]) - float(met["y"])))
 
 
 def _met_end_node(edge, nodes) -> str | None:
@@ -963,8 +1029,7 @@ def _met_end_node(edge, nodes) -> str | None:
         n = nodes.get(nid) or {}
         if n.get("node_type") == "metabolite":
             return nid
-    ends = edge.get("ends") or ()
-    return ends[1] if len(ends) > 1 else (ends[0] if ends else None)
+    return None
 
 
 def classify_far_edge(
@@ -974,73 +1039,99 @@ def classify_far_edge(
     node_key: Mapping[str, str],
     rid_struct: Mapping[str, str],
 ) -> str:
-    """Assign exactly one ``FAR_EDGE_CLASSES`` label to a pipeline edge."""
+    """Assign exactly one ``FAR_EDGE_CLASSES`` label to a pipeline edge.
+
+    Copy reuse: a ``copy:`` glyph drawn for structure S is used by a reaction
+    that is not a member of S — either a non-curated reaction
+    (``copy_reused_by_noncurated``) or a reaction belonging to another curated
+    structure (``copy_reused_by_curated``). Structure ids compare after stripping
+    a ``#…`` suffix.
+    """
     rid = str(edge.get("rid") or "")
-    rx_struct = rid_struct.get(rid)
+    rx_struct = _norm_structure_id(rid_struct.get(rid))
     met_nid = _met_end_node(edge, nodes)
     key = node_key.get(str(met_nid), "") if met_nid is not None else ""
-    copy_sid = _copy_structure_id(key)
+    copy_sid = _norm_structure_id(_copy_structure_id(key))
 
-    # 1. Within-structure curated geometry (reaction + its copy: glyph share S).
-    if rx_struct and copy_sid == rx_struct:
-        return "within_structure_curated"
-    if rx_struct and edge.get("curated") and not key.startswith(("copy:", "inst:", "m:", "side:")):
+    if key.startswith("side:"):
+        return "side_other"
+
+    # Within-structure curated: reaction and its copy: glyph share structure S.
+    if rx_struct and copy_sid and rx_struct == copy_sid:
         return "within_structure_curated"
 
-    # 2 / 3. copy: reused outside its home structure.
     if key.startswith("copy:"):
-        if rx_struct and copy_sid and copy_sid != rx_struct:
-            # Edge reaction is curated but belongs to a different structure.
-            return "copy_reused_by_curated"
         if not rx_struct:
             return "copy_reused_by_noncurated"
-        # Curated reaction in same map but copy has no / unknown home: treat as curated reuse.
+        if copy_sid and copy_sid != rx_struct:
+            return "copy_reused_by_curated"
+        # Curated reaction with unknown / missing copy home: treat as curated reuse.
         return "copy_reused_by_curated"
 
-    # 4. Movable open instances.
-    if key.startswith("inst:") or key.startswith("m:"):
-        return "movable_inst_or_m"
-    # Also flag when either end maps to inst:/m: (defensive).
-    for nid in edge.get("ends") or ():
-        k2 = node_key.get(str(nid), "")
-        if k2.startswith("inst:") or k2.startswith("m:"):
-            return "movable_inst_or_m"
+    if key.startswith("inst:"):
+        return "inst"
+    if key.startswith("m:"):
+        return "m"
 
-    return "other"
+    return "side_other"
+
+
+def _tukey_upper_fence(lengths: Sequence[float]) -> float:
+    """Q3 + 1.5·IQR upper fence (linear percentiles)."""
+    arr = np.asarray(lengths, float)
+    q1, q3 = np.percentile(arr, [25, 75])
+    return float(q3 + 1.5 * (q3 - q1))
 
 
 def far_edge_report(
     data,
     *,
     skip_edges=None,
-    p90: float | None = None,
+    length_threshold: float | None = None,
     top: int = 20,
 ) -> dict[str, Any]:
-    """Far edges (≥ p90 length) with a mutually exclusive class per edge.
+    """Far edges on core mid↔met connections (excluding ``side:`` endpoints).
 
-    Counts by class sum to ``n_far`` (exhaustive). Categories do not overlap.
+    Default threshold is the Tukey upper fence (Q3 + 1.5·IQR) on chord lengths
+    from reaction centre to metabolite instance. Pass ``length_threshold`` to
+    override. Classes are mutually exclusive; counts sum to ``n_far``.
     """
     import layout_quality as lq
 
     skip = _skip_from_data(data, skip_edges)
     edges, nodes = lq.build_edges(data, skip)
-    lengths = [_edge_length_px(e) for e in edges]
+    node_key = _metabolite_node_keys(data)
+    rid_struct = _reaction_structure_ids(data)
+
+    core = []
+    lengths = []
+    for e in edges:
+        met_nid = _met_end_node(e, nodes)
+        key = node_key.get(str(met_nid), "") if met_nid is not None else ""
+        if key.startswith("side:"):
+            continue
+        L = _chord_length_px(e, nodes)
+        if L is None:
+            continue
+        core.append(e)
+        lengths.append(L)
+
+    empty = {c: 0 for c in FAR_EDGE_CLASSES}
     if not lengths:
-        empty = {c: 0 for c in FAR_EDGE_CLASSES}
         return dict(
-            n_edges=0,
+            n_edges=len(edges),
+            n_core=0,
             n_far=0,
-            p90=0.0,
+            length_threshold=0.0,
             by_class=empty,
             top=[],
             classes=list(FAR_EDGE_CLASSES),
-            note="mutually exclusive far-edge classes; counts sum to n_far",
+            note="core mid↔met edges excluding side:; classes sum to n_far",
         )
-    thresh = float(p90) if p90 is not None else float(np.percentile(lengths, 90))
-    node_key = _metabolite_node_keys(data)
-    rid_struct = _reaction_structure_ids(data)
+
+    thresh = float(length_threshold) if length_threshold is not None else _tukey_upper_fence(lengths)
     far_rows = []
-    for e, length in zip(edges, lengths):
+    for e, length in zip(core, lengths):
         if length < thresh:
             continue
         klass = classify_far_edge(e, nodes, node_key=node_key, rid_struct=rid_struct)
@@ -1061,38 +1152,20 @@ def far_edge_report(
         by_class[row["far_class"]] = by_class.get(row["far_class"], 0) + 1
     return dict(
         n_edges=len(edges),
+        n_core=len(core),
         n_far=len(far_rows),
-        p90=round(thresh, 1),
+        length_threshold=round(thresh, 1),
         by_class=by_class,
         top=far_rows[:top],
         classes=list(FAR_EDGE_CLASSES),
-        note="mutually exclusive far-edge classes; counts sum to n_far",
+        note="core mid↔met edges excluding side:; classes sum to n_far",
     )
-
-
-# --- legacy adapters (behaviour-identical wrappers) ----------------------
-
-def relocation_gate_not_worse(before, after, eps=METRIC_EPS) -> bool:
-    """Tip-nudge no-worse check (same directions as composition._GATE_EPS)."""
-    return metrics_not_worse(before, after, TIP_DIRS, eps)
-
-
-def no_regression(before, after, tol=METRIC_EPS) -> bool:
-    """Hub-split no-regression check (same columns as layout_gate._GATE_DIRS)."""
-    return metrics_not_worse(before, after, HUB_DIRS, tol)
-
-
-def peripheral_accept(old, new):
-    """Pipeline peripheral quality-gate accept (delegates to quality_gate.accept)."""
-    import quality_gate as qg
-
-    return qg.accept(old, new)
 
 
 __all__ = [
     "METRIC_EPS",
-    "OFFICIAL_DIRS",
-    "OFFICIAL_METRICS",
+    "SCORE_DIRS",
+    "SCORE_METRICS",
     "TIP_DIRS",
     "HUB_DIRS",
     "ORTHO_DIRS",
@@ -1103,18 +1176,15 @@ __all__ = [
     "metric_regressions",
     "dominates",
     "pipeline_crossings",
-    "measure_official",
+    "measure_scores",
+    "measure_tip",
     "coverage_metrics",
     "pins_unchanged",
     "curated_translation_only",
     "previous_pinned_node_ids",
-    "curated_structure_node_ids",
     "cropped_label_count",
     "canvas_area",
     "content_area",
     "classify_far_edge",
     "far_edge_report",
-    "relocation_gate_not_worse",
-    "no_regression",
-    "peripheral_accept",
 ]
