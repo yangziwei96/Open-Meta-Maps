@@ -1990,6 +1990,14 @@ def compact_long_arms_escher(data, cur=None, max_arm=ARM_MAX, target=ARM_TARGET)
                 n = nodes.get(nid) or {}
                 if n.get('node_type') == 'metabolite':
                     holders[nid].add(rid)
+    # Freeze only copy: glyphs that structure_local detached a reaction from (otherwise a
+    # newly private curated stub would be shortened and warp structure-relative geometry).
+    gi = ((data[0] or {}).get('metadata') or {}).get('glyph_identity') or {}
+    frozen_keys = set(((data[0] or {}).get('metadata') or {}).get('structure_local_frozen_copies') or ())
+    rids = [rx.get('bigg_id') for rx in reactions.values() if rx.get('bigg_id')]
+    pos_keys = sorted([*(f'r:{r}' for r in rids), *gi.keys()])
+    id_of = {k: str(i) for i, k in enumerate(pos_keys)}
+    copy_nids = {id_of[k] for k in frozen_keys if k in id_of}
     shortened = 0
     details = []
     moved_shared = set()
@@ -2000,7 +2008,7 @@ def compact_long_arms_escher(data, cur=None, max_arm=ARM_MAX, target=ARM_TARGET)
 
     # Pass 1: shared transport/exchange pools — one move toward the nearest mid.
     for tid, rids in list(holders.items()):
-        if len(rids) < 2 or tid in moved_shared:
+        if tid in copy_nids or len(rids) < 2 or tid in moved_shared:
             continue
         t = nodes.get(tid) or {}
         mid = t.get('bigg_id')
@@ -2071,7 +2079,7 @@ def compact_long_arms_escher(data, cur=None, max_arm=ARM_MAX, target=ARM_TARGET)
             if seg['from_node_id'] != mid_id:
                 continue
             tid = seg['to_node_id']
-            if tid in moved_shared:
+            if tid in moved_shared or tid in copy_nids:
                 continue
             t = nodes.get(tid) or {}
             if t.get('node_type') != 'metabolite':

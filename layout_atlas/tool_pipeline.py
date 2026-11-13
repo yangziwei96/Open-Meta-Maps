@@ -830,7 +830,15 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
     if INSTANCES == 'auto' and not PREVIOUS_SKIP_PACK:
         import instances as instances_module
         scene = instances_module.separate(model, scene, blocks)
+        # After packing + separation, replace far cross-structure / far shared links with structure-local
+        # inst: nodes.  Placement already enforces separate()'s metabolite gap / Escher primary diameter,
+        # so a second separate pass is skipped (it shuffled neighbours and raised overlaps).
+        scene, local_report = instances_module.structure_local(
+            model, scene, blocks, currency(model),
+            reasons=scene.get('instance_reasons'))
         if instance_report is not None:
+            instance_report['structure_local'] = local_report
+            instance_report['added'] = int(instance_report.get('added', 0)) + int(local_report.get('added', 0))
             instance_report['instances_separated'] = scene.get('instances_separated')
     import curated_axes as _ca3
     scene, _rr3 = _ca3.restore_rigid_group(scene, blocks)
@@ -890,6 +898,9 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             if log:
                 log(f'  previous layout pin (escher): {n_pin} nodes')
     data[0]['metadata']['layout_sources'] = sources
+    # copy: keys structure_local detached from — compact_long_arms_escher must not shorten them.
+    data[0]['metadata']['structure_local_frozen_copies'] = list(
+        scene.get('structure_local_frozen_copies') or ())
     if plan is not None:
         metric['global'] = dict(plan=(plan or {}).get('stats'), scene_nodes=len(scene['positions']),
                                 routing_status=('none: straight connections between glyphs; structure edges use the structures\' own lines or curves'
