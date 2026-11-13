@@ -2,6 +2,8 @@
 # Core compose/tool still uses layout_atlas/requirements.txt only.
 #
 # shapely: pathway box-overlap and compartment metrics (MIT-compatible use).
+# NOT required for compose / draw_map / clear_through_nodes — official through-node
+# counting in layout_quality.official_lines_through_nodes_* is pure numpy/scipy.
 # gdmetrix: general graph-drawing metrics (GPL-3.0) — optional import only; never vendored.
 # Installing layout-benchmark from GitHub also pulls these; prefer the thin ports in
 # layout_atlas/evaluation/ plus these extras.

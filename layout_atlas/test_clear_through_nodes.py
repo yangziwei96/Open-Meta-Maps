@@ -27,6 +27,22 @@ def test_official_lines_through_nodes_positive_on_example():
     assert isinstance(report["reactions"], list)
 
 
+def test_official_lines_through_nodes_without_shapely(monkeypatch):
+    """Compose/clear-through must not hard-require eval-only shapely."""
+    import sys
+
+    class _Boom:
+        def __getattr__(self, _name):
+            raise ImportError("shapely blocked for compose path")
+
+    monkeypatch.setitem(sys.modules, "shapely", _Boom())
+    monkeypatch.setitem(sys.modules, "shapely.geometry", _Boom())
+    data = load_escher(EXAMPLE)
+    report = lq.official_lines_through_nodes_report(data)
+    assert report["count"] >= 1
+    assert isinstance(report["pairs"], list)
+
+
 def test_clear_through_nodes_no_regression_on_e_coli_core():
     data = load_escher(EXAMPLE)
     skip = (data[0].get("metadata") or {}).get("preserved_edges") or []
