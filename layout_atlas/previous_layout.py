@@ -23,7 +23,7 @@ NEW_COMPONENT_GAP = 120.0
 
 
 def load_previous_anchors(path, model=None):
-    """Read reaction midmarkers and primary metabolites from an Escher result map JSON.
+    """Read reaction midmarkers and primary metabolites from a prior result map JSON.
 
     Returns ``{ 'r:<id>': [x, y], 'm:<id>': [x, y] }``.  When ``model`` is given,
     only identifiers present in that model are kept.
@@ -82,9 +82,7 @@ def pin_scene(scene, anchors):
 
     Pins ``r:`` / ``m:`` keys and curated ``copy:…:met`` glyphs to the previous
     primary metabolite position.  Currency ``side:`` stubs follow their reaction
-    midmarker by the same delta so spokes stay attached.  Must run before
-    ``drawing.export`` (which applies one uniform canvas translation); do not
-    re-apply absolute previous coordinates onto the exported Escher JSON.
+    midmarker by the same delta so spokes stay attached.
     """
     if not scene or not anchors:
         return scene, 0
@@ -121,13 +119,124 @@ def pin_scene(scene, anchors):
     return scene, n
 
 
-def pin_escher(data, anchors):
-    """No-op kept for call-site compatibility; scene pinning + export translation is enough.
+def _shift_bezier_point(pt, dx, dy):
+    if not pt or not (isinstance(pt, dict) and 'x' in pt and 'y' in pt):
+        return pt
+    return dict(x=float(pt['x']) + dx, y=float(pt['y']) + dy)
 
-    Re-applying absolute previous coordinates after ``drawing.export`` mixes the
-    previous canvas frame with the new export translation and scrambles edges.
+
+def pin_escher(data, anchors):
+    """Restore previous pins on an exported Escher map (translation-only fit).
+
+    Fit one translation ``T`` from pinned reaction midmarkers, move each
+    midmarker to ``anchor + T``, and move each pinned species' matched primary
+    metabolite to ``anchor + T``.  Other copies of that species stay where
+    post-export passes left them.  Segment ``b1`` / ``b2`` follow their endpoint
+    node shifts.
     """
-    return data, 0
+    return _pin_escher_apply(data, anchors)
+
+
+def _pin_escher_apply(data, anchors):
+    """Unconditional translation-fit pin restore (mutates ``data``)."""
+    body = data[1] if isinstance(data, list) and len(data) >= 2 else data
+    if not isinstance(body, dict):
+        return data, 0
+    nodes = body.get('nodes') or {}
+    reactions = body.get('reactions') or {}
+    cur_rx = {}
+    for r in reactions.values():
+        rid = r.get('bigg_id')
+        if not rid or ('r:' + rid) not in anchors:
+            continue
+        for seg in (r.get('segments') or {}).values():
+            for nid in (seg.get('from_node_id'), seg.get('to_node_id')):
+                if nid not in nodes:
+                    continue
+                node = nodes[nid]
+                if node.get('node_type') != 'midmarker':
+                    continue
+                cur_rx[rid] = (nid, float(node['x']), float(node['y']))
+                break
+            if rid in cur_rx:
+                break
+    if not cur_rx:
+        return data, 0
+    deltas = [
+        (x - float(anchors['r:' + rid][0]), y - float(anchors['r:' + rid][1]))
+        for rid, (_nid, x, y) in cur_rx.items()
+    ]
+    dx = float(np.mean([d[0] for d in deltas]))
+    dy = float(np.mean([d[1] for d in deltas]))
+
+    shifts = {}
+
+    def _queue(nid, tx, ty):
+        node = nodes[nid]
+        ox, oy = float(node['x']), float(node['y'])
+        shifts[nid] = (float(tx) - ox, float(ty) - oy)
+
+    for rid, (nid, ox, oy) in cur_rx.items():
+        ax, ay = anchors['r:' + rid]
+        tx, ty = float(ax) + dx, float(ay) + dy
+        _queue(nid, tx, ty)
+        sdx, sdy = shifts[nid]
+        for r in reactions.values():
+            if r.get('bigg_id') != rid:
+                continue
+            if 'label_x' in r and 'label_y' in r:
+                r['label_x'] = float(r['label_x']) + sdx
+                r['label_y'] = float(r['label_y']) + sdy
+            break
+
+    met_nodes = {}
+    for nid, node in nodes.items():
+        if node.get('node_type') != 'metabolite' or not node.get('bigg_id'):
+            continue
+        met_nodes.setdefault(node['bigg_id'], []).append(nid)
+
+    def _anchor_metabolite_node(nids):
+        opts = [
+            (nid, bool(nodes[nid].get('node_is_primary', True)),
+             float(nodes[nid]['x']), float(nodes[nid]['y']))
+            for nid in nids
+        ]
+        opts.sort(key=lambda t: (not t[1], t[2], t[3]))
+        return opts[0][0]
+
+    for key, xy in anchors.items():
+        if not (isinstance(key, str) and key.startswith('m:')):
+            continue
+        mid = key[2:]
+        nids = met_nodes.get(mid) or []
+        if not nids:
+            continue
+        primary = _anchor_metabolite_node(nids)
+        tx, ty = float(xy[0]) + dx, float(xy[1]) + dy
+        for nid in nids:
+            nodes[nid]['node_is_primary'] = (nid == primary)
+        if primary not in shifts:
+            shifts[primary] = (tx - float(nodes[primary]['x']),
+                               ty - float(nodes[primary]['y']))
+    if not shifts:
+        return data, 0
+
+    for nid, (sdx, sdy) in shifts.items():
+        node = nodes[nid]
+        node['x'] = float(node['x']) + sdx
+        node['y'] = float(node['y']) + sdy
+
+    for r in reactions.values():
+        for seg in (r.get('segments') or {}).values():
+            fn, tn = seg.get('from_node_id'), seg.get('to_node_id')
+            if seg.get('b1') and fn in shifts:
+                sdx, sdy = shifts[fn]
+                seg['b1'] = _shift_bezier_point(seg['b1'], sdx, sdy)
+            if seg.get('b2') and tn in shifts:
+                sdx, sdy = shifts[tn]
+                seg['b2'] = _shift_bezier_point(seg['b2'], sdx, sdy)
+    return data, len(shifts)
+
 
 
 def filter_previous_map(path, model):

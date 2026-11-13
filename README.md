@@ -42,7 +42,7 @@ python3 project.py compose --gem examples/e_coli_core.xml --out results/e_coli_c
 
 Outputs use `OpenMetaMaps_<name>_result.<ext>`, where `<name>` is the model file stem (sanitised). Formats: `.json` (Escher), `.sbgn` (SBGN-ML Process Description), `.sbml` (input SBML with Layout package), `.celldesigner.xml` (CellDesigner 4.x annotations), plus `.svg` / `.png`. The Map Generator download row offers the same formats.
 
-Rebuild after a small model edit while keeping the previous layout: pass `--previous` with the prior result JSON. Matched reaction midmarkers and primary metabolites are pinned by stable id; when at least 80% of reactions are already placed, module packing is skipped and the previous Escher geometry is reused. New reactions are grafted on the chord between drawn substrate/product participants (opposite sides); leftovers without anchors are still parked so coverage stays complete. A local nudge of grafted midmarkers is kept when crossings do not worsen.
+Rebuild after a small model edit while keeping the previous layout: pass `--previous` with the prior result map JSON. Matched reaction midmarkers and primary metabolites are pinned by stable id; when at least 80% of reactions are already placed, module packing is skipped and the previous Escher geometry is reused. New reactions are grafted on the chord between drawn substrate/product participants (opposite sides); leftovers without anchors are still parked so coverage stays complete. A local nudge of grafted midmarkers is kept when crossings do not worsen. After export, a translation-fit pin restore is kept only when segment crossings do not rise.
 
 ```sh
 python3 project.py compose --gem examples/e_coli_core_edited.xml --out results/e_coli_core_edited/ --source-paths --previous results/e_coli_core/OpenMetaMaps_e_coli_core_result.json
@@ -138,7 +138,7 @@ Matched geometry is kept as drawn (translated only). Everything else is placed b
 
 **Determinism:** fixed layout seed `20261105` (`core.SEEDS`), ELK/fCoSE seeds, `PYTHONHASHSEED=0` on re-exec. Displacement measured by `evaluate --compare-map` only.
 
-`--previous OpenMetaMaps_<stem>_result.json` pins matched nodes and grafts leftovers.
+`--previous OpenMetaMaps_<stem>_result.json` pins matched midmarkers and primary metabolites (translation fit after export when it does not raise crossings) and grafts leftovers. When at least 80% of reactions are already placed, packing is skipped and the previous Escher geometry is reused.
 
 **Known gaps** ([docs/limitations.md](docs/limitations.md)): 2D component packing, harder orientation (incl. transporters), compartment-aware packing, stronger currency/biomass handling, crossing-aware composition acceptance, compose seed flag. Experimental off by default: `OPM_REGIONS`, `OPM_LOWCONF`, whole-block `OPM_BLOCK_RELOC`.
 
@@ -200,7 +200,7 @@ Layout targets (including backlog) stay on Detailed metrics; non-targets under D
 | Chain turns | Not yet | |
 | Cycle placement | Not yet | |
 | Reproducibility | Partial | Fixed seeds; no compose seed CLI |
-| Build on previous layout | Partial | `--previous OpenMetaMaps_<stem>_result.json` reuses matched geometry and grafts leftovers |
+| Build on previous layout | Partial | `--previous` pins matched midmarkers/primaries (translation fit after export when crossings do not rise), grafts leftovers; full reuse when ≥80% already placed |
 | Scale to GEMs | Partial | Global ≤3 000 + tiled views; large maps start routing-degraded |
 
 ---

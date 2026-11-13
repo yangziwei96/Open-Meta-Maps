@@ -35,16 +35,140 @@ def test_load_previous_anchors_filters_to_model(tmp_path):
 
 def test_pin_scene_and_blocks():
     anchors = {'r:A': [1.0, 2.0], 'm:x': [3.0, 4.0]}
-    scene = dict(positions={'r:A': [9.0, 9.0], 'm:x': [8.0, 8.0], 'r:B': [0.0, 0.0]})
+    scene = dict(
+        positions={
+            'r:A': [9.0, 9.0], 'm:x': [8.0, 8.0], 'r:B': [0.0, 0.0],
+            'inst:long:x:0': [50.0, 50.0],
+        },
+        copies={'m:x': 'x', 'inst:long:x:0': 'x'},
+    )
     scene, n = prev.pin_scene(scene, anchors)
-    assert n == 2
+    assert n >= 2
     assert scene['positions']['r:A'] == [1.0, 2.0]
     assert scene['positions']['r:B'] == [0.0, 0.0]
+    # inst: glyphs are not scene-pinned; curated copy: keys follow the primary.
+    assert scene['positions']['inst:long:x:0'] == [50.0, 50.0]
+    scene2, n2 = prev.pin_scene(
+        dict(positions={'r:A': [9.0, 9.0], 'm:x': [8.0, 8.0], 'copy:block:x': [50.0, 50.0]},
+             copies={}),
+        anchors)
+    assert scene2['positions']['copy:block:x'] == [3.0, 4.0]
     blocks = [dict(positions={'r:A': [0.0, 0.0], 'm:x': [0.0, 0.0], 'r:C': [5.0, 5.0]})]
     blocks, n = prev.apply_block_positions(blocks, anchors)
     assert n == 2
     assert blocks[0]['positions']['r:A'] == [1.0, 2.0]
     assert blocks[0]['positions']['r:C'] == [5.0, 5.0]
+
+
+def test_pin_escher_restores_final_map_pins():
+    # After export-frame drift, pin_escher must put previous pins back so
+    # load_previous_anchors recovers the same relative geometry (fails if no-op).
+    anchors = {
+        'r:RA': [100.0, 200.0],
+        'r:RB': [400.0, 200.0],
+        'm:hub_c': [250.0, 100.0],
+    }
+    # Uneven midmarker drift (not a pure frame translation).
+    data = [
+        {'metadata': {}},
+        {
+            'nodes': {
+                '1': dict(node_type='midmarker', x=180.0, y=260.0),
+                '2': dict(node_type='midmarker', x=430.0, y=210.0),
+                '3': dict(node_type='metabolite', bigg_id='hub_c', node_is_primary=True,
+                          x=310.0, y=140.0, label_x=319.0, label_y=125.0),
+                '4': dict(node_type='metabolite', bigg_id='hub_c', node_is_primary=False,
+                          x=900.0, y=900.0, label_x=909.0, label_y=885.0),
+            },
+            'reactions': {
+                '0': dict(bigg_id='RA', label_x=185.0, label_y=270.0,
+                          segments={'s': dict(
+                              from_node_id='1', to_node_id='3',
+                              b1=dict(x=200.0, y=250.0), b2=dict(x=280.0, y=160.0))}),
+                '1': dict(bigg_id='RB', label_x=435.0, label_y=220.0,
+                          segments={'s': dict(from_node_id='2', to_node_id='3')}),
+            },
+            'canvas': dict(x=0, y=0, width=1000, height=1000),
+        },
+    ]
+    out, n = prev.pin_escher(data, anchors)
+    assert n >= 3
+    nodes = out[1]['nodes']
+    # T = mean((80,60),(30,10)) = (55,35); midmarkers → previous+T.
+    assert abs(nodes['1']['x'] - 155.0) < 1e-6 and abs(nodes['1']['y'] - 235.0) < 1e-6
+    assert abs(nodes['2']['x'] - 455.0) < 1e-6 and abs(nodes['2']['y'] - 235.0) < 1e-6
+    # Primary lands on previous+T; curated copy keeps its post-export position.
+    assert abs(nodes['3']['x'] - 305.0) < 1e-6 and abs(nodes['3']['y'] - 135.0) < 1e-6
+    assert abs(nodes['4']['x'] - 900.0) < 1e-6 and abs(nodes['4']['y'] - 900.0) < 1e-6
+    assert (nodes['3']['x'], nodes['3']['y']) != (nodes['4']['x'], nodes['4']['y'])
+    # Pairwise distance between RA and RB matches the previous map.
+    assert abs((nodes['2']['x'] - nodes['1']['x']) - 300.0) < 1e-6
+    # Bézier controls follow their endpoint node shifts.
+    seg = out[1]['reactions']['0']['segments']['s']
+    assert abs(seg['b1']['x'] - 175.0) < 1e-6 and abs(seg['b1']['y'] - 225.0) < 1e-6
+    assert abs(seg['b2']['x'] - 275.0) < 1e-6 and abs(seg['b2']['y'] - 155.0) < 1e-6
+
+
+def test_partial_previous_pin_preserves_copies_vs_plain():
+    # Subset-model previous anchors (~partial --previous): pinning must not stack
+    # every copy of a species, and must not raise coincident overlaps vs the
+    # unpinned map (plain compose baseline for this synthetic fragment).
+    anchors = {
+        'r:PGI': [100.0, 100.0],
+        'r:PFK': [300.0, 100.0],
+        'm:g6p_c': [50.0, 100.0],
+    }
+    # Uneven midmarker drift; copies stay 200 px apart after the primary's shift.
+    plain = [
+        {'metadata': {}},
+        {
+            'nodes': {
+                'm1': dict(node_type='midmarker', x=190.0, y=160.0),
+                'm2': dict(node_type='midmarker', x=340.0, y=130.0),
+                'g0': dict(node_type='metabolite', bigg_id='g6p_c', node_is_primary=True,
+                           x=120.0, y=150.0),
+                'g1': dict(node_type='metabolite', bigg_id='g6p_c', node_is_primary=False,
+                           x=320.0, y=150.0),
+                'f6': dict(node_type='metabolite', bigg_id='f6p_c', node_is_primary=True,
+                           x=360.0, y=200.0),
+            },
+            'reactions': {
+                '0': dict(bigg_id='PGI', segments={'s': dict(
+                    from_node_id='m1', to_node_id='g0',
+                    b1=dict(x=160.0, y=155.0), b2=dict(x=130.0, y=148.0))}),
+                '1': dict(bigg_id='PFK', segments={'s': dict(
+                    from_node_id='m2', to_node_id='g1',
+                    b1=dict(x=320.0, y=135.0), b2=dict(x=330.0, y=148.0))}),
+                '2': dict(bigg_id='NEW', segments={'s': dict(
+                    from_node_id='m2', to_node_id='f6')}),
+            },
+            'canvas': dict(x=0, y=0, width=500, height=400),
+        },
+    ]
+
+    def _coincident_met_pairs(body, tol=1e-6):
+        mets = [(n['bigg_id'], float(n['x']), float(n['y']))
+                for n in body['nodes'].values() if n.get('node_type') == 'metabolite']
+        n = 0
+        for i, (a, ax, ay) in enumerate(mets):
+            for b, bx, by in mets[i + 1:]:
+                if a == b and abs(ax - bx) <= tol and abs(ay - by) <= tol:
+                    n += 1
+        return n
+
+    plain_pairs = _coincident_met_pairs(plain[1])
+    assert plain_pairs == 0
+    pinned, n = prev.pin_escher(__import__('copy').deepcopy(plain), anchors)
+    assert n >= 3
+    nodes = pinned[1]['nodes']
+    # T = mean((90,60),(40,30)) = (65,45); primary → previous+T; copy stays put.
+    assert abs(nodes['g0']['x'] - 115.0) < 1e-6 and abs(nodes['g0']['y'] - 145.0) < 1e-6
+    assert abs(nodes['g1']['x'] - 320.0) < 1e-6 and abs(nodes['g1']['y'] - 150.0) < 1e-6
+    assert (nodes['g0']['x'], nodes['g0']['y']) != (nodes['g1']['x'], nodes['g1']['y'])
+    assert _coincident_met_pairs(pinned[1]) <= plain_pairs
+    # Controls follow endpoint shifts (primary g0 shift -5,-5).
+    seg = pinned[1]['reactions']['0']['segments']['s']
+    assert abs(seg['b2']['x'] - 125.0) < 1e-6 and abs(seg['b2']['y'] - 143.0) < 1e-6
 
 
 def test_filter_previous_map_drops_removed_reactions(tmp_path):

@@ -874,12 +874,6 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
     sources = [{k: b.get(k) for k in ('id', 'template_id', 'map_id', 'source', 'lineage', 'license', 'partition', 'source_citation', 'source_sha256', 'original_instance')} for b in blocks]
     dump(folder / 'source_licenses.json', dict(layout_sources=sources, policy='Original licenses preserved; research-partition content keeps its own terms'))
     data = read(output_names.map_json(folder))
-    if PREVIOUS_ANCHORS:
-        data, n_pin = prev.pin_escher(data, PREVIOUS_ANCHORS)
-        if n_pin:
-            dump(output_names.map_json(folder), data)
-            if log:
-                log(f'  previous layout pin (escher): {n_pin} nodes')
     data[0]['metadata']['layout_sources'] = sources
     if plan is not None:
         metric['global'] = dict(plan=(plan or {}).get('stats'), scene_nodes=len(scene['positions']),
@@ -1184,6 +1178,23 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
         if log:
             log(f"  orthogonal algorithm routes (final): {metric['edge_style_orthogonal']}")
         dump(folder / 'map.json', data)
+    if PREVIOUS_ANCHORS:
+        import copy as _copy
+        import layout_quality as _lq
+        _cross_before = _lq.CrossingIndex(data).headline()
+        _trial = _copy.deepcopy(data)
+        _trial, n_pin = prev.pin_escher(_trial, PREVIOUS_ANCHORS)
+        if n_pin:
+            _cross_after = _lq.CrossingIndex(_trial).headline()
+            # Keep the restore only when segment crossings do not rise.
+            if _cross_after is None or _cross_before is None or _cross_after <= _cross_before:
+                data[0], data[1] = _trial[0], _trial[1]
+                dump(output_names.map_json(folder), data)
+                if log:
+                    log(f'  previous layout pin (escher): {n_pin} nodes')
+            elif log:
+                log(f'  previous layout pin (escher): skipped '
+                    f'(crossings {_cross_before} -> {_cross_after})')
     t_quality = time.time()
     # Persist structure membership on the map so continuity can be scored from map.json alone.
     # Absolute same-map reuse keeps BiGG spacing; score spatial pieces, not whole atlas windows.
