@@ -250,6 +250,57 @@ def test_pack_into_main_pockets_places_beside_main():
     assert -80 <= x <= 160 and -80 <= y <= 160
 
 
+def test_reflow_landscape_in_band_keeps_near_tiles():
+    """In-band frame: pocket far outliers only; do not shelf near leftovers to the side.
+
+    Regression for e_coli TR floaters / iIT341 spokes: leftover used to mean
+    ``all sizes − pocketed``, which yanked near tiles onto an external shelf.
+    """
+    # Landscape main ~1080×720 (aspect 1.5). Chain reactions through a shared
+    # backbone metabolite so they form one MAIN_MIN+ component.
+    reactions = []
+    parts = {}
+    pos = {}
+    n_main = max(C.MAIN_MIN, 30)
+    cols = 6
+    for i in range(n_main):
+        rid = f'M{i}'
+        mid = f'm{i}'
+        mets = {'backbone': -1.0, mid: 1.0} if i else {mid: -1.0, 'backbone': 1.0}
+        reactions.append({'id': rid, 'metabolites': mets})
+        for m in mets:
+            parts[rid, m] = f'm:{m}'
+        x = (i % cols) * 180.0
+        y = (i // cols) * 180.0
+        pos[f'r:{rid}'] = [x, y]
+        pos[f'm:{mid}'] = [x + 40.0, y + 20.0]
+    pos['m:backbone'] = [500.0, 360.0]
+    # Near free component (inside main AABB, well under FAR_OUTLIER_FRAC · span).
+    reactions.append({'id': 'NEAR', 'metabolites': {'n': -1.0}})
+    parts['NEAR', 'n'] = 'm:n'
+    pos['r:NEAR'] = [500.0, 400.0]
+    pos['m:n'] = [540.0, 420.0]
+    near_before = list(pos['r:NEAR'])
+    # Far free component to the right; combined aspect stays in 4:3–16:9 so the
+    # in-band path runs, while distance still exceeds FAR_OUTLIER_FRAC · span.
+    reactions.append({'id': 'FAR', 'metabolites': {'f': -1.0}})
+    parts['FAR', 'f'] = 'm:f'
+    pos['r:FAR'] = [1200.0, 360.0]
+    pos['m:f'] = [1240.0, 380.0]
+    model = {'reactions': reactions}
+    scene = {'positions': pos, 'participants': parts, 'labels': {}}
+    cur = set()
+    out, rep = C.reflow_landscape(model, scene, blocks=[], cur=cur)
+    assert C.ASPECT_MIN - 1e-3 <= rep.get('aspect_before', 0) <= C.ASPECT_MAX + 1e-3, rep
+    assert rep.get('reason') == 'main_pocket_pack', rep
+    assert rep.get('pack', {}).get('side') == 'pocket', rep
+    assert rep.get('pocket', {}).get('near_kept', 0) >= 1, rep
+    # Near tile must not be skyline-shelved far from its original pose.
+    near_after = out['positions']['r:NEAR']
+    assert abs(near_after[0] - near_before[0]) < 1e-6, (near_before, near_after, rep)
+    assert abs(near_after[1] - near_before[1]) < 1e-6, (near_before, near_after, rep)
+
+
 def test_fit_canvas_to_content_shrinks_frame():
     data = [
         {},

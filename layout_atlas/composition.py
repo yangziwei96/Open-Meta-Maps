@@ -56,6 +56,12 @@ ARM_TARGET = 150.0
 # Pocket pack: search empty cells inside/flush with the main AABB before external shelving.
 POCKET_CELL_FRAC = 0.55
 POCKET_PAD_CELLS = 1
+# When the frame is already in 4:3–16:9, only pocket-pack components this far from the
+# main centre (fraction of main diagonal). Near tiles must stay put — treating them as
+# shelf leftovers reopens TR floaters and stretches connected stubs into long spokes.
+FAR_OUTLIER_FRAC = 0.28
+# Second-chance pad for far outliers that miss the tight flush search (fraction of span).
+FAR_OUTLIER_PAD_FRAC = 0.18
 
 
 def components(model, scene, cur):
@@ -626,11 +632,13 @@ def _find_pocket_origin(occ, size_w, size_h, prefer_c, content_lo=None, content_
     return best[1], best[2]
 
 
-def pack_into_main_pockets(boxes, main_pts, spacing, prefer_c=None, prefer_void=False):
+def pack_into_main_pockets(boxes, main_pts, spacing, prefer_c=None, prefer_void=False,
+                           search_pad=None):
     """Place boxes into empty pockets inside/flush with the main AABB.
 
     ``boxes``: list of ``(id, size_w, size_h)`` largest-first preferred.
     Returns ``{id: (x, y)}`` top-left placements for those that fit; others omitted.
+    ``search_pad`` overrides the default flush strip outside the main AABB.
     """
     if not boxes or len(main_pts) < 2:
         return {}, dict(placed=0, missed=len(boxes))
@@ -641,7 +649,11 @@ def pack_into_main_pockets(boxes, main_pts, spacing, prefer_c=None, prefer_void=
     # small components fill the largest free regions before the canvas grows.
     pts = np.asarray(main_pts, float)
     lo, hi = pts.min(0), pts.max(0)
-    pad = min(float(spacing) * 1.25 + SHELF_GAP, 0.08 * max(float(hi[0] - lo[0]), float(hi[1] - lo[1]), 1.0))
+    span_xy = max(float(hi[0] - lo[0]), float(hi[1] - lo[1]), 1.0)
+    if search_pad is None:
+        pad = min(float(spacing) * 1.25 + SHELF_GAP, 0.08 * span_xy)
+    else:
+        pad = max(float(search_pad), 0.0)
     # Seed occupancy with main points only; pocket search covers the padded AABB.
     seed = []
     for x, y in pts:
@@ -783,19 +795,49 @@ def reflow_landscape(model, scene, blocks, cur):
     # Prefer pocket-packing movables into empty space flush with main before an external shelf.
     # When already in-band, only pull far outliers in (not every non-main tile) — packing
     # hundreds of tiles into pockets collapses large maps toward a square and raises empty/cross.
+    # Critical: near tiles that were *not* pack candidates must never become shelf leftovers;
+    # shelving them (e_coli TR floaters / iIT341 long spokes) is what reopens the corridor.
     prefer_c = main_pts.mean(0)
     span = max(float(np.hypot(*(mhi - mlo))), 1.0)
+    span_xy = max(float(mhi[0] - mlo[0]), float(mhi[1] - mlo[1]), 1.0)
+    spacing = max(spacing_from_main(main_pts), 40.0)
     if in_band0:
         pack_ids = [i for i in sizes
-                    if float(np.hypot(*(centres[i] - prefer_c))) > 0.32 * span]
+                    if float(np.hypot(*(centres[i] - prefer_c))) > FAR_OUTLIER_FRAC * span]
     else:
         pack_ids = list(sizes)
     pocket_boxes = sorted(
         [(i, sizes[i][0], sizes[i][1]) for i in pack_ids],
         key=lambda t: (-t[1] * t[2], t[0]))
     pocket_tl, pocket_rep = pack_into_main_pockets(
-        pocket_boxes, main_pts, max(spacing_from_main(main_pts), 40.0),
+        pocket_boxes, main_pts, spacing,
         prefer_c=prefer_c, prefer_void=len(pocket_boxes) > 20)
+    # Wider flush retry for far outliers that missed the tight pad (in-band only).
+    if in_band0 and pocket_boxes:
+        missed_boxes = [(i, w, h) for i, w, h in pocket_boxes if i not in pocket_tl]
+        if missed_boxes:
+            more_tl, more_rep = pack_into_main_pockets(
+                missed_boxes, main_pts, spacing, prefer_c=prefer_c,
+                prefer_void=len(missed_boxes) > 20,
+                search_pad=max(FAR_OUTLIER_PAD_FRAC * span_xy, spacing * 1.5 + SHELF_GAP))
+            kept = {}
+            for bid, (x0, y0) in more_tl.items():
+                bw, bh = sizes[bid]
+                hit = False
+                for oi, (px, py) in pocket_tl.items():
+                    ow, oh = sizes[oi]
+                    if x0 < px + ow and px < x0 + bw and y0 < py + oh and py < y0 + bh:
+                        hit = True
+                        break
+                if not hit:
+                    kept[bid] = (x0, y0)
+            if kept:
+                pocket_tl.update(kept)
+                pocket_rep = dict(
+                    pocket_rep,
+                    placed=len(pocket_tl),
+                    missed=len(pocket_boxes) - len(pocket_tl),
+                    retry=dict(more_rep, accepted=len(kept)))
     if in_band0 and not pocket_tl:
         report.update(aspect_after=round(aspect0, 3), reason='already_in_band',
                       pocket=pocket_rep)
@@ -805,17 +847,25 @@ def reflow_landscape(model, scene, blocks, cur):
         pocket_placed = {i: (x, y) for i, (x, y) in pocket_tl.items()}
         # Absolute top-lefts with origin (0,0): _apply_placed targets top-left + size/2.
         aspect_p = _apply_placed(pocket_placed, (0.0, 0.0))
-        leftover = [i for i in sizes if i not in pocket_tl]
-        report['pocket'] = dict(pocket_rep, leftover=len(leftover))
+        # Shelf leftovers are only tiles that were pack candidates but still missed.
+        # Near non-candidates (in-band) and successfully pocketed tiles stay put.
+        leftover = [i for i in pack_ids if i not in pocket_tl]
+        report['pocket'] = dict(pocket_rep, leftover=len(leftover),
+                                near_kept=max(0, len(sizes) - len(pack_ids)))
         aspect_p_in = ASPECT_MIN - 1e-3 <= aspect_p <= ASPECT_MAX + 1e-3
 
         def _pocket_done(reason, left):
             report.update(applied=bool(pocket_tl), aspect_after=round(aspect_p, 3),
                           reason=reason,
-                          pack=dict(side='pocket', movable=len(pocket_tl) - len(left),
+                          pack=dict(side='pocket', movable=len(pocket_tl),
                                     leftover=len(left), aspect=round(aspect_p, 3),
                                     in_band=ASPECT_MIN - 1e-3 <= aspect_p <= ASPECT_MAX + 1e-3))
             return scene, report
+
+        # Started in-band: pocket-pack (plus flush retry) only — never peel onto an
+        # external shelf or skyline-reflow near leftovers (reopens TR floaters / spokes).
+        if in_band0:
+            return _pocket_done('main_pocket_pack', leftover)
 
         # If every movable fitted in a pocket but the frame is still tall/narrow,
         # peel the largest pocketed tiles onto an east shelf so width can catch up
@@ -830,9 +880,6 @@ def reflow_landscape(model, scene, blocks, cur):
             report['pocket'] = dict(pocket_rep, leftover=len(leftover), peeled=len(leftover))
             pocket_keys = {i: list(keys_of[i]) for i in keep}
         elif aspect_p_in and not leftover:
-            return _pocket_done('main_pocket_pack', [])
-        elif in_band0 and not leftover:
-            # Started in-band; pocket-pack only (no external re-shelf that reopens gaps).
             return _pocket_done('main_pocket_pack', [])
         elif not leftover:
             return _pocket_done('main_pocket_pack', [])
