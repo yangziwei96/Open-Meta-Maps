@@ -600,6 +600,27 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                         met_acc[k].append(v)
             for k, vals in met_acc.items():
                 anchors[k] = np.mean(vals, axis=0).tolist()
+    # Small-model ELK path: inter-skeleton refinement (mid-size uses plan_global).
+    inter_skeleton_report = None
+    if plan is not None:
+        inter_skeleton_report = (plan.get('stats') or {}).get('placement', {}).get('inter_skeleton')
+    elif not PREVIOUS_SKIP_PACK and len(blocks) >= 2:
+        import inter_skeleton
+        pinned_rids = set()
+        if PREVIOUS_ANCHORS:
+            pinned_rids = {k[2:] for k in PREVIOUS_ANCHORS if k.startswith('r:')}
+        inter_skeleton_report = inter_skeleton.refine_packed_blocks(
+            model, blocks, currency(model), pinned_reaction_ids=pinned_rids, log=log)
+        anchors = {}
+        met_acc = defaultdict(list)
+        for b in blocks:
+            for k, v in b['positions'].items():
+                if k.startswith('r:'):
+                    anchors[k] = v
+                else:
+                    met_acc[k].append(v)
+        for k, vals in met_acc.items():
+            anchors[k] = np.mean(vals, axis=0).tolist()
     if not PREVIOUS_SKIP_PACK:
         for bridge in bridges:
             a, c = anchors.get(bridge['nodes'][0]), anchors.get(bridge['nodes'][-1])
@@ -1271,6 +1292,17 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
     metric['layout_quality_final'] = quality_summary
     metric['algorithm_curated_crossings'] = (quality_summary.get('details') or {}).get('algorithm_curated_crossings')
     metric['longest_links'] = (quality_summary.get('details') or {}).get('longest_links')
+    if inter_skeleton_report is not None:
+        metric['inter_skeleton'] = inter_skeleton_report
+        # Companion: routed polyline length on the finished map (straight-line L is in the report).
+        try:
+            import inter_skeleton as _is
+            metric['inter_skeleton'] = dict(
+                inter_skeleton_report,
+                routed_final=_is.routed_attachment_length(data),
+            )
+        except Exception:
+            pass
     metric['peripheral'] = None if peripheral_report is None else {k: v for k, v in peripheral_report.items() if k not in ('details', 'gate_rows')}
     dump(folder / 'layout_issues.json', quality_issues)
     metric['instance_optimization'] = instance_report if instance_report is not None else dict(mode='off')
@@ -1548,7 +1580,7 @@ def draw_global_map(job, model, selected, folder, prov_kinds, n_reactions, plan=
     job.save()
     return dict(kind=kind, requested_layout='global', degraded=degraded, seconds=round(time.time() - t0, 1), network=network,
                 metrics={k: metric.get(k) for k in ('node_overlap_pairs', 'label_overlap_pairs', 'straight_crossings')}, source_paths=metric.get('source_paths'),
-                instances=metric.get('instances'), global_layout=metric.get('global'), completion=metric.get('completion'), expert_geometry=metric.get('expert_geometry'), instance_optimization=metric.get('instance_optimization'), context_placement=metric.get('context_placement'), completion_context=metric.get('completion_context'), layout_quality_final=metric.get('layout_quality_final'), edge_style=metric.get('edge_style'), edge_style_orthogonal=metric.get('edge_style_orthogonal'), peripheral=metric.get('peripheral'), block_relocation=metric.get('block_relocation'), region_placement=metric.get('region_placement'), regions=metric.get('regions'), expert_submodule=metric.get('expert_submodule'), label_placement=metric.get('label_placement'), hotspot_repair=metric.get('hotspot_repair'), protected=metric.get('protected'), node_overlap_kinds=metric.get('node_overlap_kinds'), edge_routing=metric.get('edge_routing'))
+                instances=metric.get('instances'), global_layout=metric.get('global'), completion=metric.get('completion'), expert_geometry=metric.get('expert_geometry'), instance_optimization=metric.get('instance_optimization'), context_placement=metric.get('context_placement'), completion_context=metric.get('completion_context'), layout_quality_final=metric.get('layout_quality_final'), edge_style=metric.get('edge_style'), edge_style_orthogonal=metric.get('edge_style_orthogonal'), peripheral=metric.get('peripheral'), block_relocation=metric.get('block_relocation'), region_placement=metric.get('region_placement'), regions=metric.get('regions'), expert_submodule=metric.get('expert_submodule'), label_placement=metric.get('label_placement'), hotspot_repair=metric.get('hotspot_repair'), protected=metric.get('protected'), node_overlap_kinds=metric.get('node_overlap_kinds'), edge_routing=metric.get('edge_routing'), inter_skeleton=metric.get('inter_skeleton'))
 
 
 def run_job(folder):
@@ -1570,6 +1602,9 @@ def run_job(folder):
     import global_layout as _gl
     _gl.BACKBONE = (LAYOUT_STYLE == 'curated')
     _gl.BLOCK_LAYOUT = options.get('block_layout') if options.get('block_layout') in ('auto', 'single') else 'auto'
+    # Report-only diagnostic (not a CLI flag): refine all four initial arrangements.
+    import inter_skeleton as _is_opt
+    _is_opt.DIAGNOSTIC = bool(options.get('inter_skeleton_diagnostic'))
     REACTION_STYLE = options.get('reaction_style') if options.get('reaction_style') in ('line', 'marker') else 'line'
     COMPLETION = options.get('completion') if options.get('completion') in ('spaced', 'classic') else 'spaced'
     PREVIOUS_ANCHORS = None
@@ -1739,6 +1774,7 @@ def run_job(folder):
                 job.log(f'global plan failed ({type(e).__name__}: {str(e)[:120]}); the skeleton uses the ELK layout')
         if global_plan is None:
             anchors, blocks, containers, macro = drawing.pack_modules(model, copy.deepcopy(selected), bridges, physical_scale=True)
+        inter_skeleton_report = (global_plan or {}).get('stats', {}).get('placement', {}).get('inter_skeleton')
         proposal_by_id = {p['id']: p for p in selected}
         for b in blocks:
             p = proposal_by_id[b['id']]
@@ -1769,6 +1805,25 @@ def run_job(folder):
                             met_acc[k].append(v)
                 for k, vals in met_acc.items():
                     anchors[k] = np.mean(vals, axis=0).tolist()
+        # Small-model path: inter-skeleton refinement on ELK-packed blocks (plan_global
+        # already ran it for mid-size models). Translation only; before local stages.
+        if global_plan is None and len(blocks) >= 2 and not PREVIOUS_SKIP_PACK:
+            import inter_skeleton
+            pinned_rids = set()
+            if PREVIOUS_ANCHORS:
+                pinned_rids = {k[2:] for k in PREVIOUS_ANCHORS if k.startswith('r:')}
+            inter_skeleton_report = inter_skeleton.refine_packed_blocks(
+                model, blocks, currency(model), pinned_reaction_ids=pinned_rids, log=job.log)
+            anchors = {}
+            met_acc = defaultdict(list)
+            for b in blocks:
+                for k, v in b['positions'].items():
+                    if k.startswith('r:'):
+                        anchors[k] = v
+                    else:
+                        met_acc[k].append(v)
+            for k, vals in met_acc.items():
+                anchors[k] = np.mean(vals, axis=0).tolist()
         for bridge in bridges:
             a, c = anchors.get(bridge['nodes'][0]), anchors.get(bridge['nodes'][-1])
             if a is None or c is None:
@@ -1832,7 +1887,7 @@ def run_job(folder):
             else:
                 (output_names.map_svg(folder)).write_text(epv.recolor_svg((output_names.map_svg(folder)).read_text(), prov_kinds))
             map_note = dict(kind='routed_full', routing=(metric.get('routing') or {}).get('status'), routing_attempts=metric.get('routing_attempts'),
-                            metrics={k: metric.get(k) for k in ('node_overlap_pairs', 'label_overlap_pairs', 'straight_crossings')}, source_paths=metric.get('source_paths'), expert_geometry=metric.get('expert_geometry'), instance_optimization=metric.get('instance_optimization'), context_placement=metric.get('context_placement'), completion_context=metric.get('completion_context'), layout_quality_final=metric.get('layout_quality_final'), edge_style=metric.get('edge_style'), peripheral=metric.get('peripheral'), block_relocation=metric.get('block_relocation'), region_placement=metric.get('region_placement'), regions=metric.get('regions'), expert_submodule=metric.get('expert_submodule'), label_placement=metric.get('label_placement'), hotspot_repair=metric.get('hotspot_repair'), protected=metric.get('protected'), node_overlap_kinds=metric.get('node_overlap_kinds'), edge_routing=metric.get('edge_routing'))
+                            metrics={k: metric.get(k) for k in ('node_overlap_pairs', 'label_overlap_pairs', 'straight_crossings')}, source_paths=metric.get('source_paths'), expert_geometry=metric.get('expert_geometry'), instance_optimization=metric.get('instance_optimization'), context_placement=metric.get('context_placement'), completion_context=metric.get('completion_context'), layout_quality_final=metric.get('layout_quality_final'), edge_style=metric.get('edge_style'), peripheral=metric.get('peripheral'), block_relocation=metric.get('block_relocation'), region_placement=metric.get('region_placement'), regions=metric.get('regions'), expert_submodule=metric.get('expert_submodule'), label_placement=metric.get('label_placement'), hotspot_repair=metric.get('hotspot_repair'), protected=metric.get('protected'), node_overlap_kinds=metric.get('node_overlap_kinds'), edge_routing=metric.get('edge_routing'), inter_skeleton=metric.get('inter_skeleton'))
         elif len(allids) <= LIMITS['whole_map_max_reactions']:
             global_note = None
             if LAYOUT == 'global':
@@ -1916,6 +1971,10 @@ def run_job(folder):
         pending = sorted(r for r, s in status.items() if s == 'pending_algorithm')
         import orientation as orientation_report
         layout_quality_report = dict(orientation_mode=ORIENTATION, expert_geometry=(map_note or {}).get('expert_geometry'), final_geometry=(map_note or {}).get('layout_quality_final'))
+        if (map_note or {}).get('inter_skeleton') is not None:
+            layout_quality_report['inter_skeleton'] = (map_note or {}).get('inter_skeleton')
+        elif inter_skeleton_report is not None:
+            layout_quality_report['inter_skeleton'] = inter_skeleton_report
         if (output_names.map_json(folder)).exists():
             layout_quality_report['orientation'] = orientation_report.summary(read(output_names.map_json(folder)), prov_kinds)
         run_settings = dict(

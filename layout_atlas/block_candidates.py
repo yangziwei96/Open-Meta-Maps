@@ -266,4 +266,5 @@ def place(items, weights, links, layout_blocks, log=None):
     why['chosen'] = rows[win]['name']
     if log:
         log(f'  chosen arrangement: {rows[win]["name"]}')
-    return arrangements[win], dict(candidates=rows, selection=why)
+    # Keep all four canvases in memory for optional inter-skeleton diagnostics.
+    return arrangements[win], dict(candidates=rows, selection=why, arrangements=arrangements)

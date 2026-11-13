@@ -127,6 +127,7 @@ Matched geometry is kept as drawn (translated only). Everything else is placed b
 | Stage | What it does | Optimises | Main code |
 |---|---|---|---|
 | **Rigid curated skeleton** | Scale matched structures; pack rigid blocks with shared metabolites as junctions; network bridges as anchors | Curated-structure continuity (with matching) | `drawing.py`, `geometry.py` |
+| **Inter-skeleton refinement** | After global block placement, translate whole modules only (swap / relocate) to shorten attachment-pair lengths between structure copies; per-metabolite MST with edge weight `1/(k−1)` so each metabolite contributes its mean MST length (not `C(k,2)` link counts / `k/2` attraction of `group_weights`·`module_links`); `copy:` glyphs stay per-structure | Long inter-skeleton links; module crossings / overlaps; canvas aspect | `inter_skeleton.py`, `global_layout.py` |
 | **Complete uncovered reactions** | Place free nodes around fixed anchors; optional context for currency-only reactions | — | `completion.py`, `context.py`, `completion_context.py` |
 | **Metabolite instances** | Extra visual copies of non-currency metabolites to shorten long edges; currency stays private `side:` glyphs | Long lines; cofactor clones | `instances.py`, `drawing.py` |
 | **Orientation** | Put free reactions between substrates and products; currency copies on the correct side | Participant placement | `orientation.py` |

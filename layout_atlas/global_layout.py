@@ -763,10 +763,13 @@ def plan_global(model, selected, bridges, g, log=None):
     for key in list(weights):
         weights[key] = weights[key] * 1.30
     lap('module weights')
+    links = {}
+    arrangements = None
     if BLOCK_LAYOUT == 'auto':
         import block_candidates
         _, links = block_candidates.module_links([dict(reactions=i['reactions'], _rx=i['_rx']) for i in items], cur, HUB)
         centres, placement = block_candidates.place(items, weights, links, layout_blocks, log=log)
+        arrangements = (placement or {}).pop('arrangements', None)
     else:
         centres, placement = layout_blocks([i['size'] for i in items], weights, aspect=1.5), dict(selection=dict(chosen='spring', rule='single arrangement (block_layout=single)'))
     centres = np.asarray(centres, float)
@@ -774,17 +777,42 @@ def plan_global(model, selected, bridges, g, log=None):
     # without reshuffling the aspect-feasible packing enough to raise curated×curated crossings.
     centres, face_report = _face_shared_metabolites(
         items, centres, weights, n_expert_items, blocks=blocks, cur=cur, max_nudge=80.0, face_axis=False)
+    # Inter-skeleton refinement: translate whole modules to shorten attachment-pair lengths
+    # before any local (island/cycle-style) stages. Not a fifth arrangement algorithm.
+    import inter_skeleton
+    pinned = set()
+    try:
+        import tool_pipeline as _tp
+        prev = getattr(_tp, 'PREVIOUS_ANCHORS', None) or {}
+        if prev:
+            for ii, it in enumerate(items):
+                rx = set(it.get('reactions') or ())
+                if rx and all(('r:' + rid) in prev for rid in rx):
+                    pinned.add(ii)
+    except Exception:
+        pinned = set()
+    far_before = inter_skeleton.far_from_reaction_copies(blocks, model, cur)
+    centres, is_report = inter_skeleton.refine(
+        items, centres, model, cur, blocks=blocks, hub=HUB,
+        weights=weights, links=links, pinned=pinned,
+        arrangements=arrangements, log=log,
+    )
+    centres = np.asarray(centres, float)
     placement = dict(placement or {}, same_map_weights=SAME_MAP_W, link_weight_scale=1.30,
                      face_shared=face_report, same_map_bake=same_map_bake,
-                     rigid_groups={str(k)[:24]: v for k, v in rigid_groups.items()})
+                     rigid_groups={str(k)[:24]: v for k, v in rigid_groups.items()},
+                     inter_skeleton=is_report)
     lap('placement of all modules')
+    import copy as _copy
+    blocks_before_translate = [_copy.deepcopy(b) for b in blocks]
     new_anchors = {}
-    # Expert tiles (individuals or rigid composites): one shared translation per tile.
+    # Expert tiles (individuals or rigid composites): one shared translation per tile
+    # of the full curated geometry (positions + any stored curves/labels).
     for plan, it, centre in zip(expert_plan, items[:n_expert_items], centres[:n_expert_items]):
         delta = centre - it['size'] / 2 + 40 - it['lo']
         for bi in plan[2]:
             b = blocks[bi]
-            b['positions'] = {k: (np.array(v) + delta).tolist() for k, v in b['positions'].items()}
+            inter_skeleton.translate_structure(b, delta)
             for k, v in b['positions'].items():
                 if k.startswith('r:'):
                     anchors[k] = v
@@ -814,6 +842,13 @@ def plan_global(model, selected, bridges, g, log=None):
                 anchors[n] = xy
                 grp['positions'][n] = xy
         grp['size'] = it['size'].tolist()
+    far_after = inter_skeleton.far_from_reaction_copies(blocks, model, cur)
+    internals = inter_skeleton.check_curated_internals_unchanged(blocks_before_translate, blocks)
+    is_report = dict(is_report, far_from_reaction_before=far_before, far_from_reaction_after=far_after,
+                     curated_internals=internals)
+    if log and not internals.get('ok', True):
+        log(f"  inter-skeleton: curated internals check FAILED on {len(internals.get('failed') or [])} block(s)")
+    placement['inter_skeleton'] = is_report
     lap('anchors')
     missing = [k for k in g if k not in anchors]
     # expert-side bookkeeping used by the callers
