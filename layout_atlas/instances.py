@@ -1,25 +1,32 @@
 """V3: visual instances of metabolites, decided from the global layout.
 
-Until now a metabolite outside the expert structures had ONE visual node (`m:<id>`), however many modules used it.  In the iMM904 global map
+Until now a metabolite outside the curated structures had ONE visual node (`m:<id>`), however many modules used it.  In the iMM904 global map
 66 % of the connections longer than 1,000 px ran to ~30 such metabolites (glutamate, acetyl-CoA, 2-oxoglutarate, pyruvate ...) and 29 to the
-biomass reaction.  Expert maps draw such a metabolite once per place where it is used.  This module decides, from the positions that the
+biomass reaction.  Curated maps draw such a metabolite once per place where it is used.  This module decides, from the positions that the
 global layout produced, how many visual instances each metabolite gets and which reactions each instance serves.  One GEM metabolite stays one
 identity (`copies[key]` is always its id); instances are only places where it is drawn.
 
-Three operations on the scene made by `drawing.display_scene` (the hashed drawing files are not modified):
+Operations on the scene made by `drawing.display_scene` (the hashed drawing files are not modified):
 
-  summary reactions   a reaction outside the expert structures with >= SUMMARY_MIN non-currency participants (biomass) gets a private instance
+  summary reactions   a reaction outside the curated structures with >= SUMMARY_MIN non-currency participants (biomass) gets a private instance
                       of every participant on a ring around it, instead of one long line per participant to nodes all over the map.  Every
                       participant stays drawn and connected; nothing is hidden or merged.  Reason `summary_reaction`.
-  reuse / merge       a reaction attaches to the nearest existing instance of its metabolite (an expert copy, a shared node or an earlier
+  reuse / merge       a reaction attaches to the nearest existing instance of its metabolite (a curated copy, a shared node or an earlier
                       instance) when that is within NEAR px.  A shared node that no longer serves any reaction disappears (a merge).
   split               reactions of one metabolite that are further than NEAR from every existing instance are grouped (single linkage,
                       LINK px); a group of >= MIN_CLUSTER reactions (or one reaction farther than FAR) gets a new instance at its centre.
                       Reason `long_edge_split`.  At most MAX_NEW new instances per metabolite.
+  island attach       an isolated non-curated reaction may attach to a nearby instance of a participant (up to RESCUE px) so packing keeps
+                      connectivity.
+  structure-local     after packing (compose pipeline), a reaction inside a curated structure prefers that structure's own `copy:` of the
+                      metabolite.  When the structure has no suitable copy and the reaction still has a far link to another structure's
+                      `copy:`, a new movable `inst:` is placed next to the structure — replacing the island-proximity stretch onto a foreign
+                      curated copy.  Curated `copy:` / `side:` / pinned glyphs are never created, moved or merged.  Reason `structure_local`.
+                      The far cut is the layout's own edge-length fence (Q3 + 1.5 IQR of non-currency participant lengths, falling back to NEAR).
 
-Expert glyphs and reaction points are never moved here; only the participant each non-expert reaction attaches to is chosen.  Currency
-metabolites keep their per-reaction `side:` glyphs.  Deterministic.  The report gives long-edge counts before / after (on the scene before
-relaxation, participant edges of non-currency metabolites) and the reduction per added instance.
+Curated glyphs and reaction points are never moved here; only the participant each reaction attaches to is chosen (and new `inst:` nodes may
+be added).  Currency metabolites keep their per-reaction `side:` glyphs.  Deterministic.  The report gives long-edge counts before / after
+(on the scene before relaxation, participant edges of non-currency metabolites) and the reduction per added instance.
 """
 from collections import Counter, defaultdict
 
@@ -44,6 +51,7 @@ RESCUE = 700.0      # an otherwise isolated reaction attaches to the nearest ins
 HUB_METAB_PCT = 0.95
 HUB_NEAR = 180.0
 HUB_MAX_NEW = 12
+LOCAL_OFFSET = np.array([0.0, 55.0])  # same offset as long_edge_split placement
 
 
 def _long(model, scene, cur, thresholds=(250.0, 1000.0)):
@@ -99,13 +107,287 @@ def _hub_metabolites(model, cur, pct):
     return {m for m, n in uses.items() if n >= cut}
 
 
+def _edge_far_threshold(model, scene, cur):
+    """Far-edge fence from the scene itself: Q3 + 1.5 IQR of non-currency participant lengths."""
+    pos, parts = scene['positions'], scene['participants']
+    lengths = []
+    for r in model['reactions']:
+        rk = 'r:' + r['id']
+        if rk not in pos:
+            continue
+        rp = np.array(pos[rk], float)
+        for mid in r['metabolites']:
+            if mid in cur:
+                continue
+            key = parts.get((r['id'], mid))
+            if key not in pos:
+                continue
+            lengths.append(float(np.hypot(*(np.array(pos[key], float) - rp))))
+    if len(lengths) < 8:
+        return NEAR
+    q1, q3 = np.percentile(lengths, [25, 75])
+    return float(q3 + 1.5 * (q3 - q1))
+
+
+def _rid_block(blocks):
+    return {rid: b['id'] for b in (blocks or []) for rid in b.get('reaction_ids') or ()}
+
+
+def _block_copies(copies, pos):
+    """(block_id, metabolite_id) -> copy: key for curated copies present in the scene."""
+    out = {}
+    for key, mid in copies.items():
+        if key.startswith('copy:') and key in pos:
+            out[key.split(':')[1], mid] = key
+    return out
+
+
+def _pinned_keys(scene):
+    """Hard-pinned glyph keys (previous-layout anchors); never reassigned or moved here."""
+    pinned = set()
+    for key, hint in (scene.get('anchors') or {}).items():
+        if isinstance(hint, dict):
+            if hint.get('hard'):
+                pinned.add(key)
+        else:
+            pinned.add(key)
+    return pinned
+
+
+def _detach_protected(scene, rid, mid):
+    """Remove one reaction from protected groups of `mid` so a deliberate reattachment does not count as a split.
+
+    A curated reaction that was sharing another structure's `copy:` (or a far `m:`) is not part of that
+    glyph's intended protection; peeling it off leaves the remaining members on one instance.
+    """
+    kept = []
+    for rec in scene.get('protected') or []:
+        if rec.get('canonical_metabolite_id') != mid or rid not in rec.get('attached_reaction_ids', ()):
+            kept.append(rec)
+            continue
+        members = [r for r in rec['attached_reaction_ids'] if r != rid]
+        if len(members) >= 2:
+            rec = dict(rec, attached_reaction_ids=members)
+            kept.append(rec)
+        # Degenerate (<2) groups are dropped.
+    scene['protected'] = kept
+
+
+def _far_foreign_or_shared(cur_key, bid):
+    """True when the attachment is another structure's copy, or a shared/movable glyph (m:/inst:)."""
+    if cur_key.startswith('copy:'):
+        return cur_key.split(':')[1] != bid
+    return cur_key.startswith(('inst:', 'm:'))
+
+
+def _unit_toward(origin, target):
+    vec = np.asarray(target, float) - np.asarray(origin, float)
+    norm = float(np.hypot(*vec))
+    if norm < 1e-6:
+        return np.array([0.0, 1.0])
+    return vec / norm
+
+
+def _axis_unit_toward(origin, target):
+    """Dominant-axis unit toward the old endpoint — keeps the half-plane and favours orthogonal stubs."""
+    unit = _unit_toward(origin, target)
+    if abs(unit[0]) >= abs(unit[1]):
+        return np.array([1.0 if unit[0] >= 0 else -1.0, 0.0])
+    return np.array([0.0, 1.0 if unit[1] >= 0 else -1.0])
+
+
+def _clear_of(existing, spot, need):
+    if existing is None or len(existing) == 0:
+        return True
+    return float(np.min(np.hypot(*(existing - spot).T))) >= need - 1e-9
+
+
+def _place_along_corridor(centre, foreign_xy, existing, place_dist, clearance, far_thr, disk_clearance):
+    """Place a local stub toward the old endpoint: try the axis-aligned ray first (edge orthogonality), then the true corridor.
+
+    Distances stay at or under the layout far fence so the new stub is not itself a far edge.
+    """
+    max_dist = max(float(place_dist), float(far_thr))
+    distances = []
+    d = float(place_dist)
+    while d <= max_dist + 1e-9:
+        distances.append(d)
+        d += clearance
+    if not distances or distances[-1] < max_dist - 1e-9:
+        distances.append(max_dist)
+    # Soft clearance = metabolite label gap; hard floor = Escher primary diameter.
+    soft, hard = float(clearance), float(disk_clearance)
+
+    def _search(unit, need):
+        angles = [0.0]
+        for step in (1, 2, 3, 4):
+            ang = step * (np.pi / 4.0)
+            angles.extend((ang, -ang))
+        for ang in angles:
+            c, s = float(np.cos(ang)), float(np.sin(ang))
+            rot = np.array([unit[0] * c - unit[1] * s, unit[0] * s + unit[1] * c])
+            for dist in distances:
+                cand = np.asarray(centre, float) + rot * dist
+                if _clear_of(existing, cand, need):
+                    return cand
+        return None
+
+    # Axis-aligned corridor first (edge orthogonality), then the true corridor (half-plane).
+    true = _unit_toward(centre, foreign_xy)
+    axis = _axis_unit_toward(centre, foreign_xy)
+    for need in (soft, hard):
+        for unit in (axis, true):
+            hit = _search(unit, need)
+            if hit is not None:
+                return hit
+    # Last resort on the axis ray at place_dist (caller may still reject if hard clearance fails).
+    return np.asarray(centre, float) + axis * float(place_dist)
+
+
+def structure_local(model, scene, blocks, cur, reasons=None):
+    """Prefer each curated structure's own metabolite copy; add local inst: only to clear far foreign / far m:/inst: links.
+
+    Does not move or merge curated `copy:`, `side:` or pinned glyphs.  Returns (scene, report) and may modify `scene`.
+    """
+    pos, labels, copies, parts = scene['positions'], scene['labels'], scene['copies'], scene['participants']
+    reasons = reasons if reasons is not None else scene.setdefault('instance_reasons', {})
+    rid_block = _rid_block(blocks)
+    own_of = _block_copies(copies, pos)
+    pinned = _pinned_keys(scene)
+    far_thr = _edge_far_threshold(model, scene, cur)
+    rx = {r['id']: r for r in model['reactions']}
+    reassigned = 0
+    # 1. Prefer the structure's own curated copy whenever it exists.
+    for rid, bid in sorted(rid_block.items()):
+        r = rx.get(rid)
+        if r is None or ('r:' + rid) not in pos:
+            continue
+        for mid in sorted(r['metabolites']):
+            if mid in cur:
+                continue
+            own = own_of.get((bid, mid))
+            if not own:
+                continue
+            cur_key = parts.get((rid, mid))
+            if cur_key == own or cur_key in pinned or own in pinned:
+                continue
+            if cur_key and cur_key.startswith('side:'):
+                continue
+            _detach_protected(scene, rid, mid)
+            parts[rid, mid] = own
+            reassigned += 1
+    # 2. Far attachments that still lack an own copy: foreign curated copies first, then far m:/inst:.
+    def _pending(kind):
+        out = defaultdict(list)
+        for rid, bid in sorted(rid_block.items()):
+            r = rx.get(rid)
+            if r is None or ('r:' + rid) not in pos:
+                continue
+            rp = np.array(pos['r:' + rid], float)
+            for mid in sorted(r['metabolites']):
+                if mid in cur or own_of.get((bid, mid)):
+                    continue
+                cur_key = parts.get((rid, mid))
+                if cur_key is None or cur_key not in pos or cur_key in pinned:
+                    continue
+                if cur_key.startswith('side:') or not _far_foreign_or_shared(cur_key, bid):
+                    continue
+                is_foreign = cur_key.startswith('copy:') and cur_key.split(':')[1] != bid
+                is_shared = cur_key.startswith(('inst:', 'm:'))
+                if kind == 'foreign' and not is_foreign:
+                    continue
+                if kind == 'shared' and not is_shared:
+                    continue
+                dist = float(np.hypot(*(np.array(pos[cur_key], float) - rp)))
+                if dist <= far_thr:
+                    continue
+                out[bid, mid].append((rid, cur_key))
+        return out
+
+    # Clearance beside a curated reaction: same defaults separate() uses; disk floor from Escher primary radius.
+    import inspect as _inspect
+    from layout_gate import _RADIUS as _ESCHER_RADIUS, SPECIES as _ESCHER_SPECIES
+    _sep = _inspect.signature(separate).parameters
+    reaction_gap = float(_sep['reaction_gap'].default)
+    metabolite_gap = float(_sep['metabolite_gap'].default)
+    place_dist = max(reaction_gap, metabolite_gap)
+    clearance = metabolite_gap
+    disk_clearance = 2.0 * float(_ESCHER_RADIUS[_ESCHER_SPECIES][0])
+    existing = np.array([pos[k] for k in sorted(pos)], float) if pos else np.zeros((0, 2))
+
+    added = 0
+    reused = 0
+    skipped = 0
+    frozen_copies = set(scene.get('structure_local_frozen_copies') or ())
+    foreign_pending = _pending('foreign')
+    shared_pending = _pending('shared')
+    # Shared (m:/inst:) groups only reuse an existing local movable instance — new glyphs are reserved for
+    # far foreign-copy links (the cross-structure case).  Reuse is applied when it clearly shortens the edge.
+    for kind, pending in (('foreign', foreign_pending), ('shared', shared_pending)):
+        for (bid, mid), members in sorted(pending.items()):
+            rids = [rid for rid, _ in members]
+            centre = np.asarray(np.mean([pos['r:' + rid] for rid in rids], axis=0), float)
+            local_opts = []
+            for t, m2 in copies.items():
+                if m2 != mid or t not in pos or t.startswith(('side:', 'copy:')):
+                    continue
+                # Never reuse another structure's structure-local instance (that recreates cross-structure links).
+                if t.startswith('inst:local:'):
+                    other = t.split(':')[2] if t.count(':') >= 3 else None
+                    if other is not None and other != bid:
+                        continue
+                d = float(np.hypot(*(np.array(pos[t], float) - centre)))
+                if d <= far_thr:
+                    local_opts.append((d, t))
+            if local_opts:
+                best = min(local_opts)[1]
+                for rid, old in members:
+                    if old.startswith('copy:'):
+                        frozen_copies.add(old)
+                    _detach_protected(scene, rid, mid)
+                    parts[rid, mid] = best
+                reused += 1
+                continue
+            if kind == 'shared':
+                skipped += 1
+                continue
+            foreign_xy = np.mean([pos[fk] for _, fk in members], axis=0)
+            spot = _place_along_corridor(
+                centre, foreign_xy, existing, place_dist, clearance, far_thr, disk_clearance)
+            if not _clear_of(existing, spot, disk_clearance):
+                skipped += 1
+                continue
+            key = f'inst:local:{bid}:{mid}'
+            n = 0
+            while key in pos:
+                n += 1
+                key = f'inst:local:{bid}:{mid}:{n}'
+            pos[key] = np.asarray(spot, float).tolist()
+            labels[key], copies[key] = mid, mid
+            reasons[key] = 'structure_local'
+            existing = np.vstack([existing, spot]) if len(existing) else np.asarray(spot, float).reshape(1, 2)
+            for rid, old in members:
+                if old.startswith('copy:'):
+                    frozen_copies.add(old)
+                _detach_protected(scene, rid, mid)
+                parts[rid, mid] = key
+            added += 1
+    scene['structure_local_frozen_copies'] = sorted(frozen_copies)
+    report = dict(added=added, reused_local=reused, reassigned_to_own_copy=reassigned,
+                  skipped_no_clearance=skipped,
+                  far_threshold=round(far_thr, 2),
+                  groups=len(foreign_pending) + len(shared_pending), reason='structure_local',
+                  frozen_copies=len(frozen_copies))
+    return scene, report
+
+
 def optimize(model, scene, blocks, cur, summary=True, reuse=True, split=True):
     """Returns (new scene, report).  `scene` is not modified."""
     scene = dict(scene, positions={k: list(v) for k, v in scene['positions'].items()}, labels=dict(scene['labels']), copies=dict(scene['copies']),
                  participants=dict(scene['participants']))
     pos, labels, copies, parts = scene['positions'], scene['labels'], scene['copies'], scene['participants']
     reasons = {}
-    expert = {rid for b in blocks for rid in b['reaction_ids']}
+    curated = {rid for b in blocks for rid in b['reaction_ids']}
     before = _long(model, scene, cur)
     rx = {r['id']: r for r in model['reactions']}
     shared_before = {k for k in pos if k.startswith('m:')}
@@ -118,7 +400,7 @@ def optimize(model, scene, blocks, cur, summary=True, reuse=True, split=True):
         for rid in sorted(rx):
             r = rx[rid]
             core = [m for m in sorted(r['metabolites']) if m not in cur and not parts[rid, m].startswith('copy:')]
-            if rid in expert or len(core) < summary_cut:
+            if rid in curated or len(core) < summary_cut:
                 continue
             centre = np.array(pos['r:' + rid], float)
             radius = max(160.0, len(core) * 46 / (2 * np.pi))
@@ -203,7 +485,7 @@ def optimize(model, scene, blocks, cur, summary=True, reuse=True, split=True):
                 if t == 'm:' + mid:
                     continue
                 if t.startswith('copy:') and rec.get('anchor_region') and t.split(':')[1] != rec['anchor_region']:
-                    continue  # a glyph of another expert structure is not this group's anchor
+                    continue  # a glyph of another curated structure is not this group's anchor
                 d = np.hypot(*(mp - np.array(pos[t], float)).T)
                 if float(d.max()) <= near and float(d.sum()) <= cost_now:
                     options.append((float(d.sum()), t))
@@ -211,7 +493,7 @@ def optimize(model, scene, blocks, cur, summary=True, reuse=True, split=True):
                 best = min(options)[1]
             elif cost_now > 0 and float(np.min(np.hypot(*(mp - here).T))) > SPLIT_PLACED and added < max_new:
                 best = f'inst:{mid}:{added}'
-                pos[best] = (mp.mean(axis=0) + np.array([0.0, 55.0])).tolist()
+                pos[best] = (mp.mean(axis=0) + LOCAL_OFFSET).tolist()
                 labels[best], copies[best] = mid, mid
                 reasons[best] = 'long_edge_split'
                 targets.append(best)
@@ -246,7 +528,7 @@ def optimize(model, scene, blocks, cur, summary=True, reuse=True, split=True):
                 placed_here = scene.get('completion_context', {}).get('tiers', {})
                 if added < max_new and (len(members) >= MIN_CLUSTER or mean_d > FAR or (mean_d > SPLIT_PLACED and any(rid in placed_here for rid, _ in members))):
                     key = f'inst:{mid}:{added}'
-                    pos[key] = (centre + np.array([0.0, 55.0])).tolist()
+                    pos[key] = (centre + LOCAL_OFFSET).tolist()
                     labels[key], copies[key] = mid, mid
                     reasons[key] = 'long_edge_split'
                     targets.append(key)
@@ -261,14 +543,15 @@ def optimize(model, scene, blocks, cur, summary=True, reuse=True, split=True):
         if added:
             per_metabolite[mid] = added
 
-    # 2b. a reaction outside the expert structures whose every glyph is private (shared with no other reaction) is attached to the nearest
-    # instance that another reaction uses, whatever the usual NEAR rule says: an island is worse than a longer line
+    # 2b. a reaction outside the curated structures whose every glyph is private (shared with no other reaction) is attached to the nearest
+    # instance that another reaction uses, whatever the usual NEAR rule says: an island is worse than a longer line.  Far stretches onto a
+    # foreign curated copy are corrected after packing by structure_local.
     holders = defaultdict(set)
     for (rid, mid), key in parts.items():
         holders[key].add(rid)
     rescued = 0
     for rid in sorted(rx):
-        if rid in expert:
+        if rid in curated:
             continue
         mine = [(mid, parts[rid, mid]) for mid in sorted(rx[rid]['metabolites']) if mid not in cur]
         if not mine or any(len(holders[k]) > 1 for _, k in mine):
