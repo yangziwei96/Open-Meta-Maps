@@ -724,17 +724,15 @@ def compose(model, scene, blocks, cur):
         report['interior_repack'] = iter_reps
     # Close empty corridors between islands and the dense main hull (AABB voids that
     # pocket-pack leaves with leftover=0 but still look like TR/top floaters).
-    # Mid/large: skip late island tuck + landscape reflow — they inflate blank /
-    # canvas height vs stable-v1 iIT341 (0.20 blank / ~5k H). Small maps keep
-    # them for e_coli floater wins.
+    scene, island_rep = tuck_islands_to_silhouette(
+        model, scene, blocks, cur, spacing=spacing)
+    report['island_tuck'] = island_rep
     n_rx = len(model['reactions'])
     if n_rx >= 200:
-        report['island_tuck'] = dict(skipped='n_rx>=200_packing_gate')
+        # Landscape reflow pocket-packs / near_kept leftovers can widen the
+        # canvas on mid/large GEMs vs stable-v1; keep silhouette tuck only.
         report['landscape_reflow'] = dict(skipped='n_rx>=200_packing_gate')
     else:
-        scene, island_rep = tuck_islands_to_silhouette(
-            model, scene, blocks, cur, spacing=spacing)
-        report['island_tuck'] = island_rep
         # Final landscape reflow: translation-only skyline of rigid visual components so the
         # content bbox lands in 4:3–16:9 even when related-pulls left a tall column.
         scene, reflow = reflow_landscape(model, scene, blocks, cur)
