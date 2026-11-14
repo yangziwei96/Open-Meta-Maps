@@ -152,10 +152,17 @@ def tuck_islands_to_silhouette(model, scene, blocks, cur, spacing=None):
     scene = dict(scene, positions={k: list(v) for k, v in scene['positions'].items()})
     pos = scene['positions']
     comps = components(model, scene, cur)
-    # Hull reference = large connected components only. Do NOT freeze same_map_rigid
-    # tiles as main — those are often the visual islands we must tuck (translation
-    # preserves their internal geometry).
+    # Hull = large components PLUS same_map_rigid tiles. Compose / reflow already
+    # freeze absolute_rigid backbones as main so hand-drawn row/column relatives
+    # survive; early silhouette tuck used to slide each currency-split module on
+    # its own (PFK/RPE… 1600px) and erased that grid before restore could help.
     main = [i for i, c in enumerate(comps) if len(c['reactions']) >= MAIN_MIN]
+    rigid_rx = {rid for b in (blocks or []) if b.get('same_map_rigid')
+                for rid in (b.get('reaction_ids') or [])}
+    if rigid_rx:
+        for i, c in enumerate(comps):
+            if i not in main and any(rid in rigid_rx for rid in c['reactions']):
+                main.append(i)
     if not main:
         main = [int(np.argmax([len(c['reactions']) for c in comps]))] if comps else []
     if not main:
@@ -519,13 +526,21 @@ def compose(model, scene, blocks, cur):
             lw = min(max([text_w(str(labels.get(k, ''))) for k in ks] + [0.0]), 220.0)
             pads[i] = lw
             boxes.append((i, arr.min(0), arr.max(0) - arr.min(0) + np.array([60.0 + lw, 60.0])))
-        # Pocket-pack into empty space flush with the main AABB before any external shelf.
+        # Small maps (e_coli): shelf independents in uniform rows/columns beside the
+        # main AABB. Pocket-pack alone left shelf.rows=0 and erased the hand-drawn
+        # row/column guide that same-map absolute_rigid establishes on the main body.
+        # Mid/large: pocket-pack first (spoke-safe), shelf only leftovers.
+        n_rx_model = len(model['reactions'])
         prefer_c = main_pts.mean(0)
-        pocket_boxes = sorted(
-            [(i, float(size[0]), float(size[1])) for i, _bmin, size in boxes],
-            key=lambda t: (-t[1] * t[2], t[0]))
-        pocket_placed, pocket_rep = pack_into_main_pockets(
-            pocket_boxes, main_pts, spacing, prefer_c=prefer_c)
+        pocket_placed, pocket_rep = {}, dict(placed=0, missed=len(boxes), skipped=None)
+        if n_rx_model >= 200:
+            pocket_boxes = sorted(
+                [(i, float(size[0]), float(size[1])) for i, _bmin, size in boxes],
+                key=lambda t: (-t[1] * t[2], t[0]))
+            pocket_placed, pocket_rep = pack_into_main_pockets(
+                pocket_boxes, main_pts, spacing, prefer_c=prefer_c)
+        else:
+            pocket_rep = dict(placed=0, missed=len(boxes), skipped='shelf_rows_small_map')
         report['pocket_pack'] = pocket_rep
         remaining = []
         for i, bmin, size in boxes:
@@ -650,9 +665,13 @@ def compose(model, scene, blocks, cur):
     # After related/independent moves: pull true exterior stubs into free regions
     # of the main AABB. Keep this mild — aggressive teleports raise crossings and
     # split curated structures (the initial pocket_pack already places most tiles).
+    # Skip when shelf rows are the packing mode: interior pocket hops yank shelved
+    # modules off their row/column guides (e_coli hops ~1175 px).
+    shelf_rep_early = report.get('shelf') or {}
+    skip_interior_for_shelf = int(shelf_rep_early.get('rows') or 0) > 0
     iter_reps = []
     prev_ids = None
-    for _it in range(2):
+    for _it in range(0 if skip_interior_for_shelf else 2):
         main_pts = np.array(
             [placed_pts[k] for i in main for k in cur_keys_of[i] if k in placed_pts], float)
         if len(main_pts) < 2:
@@ -722,20 +741,45 @@ def compose(model, scene, blocks, cur):
             break
     if iter_reps:
         report['interior_repack'] = iter_reps
-    # Close empty corridors between islands and the dense main hull (AABB voids that
-    # pocket-pack leaves with leftover=0 but still look like TR/top floaters).
-    scene, island_rep = tuck_islands_to_silhouette(
-        model, scene, blocks, cur, spacing=spacing)
-    report['island_tuck'] = island_rep
-    # Final landscape reflow: translation-only skyline of rigid visual components so the
-    # content bbox lands in 4:3–16:9 even when related-pulls left a tall column.
-    scene, reflow = reflow_landscape(model, scene, blocks, cur)
-    report['landscape_reflow'] = reflow
-    # Reflow may re-pocket/flush; one more silhouette tuck for anything still gapped.
-    scene, island_rep2 = tuck_islands_to_silhouette(
-        model, scene, blocks, cur, spacing=spacing)
-    if island_rep2.get('moved'):
-        report['island_tuck_after_reflow'] = island_rep2
+    # Small-map shelf rows restore hand-drawn row/column guides for independents.
+    # Silhouette tuck + landscape far-outlier pocket-pack yank those shelf tiles
+    # back into AABB voids (e_coli: shelf.rows=5 → pocket placed=9) and erase the
+    # absolute_rigid + shelf grid. Keep the shelf.
+    # Mid/large: match stable-v1 e42993f — landscape reflow only (no silhouette
+    # tuck). Tip silhouette tuck irregularized the skyline AABB (iIT341 blank
+    # 0.58 vs stable 0.20 rectangular packing).
+    shelf_rep = report.get('shelf') or {}
+    used_shelf_rows = int(shelf_rep.get('rows') or 0) > 0
+    n_rx = len(model['reactions'])
+    if used_shelf_rows:
+        report['island_tuck'] = dict(skipped='shelf_rows_keep_alignment',
+                                     shelf_rows=shelf_rep.get('rows'))
+        report['landscape_reflow'] = dict(
+            skipped='shelf_rows_keep_alignment',
+            shelf_rows=shelf_rep.get('rows'),
+            shelf_side=shelf_rep.get('side'))
+    elif n_rx >= 200:
+        # Mid/large: silhouette tuck off (tip irregularized AABB). Keep e42993f-style
+        # landscape reflow only — no tip flush-tuck / wide far-outlier retry.
+        report['island_tuck'] = dict(skipped='n_rx>=200_rectangular_packing')
+        scene, reflow = reflow_landscape(
+            model, scene, blocks, cur, stable_inband=True)
+        report['landscape_reflow'] = reflow
+    else:
+        # Close empty corridors between islands and the dense main hull (AABB voids that
+        # pocket-pack leaves with leftover=0 but still look like TR/top floaters).
+        scene, island_rep = tuck_islands_to_silhouette(
+            model, scene, blocks, cur, spacing=spacing)
+        report['island_tuck'] = island_rep
+        # Final landscape reflow: translation-only skyline of rigid visual components so the
+        # content bbox lands in 4:3–16:9 even when related-pulls left a tall column.
+        scene, reflow = reflow_landscape(model, scene, blocks, cur)
+        report['landscape_reflow'] = reflow
+        # Reflow may re-pocket/flush; one more silhouette tuck for anything still gapped.
+        scene, island_rep2 = tuck_islands_to_silhouette(
+            model, scene, blocks, cur, spacing=spacing)
+        if island_rep2.get('moved'):
+            report['island_tuck_after_reflow'] = island_rep2
     scene['composition'] = report
     return scene, report
 
@@ -790,13 +834,15 @@ def _mark_rect_occupied(occ, x0, y0, w, h):
 
 
 def _find_pocket_origin(occ, size_w, size_h, prefer_c, content_lo=None, content_hi=None,
-                        prefer_void=False):
+                        prefer_void=False, use_silhouette=True):
     """Top-left origin for a ``size_w×size_h`` box inside empty cells nearest ``prefer_c``.
 
     When ``content_lo/hi`` are set, prefer slots that pull the combined aspect toward
     the 4:3–16:9 band (widen a tall map, avoid growing height on an already-wide map).
     ``prefer_void`` ranks large empty neighbourhoods before tuck/centre (safer when
     packing many tiles on large maps).
+    ``use_silhouette``: tip scoring prefers flush silhouette distance; set False to
+    match stable-v1 e42993f void/tuck ranking (mid/large rectangular density).
     """
     if occ is None:
         return None
@@ -809,11 +855,13 @@ def _find_pocket_origin(occ, size_w, size_h, prefer_c, content_lo=None, content_
     integ = np.pad(empty, ((1, 0), (1, 0)), mode='constant')
     integ = integ.cumsum(0).cumsum(1)
     # Distance (in cells) from each empty cell to nearest occupied — silhouette cue.
-    try:
-        from scipy.ndimage import distance_transform_edt
-        sil_map = distance_transform_edt(grid == 0) * cell
-    except Exception:
-        sil_map = None
+    sil_map = None
+    if use_silhouette:
+        try:
+            from scipy.ndimage import distance_transform_edt
+            sil_map = distance_transform_edt(grid == 0) * cell
+        except Exception:
+            sil_map = None
     best = None
     step = 1 if occ['nx'] * occ['ny'] < 40_000 else 2
     want_wide = False
@@ -869,14 +917,17 @@ def _find_pocket_origin(occ, size_w, size_h, prefer_c, content_lo=None, content_
             neigh = integ[iy1, ix1] - integ[iy0, ix1] - integ[iy1, ix0] + integ[iy0, ix0]
             void_pen = -float(neigh)
             # Silhouette distance at slot centre — prefer flush with main glyphs,
-            # not the middle of a large AABB void corridor.
+            # not the middle of a large AABB void corridor (tip small-map path).
             if sil_map is not None:
                 sil_dist = float(sil_map[min(iy + nh // 2, occ['ny'] - 1),
                                          min(ix + nw // 2, occ['nx'] - 1)])
             else:
-                sil_dist = float(np.sqrt(dist))
+                sil_dist = None
             if prefer_void:
-                score = (aspect_pen, expand_pen, sil_dist, void_pen, dist, iy, ix)
+                if sil_dist is not None:
+                    score = (aspect_pen, expand_pen, sil_dist, void_pen, dist, iy, ix)
+                else:
+                    score = (aspect_pen, expand_pen, void_pen, dist, iy, ix)
             else:
                 # Prefer slots tucked against occupied cells, then near the main
                 # silhouette / centre so TR floaters pull inward.
@@ -890,7 +941,10 @@ def _find_pocket_origin(occ, size_w, size_h, prefer_c, content_lo=None, content_
                 border_cells = max(1, area_cells - nw * nh)
                 occupied_contact = border_cells - border_empty
                 tuck_pen = -float(occupied_contact)
-                score = (aspect_pen, expand_pen, tuck_pen, sil_dist, dist, iy, ix)
+                if sil_dist is not None:
+                    score = (aspect_pen, expand_pen, tuck_pen, sil_dist, dist, iy, ix)
+                else:
+                    score = (aspect_pen, expand_pen, tuck_pen, dist, iy, ix)
             if best is None or score < best[0]:
                 best = (score, x0, y0)
     if best is None:
@@ -899,12 +953,13 @@ def _find_pocket_origin(occ, size_w, size_h, prefer_c, content_lo=None, content_
 
 
 def pack_into_main_pockets(boxes, main_pts, spacing, prefer_c=None, prefer_void=False,
-                           search_pad=None):
+                           search_pad=None, use_silhouette=True):
     """Place boxes into empty pockets inside/flush with the main AABB.
 
     ``boxes``: list of ``(id, size_w, size_h)`` largest-first preferred.
     Returns ``{id: (x, y)}`` top-left placements for those that fit; others omitted.
     ``search_pad`` overrides the default flush strip outside the main AABB.
+    ``use_silhouette``: tip silhouette scoring; False matches stable-v1 e42993f.
     """
     if not boxes or len(main_pts) < 2:
         return {}, dict(placed=0, missed=len(boxes))
@@ -950,7 +1005,8 @@ def pack_into_main_pockets(boxes, main_pts, spacing, prefer_c=None, prefer_void=
     for bid, bw, bh in boxes:
         origin = _find_pocket_origin(occ, bw, bh, prefer_c,
                                     content_lo=content_lo, content_hi=content_hi,
-                                    prefer_void=prefer_void)
+                                    prefer_void=prefer_void,
+                                    use_silhouette=use_silhouette)
         if origin is None:
             continue
         placed[bid] = origin
@@ -965,7 +1021,7 @@ def pack_into_main_pockets(boxes, main_pts, spacing, prefer_c=None, prefer_void=
                                                  / max(content_hi[1] - content_lo[1], 1e-9)), 3))
 
 
-def reflow_landscape(model, scene, blocks, cur):
+def reflow_landscape(model, scene, blocks, cur, stable_inband=False):
     """Bring the scene content bbox into 4:3–16:9 without deforming curated glyphs.
 
     Safe tools only (never tear the main packed network):
@@ -973,6 +1029,10 @@ def reflow_landscape(model, scene, blocks, cur):
       2. Otherwise freeze MAIN visual components and skyline-pack only the
          non-main components beside them with binary-searched width so the
          combined frame is landscape (translation only).
+
+    ``stable_inband``: match stable-v1 e42993f in-band behaviour — far-outlier
+    pocket only (0.32×span), no tip flush-tuck / wide search retry that
+    collapsed iIT341 toward a square irregular silhouette.
     """
     scene = dict(scene, positions={k: list(v) for k, v in scene['positions'].items()})
     pos = scene['positions']
@@ -1067,9 +1127,10 @@ def reflow_landscape(model, scene, blocks, cur):
     span = max(float(np.hypot(*(mhi - mlo))), 1.0)
     span_xy = max(float(mhi[0] - mlo[0]), float(mhi[1] - mlo[1]), 1.0)
     spacing = max(spacing_from_main(main_pts), 40.0)
+    far_frac = 0.32 if stable_inband else FAR_OUTLIER_FRAC
     if in_band0:
         pack_ids = [i for i in sizes
-                    if float(np.hypot(*(centres[i] - prefer_c))) > FAR_OUTLIER_FRAC * span]
+                    if float(np.hypot(*(centres[i] - prefer_c))) > far_frac * span]
     else:
         pack_ids = list(sizes)
     pocket_boxes = sorted(
@@ -1077,9 +1138,11 @@ def reflow_landscape(model, scene, blocks, cur):
         key=lambda t: (-t[1] * t[2], t[0]))
     pocket_tl, pocket_rep = pack_into_main_pockets(
         pocket_boxes, main_pts, spacing,
-        prefer_c=prefer_c, prefer_void=len(pocket_boxes) > 20)
+        prefer_c=prefer_c, prefer_void=len(pocket_boxes) > 20,
+        use_silhouette=not stable_inband)
     # Wider flush retry for far outliers that missed the tight pad (in-band only).
-    if in_band0 and pocket_boxes:
+    # Skip on stable_inband mid/large — tip retry irregularized the skyline AABB.
+    if in_band0 and pocket_boxes and not stable_inband:
         missed_boxes = [(i, w, h) for i, w, h in pocket_boxes if i not in pocket_tl]
         if missed_boxes:
             more_tl, more_rep = pack_into_main_pockets(
@@ -1104,7 +1167,9 @@ def reflow_landscape(model, scene, blocks, cur):
                     placed=len(pocket_tl),
                     missed=len(pocket_boxes) - len(pocket_tl),
                     retry=dict(more_rep, accepted=len(kept)))
-    if in_band0 and not pocket_tl and not pack_ids:
+    # Stable-v1 (e42993f): in-band with nothing pocketed → leave frame alone (far
+    # outliers that missed pockets stay put; no tip flush/shelf of near tiles).
+    if in_band0 and not pocket_tl:
         report.update(aspect_after=round(aspect0, 3), reason='already_in_band',
                       pocket=pocket_rep)
         return scene, report
@@ -1132,9 +1197,11 @@ def reflow_landscape(model, scene, blocks, cur):
                           reason=reason, pack=pack)
             return scene, report
 
-        # Started in-band: pocket-pack, then flush-tuck any missed far outliers against
-        # the main AABB. Never peel onto a wide skyline shelf (reopens TR floaters).
-        if in_band0:
+        # Started in-band: pocket-pack far outliers.
+        # - Tip (small maps): flush-tuck leftovers against main (no wide shelf).
+        # - Mid/large stable_inband (e42993f): leftover = ALL non-pocketed
+        #   movables; no flush-tuck; fall through to main_frozen_shelf_reflow.
+        if in_band0 and not stable_inband:
             flush_rep = None
             if leftover:
                 # Bounds after pocket apply so flush strip sits beside the filled main.
@@ -1165,6 +1232,19 @@ def reflow_landscape(model, scene, blocks, cur):
                         report.get('pocket') or {},
                         leftover=0, flush_tuck=flush_rep)
             return _pocket_done('main_pocket_pack', leftover, flush_rep=flush_rep)
+
+        if in_band0 and stable_inband:
+            # e42993f: leftovers are ALL non-pocketed movables; no flush-tuck;
+            # fall through to main_frozen_shelf_reflow. (Tip flush/wide-retry and
+            # tip island tuck are off; silhouette pocket scoring off via
+            # use_silhouette=False above.)
+            leftover = [i for i in sizes if i not in pocket_tl]
+            report['pocket'] = dict(
+                pocket_rep, leftover=len(leftover), stable_inband=True)
+            aspect_p_in = ASPECT_MIN - 1e-3 <= aspect_p <= ASPECT_MAX + 1e-3
+            if not leftover:
+                return _pocket_done('main_pocket_pack_stable', [])
+            # Fall through to shelf with e42993f leftover set.
 
         # If every movable fitted in a pocket but the frame is still tall/narrow,
         # peel the largest pocketed tiles onto an east shelf so width can catch up
@@ -1530,12 +1610,12 @@ def nudge_frontier_escher(data, model, previous_anchors=None, skip_edges=(),
                           gem_path=None):
     """Pull free content-bbox tip glyphs inward when post-routing gates allow.
 
-    Runs after the final orthogonal pass. Each candidate is scored against the
-    original pre-nudge baseline (limits do not accumulate). Cheap area / overlap /
-    aspect / crossing checks reject before re-routing; surviving trials re-route
-    only reactions that touch moved nodes. Curated-structure and ``--previous``
-    pins stay fixed. Tip step is one primary-glyph diameter; the face band is
-    one marker radius (glyph disk touching the bbox face).
+    Runs after curated Bezier routing (stable-v1 path). Each candidate is scored
+    against the original pre-nudge baseline (limits do not accumulate). Cheap
+    area / overlap / aspect / crossing checks reject before re-routing; surviving
+    trials re-route only reactions that touch moved nodes. Curated-structure and
+    ``--previous`` pins stay fixed. Tip step is one primary-glyph diameter; the
+    face band is one marker radius (glyph disk touching the bbox face).
     """
     import copy as _copy
     import edge_style
@@ -1613,8 +1693,10 @@ def nudge_frontier_escher(data, model, previous_anchors=None, skip_edges=(),
                 rejected += 1
                 continue
             only = _reactions_touching(tbody, move)
+            # Bezier re-route (stable curated style) — orthogonal tip trials left
+            # stair-step bends without packing/avoidance reason.
             edge_style.apply(
-                trial, skip, mode='orthogonal', only=only or None,
+                trial, skip, mode='bezier', only=only or None,
                 gem_path=gem_path, pathway=pathway)
             gate1 = measure_tip(trial, pathway=pathway)
             if not tip_ev.evaluate(trial, metrics=gate1).accepted:
@@ -2415,18 +2497,23 @@ def compact_long_arms_scene(model, scene, cur, max_arm=ARM_MAX, target=ARM_TARGE
     return scene, report
 
 
-def tuck_islands_escher(data, cur=None, spacing=None):
+def tuck_islands_escher(data, cur=None, spacing=None, blocks=None):
     """Pull spatially floating reaction islands flush with the dense main hull.
 
     Runs on the finished Escher map (after squeeze / corridor) so later geometry
     passes cannot reopen the empty corridors that scene-level tuck closed.
     Gap is the minimum point-to-hull distance (not component centres). Translation
     only; Bezier ``b1``/``b2`` shift with their reaction.
+
+    ``blocks`` with ``same_map_rigid``: those reactions stay put (absolute row /
+    column relatives from the curated source map). Only non-rigid floaters tuck.
     """
     from core import CURRENCY
     cur = set(cur or ()) | set(CURRENCY)
     body = data[1]
     nodes, reactions = body['nodes'], body['reactions']
+    rigid_rx = {rid for b in (blocks or []) if b.get('same_map_rigid')
+                for rid in (b.get('reaction_ids') or [])}
     parent = {}
 
     def find(a):
@@ -2570,7 +2657,11 @@ def tuck_islands_escher(data, cur=None, spacing=None):
     # so CYTBD/NADH/O2t tuck as one rigid body. Never join a far floater to a
     # near island: min-gap over the union would drop below thresh and skip the
     # whole group (e_coli glucose/ETC sitting across an AABB void next to FBA).
-    islands = list(rows[1:])
+    # Skip same_map_rigid islands — absolute_rigid bake already placed them on
+    # hand-drawn rows/columns; sliding each currency-split piece independently
+    # is what erased module grid alignment on the speed branch.
+    islands = [m for m in rows[1:]
+               if not (rigid_rx and any(rid in rigid_rx for rid in m))]
     island_pts_cache = []
     island_gaps = []
     for members in islands:
