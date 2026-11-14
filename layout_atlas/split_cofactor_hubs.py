@@ -42,6 +42,9 @@ _FALLBACK_ROTATIONS = (
     -135.0,
     180.0,
 )
+# Cap length-preserving clone radius so a hub that already sits on an exploded
+# spoke cannot mint another module-scale spoke (iIT341 packing regression after #33).
+CLONE_RADIUS_CAP = 220.0
 
 
 def _midmarker(nodes, rx):
@@ -62,13 +65,22 @@ def _next_id(nodes):
     return str(max(nums) + 1 if nums else 1)
 
 
-def _clone_stub(nodes, glyph, mid, angle_deg):
-    """Place a length-preserving clone of ``glyph`` rotated about ``mid``."""
+def _clone_stub(nodes, glyph, mid, angle_deg, radius_cap=None):
+    """Place a clone of ``glyph`` rotated about ``mid``.
+
+    Default keeps the mid→glyph distance. When ``radius_cap`` is set and the
+    spoke is longer, the clone is pulled in so fallback angles cannot re-emit
+    module-scale spokes on an already-exploded map.
+    """
     mx, my = float(nodes[mid]["x"]), float(nodes[mid]["y"])
     hx, hy = float(nodes[glyph]["x"]), float(nodes[glyph]["y"])
     ang = math.radians(angle_deg)
     ca, sa = math.cos(ang), math.sin(ang)
     dx, dy = hx - mx, hy - my
+    dist = math.hypot(dx, dy)
+    if radius_cap is not None and dist > float(radius_cap) and dist > 1e-9:
+        scale = float(radius_cap) / dist
+        dx, dy = dx * scale, dy * scale
     rx_, ry_ = ca * dx - sa * dy, sa * dx + ca * dy
     nid = _next_id(nodes)
     nodes[nid] = dict(nodes[glyph])
@@ -200,7 +212,7 @@ def _record_split_clones(data, clone_ids):
     meta["hub_split_clones"] = prior
 
 
-def _split_movers(map_json, metabolite, movers, glyph, angle_deg):
+def _split_movers(map_json, metabolite, movers, glyph, angle_deg, radius_cap=None):
     data = copy.deepcopy(map_json)
     nodes = data[1]["nodes"]
     reactions = data[1]["reactions"]
@@ -216,7 +228,7 @@ def _split_movers(map_json, metabolite, movers, glyph, angle_deg):
         mid = _midmarker(nodes, rx)
         if mid is None:
             continue
-        nid = _clone_stub(nodes, glyph, mid, angle_deg)
+        nid = _clone_stub(nodes, glyph, mid, angle_deg, radius_cap=radius_cap)
         _retarget(rx, glyph, nid)
         clone_ids.append(nid)
         split.append(
@@ -300,36 +312,60 @@ def apply_gated(map_json, model, pathway, curated=(), cur=None, log=None):
             old_stubs = _old_stub_pairs(current, movers, glyph)
             old_graph_stubs = stub_endpoints(pathway, current, old_stubs)
             old_stub_x = before_index.stub_crossing_count(old_graph_stubs)
-            placed = False
-            for angle in angles:
-                trial, splits, new_stubs = _split_movers(
-                    current, met, movers, glyph, angle
-                )
-                if not splits:
-                    break
-                after = score_trial(
-                    pathway,
-                    current,
-                    trial,
-                    old_stubs,
-                    new_stubs,
-                    before_index=before_index,
-                    old_stub_crossings=old_stub_x,
-                )
-                if (
-                    after is None
-                    or not metrics_not_worse(original_score, after, HUB_DIRS, METRIC_EPS)
-                    or not metrics_not_worse(current_score, after, HUB_DIRS, METRIC_EPS)
-                ):
+            # Uncapped first (preserves local spoke length). If the hub already sits
+            # on a far spoke, retry with CLONE_RADIUS_CAP so splits stay local.
+            glyph_node = current[1]["nodes"].get(glyph) or {}
+            mid0 = None
+            for rid0 in movers:
+                key0 = rid_to_key.get(rid0)
+                if key0 is None:
                     continue
-                current = trial
-                current_score = after
-                g0, pos0, routes0 = drawing_graph(pathway, current)
-                before_index = CrossingIndex(g0.to_undirected(), pos0, routes0)
-                accepted_splits.extend(splits)
-                placed = True
-                progressed = True
-                break
+                mid0 = _midmarker(current[1]["nodes"], current[1]["reactions"][key0])
+                if mid0 is not None:
+                    break
+            spoke = 0.0
+            if mid0 is not None and "x" in glyph_node:
+                mn = current[1]["nodes"][mid0]
+                spoke = math.hypot(
+                    float(glyph_node["x"]) - float(mn["x"]),
+                    float(glyph_node["y"]) - float(mn["y"]),
+                )
+            cap_passes = [None]
+            if spoke > CLONE_RADIUS_CAP:
+                cap_passes.append(CLONE_RADIUS_CAP)
+            placed = False
+            for radius_cap in cap_passes:
+                for angle in angles:
+                    trial, splits, new_stubs = _split_movers(
+                        current, met, movers, glyph, angle, radius_cap=radius_cap
+                    )
+                    if not splits:
+                        break
+                    after = score_trial(
+                        pathway,
+                        current,
+                        trial,
+                        old_stubs,
+                        new_stubs,
+                        before_index=before_index,
+                        old_stub_crossings=old_stub_x,
+                    )
+                    if (
+                        after is None
+                        or not metrics_not_worse(original_score, after, HUB_DIRS, METRIC_EPS)
+                        or not metrics_not_worse(current_score, after, HUB_DIRS, METRIC_EPS)
+                    ):
+                        continue
+                    current = trial
+                    current_score = after
+                    g0, pos0, routes0 = drawing_graph(pathway, current)
+                    before_index = CrossingIndex(g0.to_undirected(), pos0, routes0)
+                    accepted_splits.extend(splits)
+                    placed = True
+                    progressed = True
+                    break
+                if placed:
+                    break
             if not placed:
                 round_rejected += 1
         rejected = round_rejected

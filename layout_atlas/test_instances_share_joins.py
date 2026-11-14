@@ -88,6 +88,44 @@ def test_optimize_keeps_bridging_share_and_clones_non_bridge():
     assert rep['bridge_local'] >= 1
 
 
+def test_optimize_peels_far_bridge_joins_to_local():
+    """A topologically bridging share that sits beyond FAR must still get a local inst:.
+
+    Regression for iIT341 after #33: bridge-only share left edges_over_1000 ≫ 0.
+    """
+    model = {
+        'reactions': [
+            {'id': 'RA', 'metabolites': {'P_c': -1, 'X_c': 1}},
+            {'id': 'RB', 'metabolites': {'Q_c': -1, 'X_c': 1}},
+        ],
+        'metabolites': [],
+    }
+    # RB is otherwise separate (bridge) but 5000 px from m:X — must peel locally.
+    scene = _scene(
+        {
+            'r:RA': [0.0, 0.0],
+            'r:RB': [5000.0, 0.0],
+            'm:P_c': [10.0, 50.0],
+            'm:Q_c': [5010.0, 50.0],
+            'm:X_c': [50.0, 0.0],
+        },
+        {
+            ('RA', 'P_c'): 'm:P_c', ('RA', 'X_c'): 'm:X_c',
+            ('RB', 'Q_c'): 'm:Q_c', ('RB', 'X_c'): 'm:X_c',
+        },
+    )
+    out, rep = I.optimize(model, copy.deepcopy(scene), blocks=[], cur=set(), summary=False)
+    assert out['participants'][('RA', 'X_c')] == 'm:X_c'
+    rb_key = out['participants'][('RB', 'X_c')]
+    assert str(rb_key).startswith('inst:'), rb_key
+    rb_xy = out['positions'][rb_key]
+    # Local stub sits beside RB, not on the distant shared glyph.
+    assert abs(rb_xy[0] - 5000.0) < 80.0
+    # May peel via long_edge_split and/or bridge_local; either clears the spoke.
+    assert out['instance_reasons'].get(rb_key) in ('bridge_local', 'long_edge_split')
+    assert rep['edges_over_1000']['after'] == 0
+
+
 def test_optimize_clones_when_all_users_already_connected():
     # Within NEAR: proximity would keep both on m:X; bridge peels the non-spanning one.
     model = {

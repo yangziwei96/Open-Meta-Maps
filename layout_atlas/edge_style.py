@@ -965,9 +965,23 @@ def _prepare_algorithm_spokes_for_restyle(data, reaction_ids, skip_edges, only_m
                     break
                 cur = nxt[0][1]['to_node_id']
             if nodes.get(cur, {}).get('node_type') != 'metabolite':
+                # Incomplete algo corridor (no met) — drop the dangling multimarkers.
                 continue
             met = nodes[cur].get('bigg_id')
             if (rid, met) in skip:
+                # Keep the whole preserved corridor (do NOT drop it).  A bare
+                # ``continue`` left es_* chains out of ``keep`` and severed
+                # curated spokes (e_coli MDH→mal__L_c broke the TCA ring).
+                keep[key] = s
+                c2 = to
+                while nodes.get(c2, {}).get('node_type') == 'multimarker':
+                    drop_nodes.discard(c2)
+                    nxt = out.get(c2)
+                    if not nxt:
+                        break
+                    for k2, s2 in nxt:
+                        keep[k2] = s2
+                    c2 = nxt[0][1]['to_node_id']
                 continue
             if only_mets is not None and met not in only_mets:
                 # Keep the existing corridor chain intact.
@@ -1016,86 +1030,437 @@ def _prepare_algorithm_spokes_for_restyle(data, reaction_ids, skip_edges, only_m
     return n_reset
 
 
-def _nudge_through_obstacles(data, skip_edges=None, max_nudge=48.0):
+def _nudge_through_obstacles(data, skip_edges=None, max_nudge=48.0, log=None,
+                             crossing_index=None, max_tries=64, max_rounds=1):
     """Small perpendicular nudges of glyphs that official pairs still pierce.
 
     Used after routing detours stall (clone-through / dense clusters). Moves the
     *through* metabolite glyph, not curated reaction midmarkers. Accepts only
     when official pairs fall and crossings do not rise.
+
+    Speed: mutate/restore (no deepcopy), official-count gate before any
+    ``CrossingIndex`` rebuild, first improving accept, 4 compass angles × 3
+    distances, ≤2 clone candidates per through-id, hard ``max_tries`` (Mac
+    e_coli previously burned 2000+ failed trials on residual pairs).
     """
-    import copy
+    from collections import Counter
 
     import layout_quality as lq
 
     skip = list(skip_edges) if skip_edges is not None else []
-    report = dict(tried=0, kept=0, nudged=[])
+    report = dict(tried=0, kept=0, nudged=[], cross_checks=0, capped=False)
     nodes = data[1]['nodes']
+    index = crossing_index if crossing_index is not None else lq.CrossingIndex(data, skip)
+    try_cap = max(8, int(max_tries or 64))
+    n_rounds = max(1, int(max_rounds or 1))
     # Pins: curated rigid structures — still allow tiny nudges of currency clones.
-    for _round in range(3):
+    for rnd in range(n_rounds):
+        if report['tried'] >= try_cap:
+            report['capped'] = True
+            break
         pairs = lq.official_lines_through_nodes_report(data, skip).get('pairs') or []
         if not pairs:
             break
         # Prefer same-bigg clone-through, then high-frequency through ids.
-        from collections import Counter
         through_hits = Counter(p['through'] for p in pairs if p.get('through'))
+        if log:
+            log(f"  clear through-nodes nudge round {rnd + 1}: residual_official={len(pairs)}")
         progressed = False
         for through_bigg, _n in through_hits.most_common():
-            # Candidate glyphs with this bigg_id.
+            if report['tried'] >= try_cap:
+                report['capped'] = True
+                break
             cands = [
                 nid for nid, n in nodes.items()
                 if n.get('node_type') == 'metabolite' and n.get('bigg_id') == through_bigg
             ]
             if not cands:
                 continue
+            # Currency clones explode the cartesian product — keep two glyphs.
+            if len(cands) > 2:
+                # Prefer non-primary (often the clone sitting on a chord).
+                cands = sorted(
+                    cands,
+                    key=lambda nid: (
+                        1 if nodes[nid].get('node_is_primary', True) else 0,
+                        float(nodes[nid].get('x') or 0.0),
+                        float(nodes[nid].get('y') or 0.0),
+                        nid,
+                    ),
+                )[:2]
             live_off = lq.official_lines_through_nodes_count(data, skip)
-            live_cross = int(lq.CrossingIndex(data, skip).headline())
-            # Nudge each candidate along a few axes.
+            live_cross = int(index.headline())
+            if live_off <= 0:
+                break
             for nid in cands:
+                if report['tried'] >= try_cap:
+                    report['capped'] = True
+                    break
                 n0 = nodes[nid]
                 x0, y0 = float(n0['x']), float(n0['y'])
                 lx0 = n0.get('label_x')
                 ly0 = n0.get('label_y')
-                best = None
-                for dist in (12.0, 20.0, 28.0, 36.0, max_nudge):
-                    for ang_i in range(12):
-                        ang = ang_i * (math.pi / 6)
+
+                def _restore():
+                    n0['x'], n0['y'] = x0, y0
+                    if lx0 is not None:
+                        n0['label_x'], n0['label_y'] = lx0, ly0
+
+                accepted = False
+                # Dense grid when residual is small (finish →0); coarse grid otherwise
+                # so the shared try budget is not wasted on hopeless mid-clear states.
+                residual_n = len(pairs)
+                dists = (12.0, 20.0, 28.0, 36.0, max_nudge) if residual_n <= 10 else (16.0, 32.0, max_nudge)
+                n_ang = 8 if residual_n <= 10 else 4
+                ang_step = math.pi / 4 if n_ang == 8 else math.pi / 2
+                for dist in dists:
+                    for ang_i in range(n_ang):
+                        if report['tried'] >= try_cap:
+                            report['capped'] = True
+                            break
+                        ang = ang_i * ang_step
                         dx, dy = dist * math.cos(ang), dist * math.sin(ang)
-                        trial = copy.deepcopy(data)
-                        tn = trial[1]['nodes'][nid]
-                        tn['x'], tn['y'] = round(x0 + dx, 2), round(y0 + dy, 2)
+                        n0['x'], n0['y'] = round(x0 + dx, 2), round(y0 + dy, 2)
                         if lx0 is not None:
-                            tn['label_x'] = round(float(lx0) + dx, 2)
-                            tn['label_y'] = round(float(ly0) + dy, 2)
-                        after_off = lq.official_lines_through_nodes_count(trial, skip)
-                        after_cross = int(lq.CrossingIndex(trial, skip).headline())
+                            n0['label_x'] = round(float(lx0) + dx, 2)
+                            n0['label_y'] = round(float(ly0) + dy, 2)
+                        after_off = lq.official_lines_through_nodes_count(data, skip)
                         report['tried'] += 1
-                        drop = live_off - after_off
-                        if drop > 0 and after_cross <= live_cross:
-                            score = (drop, -after_cross, -dist)
-                            if best is None or score > best[0]:
-                                best = (score, trial, dist, ang_i)
-                if best is not None:
-                    _, trial, dist, ang_i = best
-                    data[0], data[1] = trial[0], trial[1]
-                    nodes = data[1]['nodes']
-                    report['kept'] += 1
-                    report['nudged'].append(dict(node=nid, bigg=through_bigg, dist=dist))
-                    progressed = True
+                        if after_off >= live_off:
+                            _restore()
+                            continue
+                        # Official improved — only then pay for CrossingIndex.
+                        index.rebuild(data)
+                        after_cross = int(index.headline())
+                        report['cross_checks'] += 1
+                        if after_cross <= live_cross:
+                            report['kept'] += 1
+                            report['nudged'].append(dict(node=nid, bigg=through_bigg, dist=dist))
+                            accepted = True
+                            progressed = True
+                            break
+                        _restore()
+                        index.rebuild(data)
+                    if accepted or report['capped']:
+                        break
+                if not accepted:
+                    _restore()
+                if accepted:
                     break
-            if progressed:
+            if progressed or report['capped']:
                 break
         if not progressed:
             break
     return report
 
 
-def clear_through_nodes(data, skip_edges=None, log=None, mode=None, gem_path=None):
+def _reaction_mid_and_rx(data, rid):
+    body = data[1]
+    nodes = body.get('nodes') or {}
+    rx = next(
+        (r for r in (body.get('reactions') or {}).values() if r.get('bigg_id') == rid),
+        None,
+    )
+    if rx is None:
+        return None, None, nodes
+    mid = next(
+        (s['from_node_id'] for s in (rx.get('segments') or {}).values()
+         if nodes.get(s['from_node_id'], {}).get('node_type') == 'midmarker'),
+        None,
+    )
+    return rx, mid, nodes
+
+
+def _reaction_reaches_metabolite(data, rid, met_bigg):
+    """True when reaction ``rid`` midmarker still has a segment path to ``met_bigg``."""
+    from collections import defaultdict
+
+    rx, mid, nodes = _reaction_mid_and_rx(data, rid)
+    if rx is None or mid is None:
+        return False
+    targets = {
+        nid for nid, n in nodes.items()
+        if n.get('node_type') == 'metabolite' and n.get('bigg_id') == met_bigg
+    }
+    if not targets:
+        return False
+    adj = defaultdict(list)
+    for s in (rx.get('segments') or {}).values():
+        adj[s['from_node_id']].append(s['to_node_id'])
+        adj[s['to_node_id']].append(s['from_node_id'])
+    seen = {mid}
+    stack = [mid]
+    while stack:
+        u = stack.pop()
+        if u in targets:
+            return True
+        for v in adj[u]:
+            if v not in seen:
+                seen.add(v)
+                stack.append(v)
+    return False
+
+
+def _force_straight_preserved_spoke(data, rid, met_bigg, max_dist=800.0):
+    """Add a numeric mid→met segment using existing glyph positions (template geometry).
+
+    Used when clear_through / prepare deleted a preserved spoke without leaving a
+    dangling multimarker chain (so ``repair_missing_preserved_spokes`` cannot see it).
+    """
+    rx, mid, nodes = _reaction_mid_and_rx(data, rid)
+    if rx is None or mid is None:
+        return None
+    if _reaction_reaches_metabolite(data, rid, met_bigg):
+        return None
+    cands = [
+        nid for nid, n in nodes.items()
+        if n.get('node_type') == 'metabolite' and n.get('bigg_id') == met_bigg
+    ]
+    if not cands:
+        return None
+    mx, my = float(nodes[mid]['x']), float(nodes[mid]['y'])
+    met_id = min(
+        cands,
+        key=lambda nid: (float(nodes[nid]['x']) - mx) ** 2 + (float(nodes[nid]['y']) - my) ** 2,
+    )
+    dist = math.hypot(float(nodes[met_id]['x']) - mx, float(nodes[met_id]['y']) - my)
+    if dist > max_dist:
+        return None
+    used_ids = set()
+    for r2 in (data[1].get('reactions') or {}).values():
+        for k in (r2.get('segments') or {}):
+            if str(k).isdigit():
+                used_ids.add(int(k))
+    seg_i = (max(used_ids) + 1) if used_ids else 900000
+    while seg_i in used_ids:
+        seg_i += 1
+    seg_key = str(seg_i)
+    rx.setdefault('segments', {})[seg_key] = dict(
+        from_node_id=mid, to_node_id=met_id, b1=None, b2=None,
+    )
+    return {'reaction': rid, 'metabolite': met_bigg, 'mid': mid,
+            'met_node': met_id, 'dist': round(dist, 1), 'segment': seg_key}
+
+
+def repair_missing_preserved_spokes(data, skip_edges=None, gate_official=True):
+    """Reconnect preserved spokes left as incomplete multimarker detours.
+
+    Only fires when a reaction mid has a dangling ``es_*``/``route``/… chain that
+    never reaches a metabolite — the clear_through failure mode that opened the
+    e_coli TCA ring (MDH→mal__L_c). Each dangling chain reconnects at most one
+    preserved metabolite (nearest unreachable mid-local target). When
+    ``gate_official`` is True (default), each candidate spoke is accepted only if
+    official through-node count does not rise — so PGK-style chord inventions do
+    not wipe a good MDH→mal heal in the same pass.
+    """
+    from collections import defaultdict
+
+    import layout_quality as lq
+
+    skip = list(skip_edges) if skip_edges is not None else list(
+        ((data[0] or {}).get('metadata') or {}).get('preserved_edges') or []
+    )
+    preserved_by_rx = defaultdict(set)
+    for edge in skip:
+        if isinstance(edge, (list, tuple)) and len(edge) >= 2:
+            preserved_by_rx[edge[0]].add(edge[1])
+    body = data[1]
+    nodes = body.get('nodes') or {}
+    repaired = []
+    rejected = []
+    off_live = lq.official_lines_through_nodes_count(data, skip) if gate_official else None
+    for rx in (body.get('reactions') or {}).values():
+        rid = rx.get('bigg_id') or ''
+        if rid not in preserved_by_rx:
+            continue
+        mid = next(
+            (s['from_node_id'] for s in (rx.get('segments') or {}).values()
+             if nodes.get(s['from_node_id'], {}).get('node_type') == 'midmarker'),
+            None,
+        )
+        if mid is None:
+            continue
+        out = defaultdict(list)
+        for key, s in (rx.get('segments') or {}).items():
+            out[s['from_node_id']].append((key, s))
+        # Incomplete algo corridors from mid → (keys, nodes, tip_id).
+        dangling_chains = []
+        for key, s in list((rx.get('segments') or {}).items()):
+            if s['from_node_id'] != mid:
+                continue
+            algo = (
+                str(key).startswith('es_s') or str(key).startswith('route')
+                or str(key).startswith('qg') or str(key).startswith('hr')
+            )
+            if not algo:
+                continue
+            to = s['to_node_id']
+            if nodes.get(to, {}).get('node_type') != 'multimarker':
+                continue
+            cur = to
+            chain_keys = {key}
+            chain_nodes = set()
+            tip = to
+            while nodes.get(cur, {}).get('node_type') == 'multimarker':
+                chain_nodes.add(cur)
+                tip = cur
+                nxt = out.get(cur)
+                if not nxt:
+                    break
+                chain_keys.add(nxt[0][0])
+                cur = nxt[0][1]['to_node_id']
+            if nodes.get(cur, {}).get('node_type') == 'metabolite':
+                continue
+            dangling_chains.append((chain_keys, chain_nodes, tip))
+
+        def _reaches(met_bigg, adj):
+            targets = {nid for nid, n in nodes.items()
+                       if n.get('node_type') == 'metabolite' and n.get('bigg_id') == met_bigg}
+            if not targets:
+                return True
+            seen = {mid}
+            stack = [mid]
+            while stack:
+                u = stack.pop()
+                if u in targets:
+                    return True
+                for v in adj[u]:
+                    if v not in seen:
+                        seen.add(v)
+                        stack.append(v)
+            return False
+
+        mx, my = float(nodes[mid]['x']), float(nodes[mid]['y'])
+        claimed = set()
+        for chain_keys, chain_nodes, tip in dangling_chains:
+            adj = defaultdict(list)
+            for key, s in (rx.get('segments') or {}).items():
+                if key in chain_keys:
+                    continue
+                adj[s['from_node_id']].append(s['to_node_id'])
+                adj[s['to_node_id']].append(s['from_node_id'])
+            tip_x, tip_y = float(nodes[tip]['x']), float(nodes[tip]['y'])
+            cands_meta = []
+            for met in sorted(preserved_by_rx[rid]):
+                if met in claimed:
+                    continue
+                if _reaches(met, adj):
+                    continue
+                cands = [nid for nid, n in nodes.items()
+                         if n.get('node_type') == 'metabolite' and n.get('bigg_id') == met]
+                if not cands:
+                    continue
+                met_id = min(
+                    cands,
+                    key=lambda nid: (float(nodes[nid]['x']) - mx) ** 2
+                    + (float(nodes[nid]['y']) - my) ** 2,
+                )
+                mid_dist = math.hypot(
+                    float(nodes[met_id]['x']) - mx, float(nodes[met_id]['y']) - my,
+                )
+                if mid_dist > 800.0:
+                    continue
+                tip_dist = math.hypot(
+                    float(nodes[met_id]['x']) - tip_x, float(nodes[met_id]['y']) - tip_y,
+                )
+                cands_meta.append((tip_dist, mid_dist, met, met_id))
+            if not cands_meta:
+                # Orphan dangling corridor — drop without inventing a spoke.
+                for key in chain_keys:
+                    rx['segments'].pop(key, None)
+                for nn in chain_nodes:
+                    used = any(
+                        nn in (s['from_node_id'], s['to_node_id'])
+                        for s in (rx.get('segments') or {}).values()
+                    )
+                    if not used:
+                        nodes.pop(nn, None)
+                continue
+            near_tip = [c for c in cands_meta if c[0] <= 400.0]
+            best = min(near_tip) if near_tip else min(cands_meta, key=lambda c: (c[1], c[0], c[2]))
+            _tip_d, mid_dist, met, met_id = best
+            # Escher schema segment keys must match ``[0-9]+`` (unanchored, so
+            # ``es_s``/``clr`` pass via embedded digits; bare ``preserve_`` does not).
+            used_ids = set()
+            for r2 in (body.get('reactions') or {}).values():
+                for k in (r2.get('segments') or {}):
+                    if str(k).isdigit():
+                        used_ids.add(int(k))
+            seg_i = (max(used_ids) + 1) if used_ids else 900000
+            while seg_i in used_ids:
+                seg_i += 1
+            seg_key = str(seg_i)
+            # Snapshot for official gate.
+            old_segs = {k: dict(s) for k, s in (rx.get('segments') or {}).items() if k in chain_keys}
+            old_nodes = {nn: dict(nodes[nn]) for nn in chain_nodes if nn in nodes}
+            for key in chain_keys:
+                rx['segments'].pop(key, None)
+            for nn in chain_nodes:
+                used = any(
+                    nn in (s['from_node_id'], s['to_node_id'])
+                    for s in (rx.get('segments') or {}).values()
+                )
+                if not used:
+                    nodes.pop(nn, None)
+            rx.setdefault('segments', {})[seg_key] = dict(
+                from_node_id=mid, to_node_id=met_id, b1=None, b2=None,
+            )
+            detail = {'reaction': rid, 'metabolite': met, 'mid': mid,
+                      'met_node': met_id, 'dist': round(mid_dist, 1),
+                      'segment': seg_key}
+            if gate_official:
+                off_new = lq.official_lines_through_nodes_count(data, skip)
+                if off_new > (off_live or 0):
+                    # Revert this spoke; keep dangling dropped (incomplete corridor gone).
+                    rx['segments'].pop(seg_key, None)
+                    for k, s in old_segs.items():
+                        rx['segments'][k] = s
+                    for nn, nd in old_nodes.items():
+                        nodes[nn] = nd
+                    rejected.append(dict(detail, reason='official_regression'))
+                    continue
+                off_live = off_new
+            claimed.add(met)
+            repaired.append(detail)
+        # Preserved pairs with no path and no dangling chain (spoke fully deleted).
+        for met in sorted(preserved_by_rx[rid]):
+            if met in claimed:
+                continue
+            if _reaction_reaches_metabolite(data, rid, met):
+                continue
+            forced = _force_straight_preserved_spoke(data, rid, met)
+            if not forced:
+                continue
+            if gate_official:
+                off_new = lq.official_lines_through_nodes_count(data, skip)
+                if off_new > (off_live or 0):
+                    # Undo the forced spoke.
+                    rx['segments'].pop(forced['segment'], None)
+                    rejected.append(dict(forced, reason='official_regression'))
+                    continue
+                off_live = off_new
+            claimed.add(met)
+            repaired.append(forced)
+    return dict(repaired=len(repaired), details=repaired, rejected=rejected)
+
+
+def clear_through_nodes(data, skip_edges=None, log=None, mode=None, gem_path=None,
+                        max_rounds=4, max_edge_tries=None, max_nudge_tries=96,
+                        max_seconds=None):
     """Re-style algorithm edges that still hit foreign glyphs (official pairs first).
 
     Greedy per-(reaction, metabolite): reset only that spoke, restyle with
     ``official_clear`` (Escher-sized obstacles + multimarker detours), keep the
     edge when official pairs fall and crossings do not rise more than a small
     trade budget. Does not scale the canvas or split the map.
+
+    Speed / budget (hotspot-style, reproducible — **not** wall-clock):
+    - ``max_edge_tries``: surgical trial ceiling (default from official mass).
+    - ``max_nudge_tries``: shared nudge trial ceiling across rounds (Mac tip
+      burned 2000+ nudge trials on one bezier clear).
+    - ``max_rounds`` + idle stop when a round keeps nothing (no official drop).
+    - ``CrossingIndex`` reused; trial crossings skipped when official did not fall.
+    ``max_seconds`` is accepted for API compat but **ignored** as a stop condition.
     """
     import copy
     import time
@@ -1107,22 +1472,25 @@ def clear_through_nodes(data, skip_edges=None, log=None, mode=None, gem_path=Non
     skip = list(skip_edges) if skip_edges is not None else list(
         (data[0].get('metadata') or {}).get('preserved_edges') or []
     )
-    before = lq.curves_through_nodes_report(data, skip)
-    before_off = lq.official_lines_through_nodes_report(data, skip)
-    before_cross = int(lq.CrossingIndex(data, skip).headline())
-    edge_hits = Counter(
-        (p['reaction'], p['metabolite'])
-        for p in before_off.get('pairs') or []
-        if p.get('reaction') and p.get('metabolite')
-    )
-    # Fall back to OMM hit reactions (all spokes) when official is already clean.
-    target_rids = list(before_off['reactions']) or list(before['reactions'])
+    nudge_cap = max(8, int(max_nudge_tries or 64))
+    # max_seconds retained for call-site compat only — never a runtime stop.
+    _ = max_seconds
+
+    # Official count first (cheap): post-hotspot / post-orthogonal / post-tip clears
+    # often arrive already at 0 — skip CrossingIndex, OMM curves, and deepcopies
+    # (stacked multi-minute compose after #38/#39).
+    off0 = lq.official_lines_through_nodes_count(data, skip)
+    # Try ceiling from official mass (like hotspot's window-mass tries), not time.
+    if max_edge_tries is None:
+        edge_cap = int(min(120, max(48, int(off0) + 24)))
+    else:
+        edge_cap = max(8, int(max_edge_tries))
     report = dict(
         enabled=True,
-        before=before['count'],
-        before_official=before_off['count'],
-        before_crossings=before_cross,
-        reactions=list(target_rids),
+        before=None,
+        before_official=off0,
+        before_crossings=None,
+        reactions=[],
         accepted=False,
         mode=mode or 'bezier',
         seconds=0.0,
@@ -1130,12 +1498,64 @@ def clear_through_nodes(data, skip_edges=None, log=None, mode=None, gem_path=Non
         edges_kept=0,
         reset_spokes=0,
         nudge=None,
+        preserved_repair=None,
+        budget_edge_tries=edge_cap,
+        budget_nudge_tries=nudge_cap,
+        capped=False,
     )
-    if (before_off['count'] <= 0 and before['count'] <= 0) or not target_rids:
+    if off0 <= 0:
+        report['before'] = None
+        report['after'] = None
+        report['after_official'] = 0
+        report['after_crossings'] = None
+        report['reason'] = 'official_clean'
+        report['preserved_repair_post'] = dict(repaired=0, details=[], skipped='official_clean')
+        report['seconds'] = round(time.time() - t0, 2)
+        return report
+
+    # Heal dangling template corridors only when official pairs still exist and
+    # the heal does not reopen through-nodes (MDH→mal / TCA ring).
+    snap0, snap1 = copy.deepcopy(data[0]), copy.deepcopy(data[1])
+    pre_repair = repair_missing_preserved_spokes(data, skip)
+    if pre_repair.get('repaired'):
+        off1 = lq.official_lines_through_nodes_count(data, skip)
+        if off1 > off0:
+            data[0], data[1] = snap0, snap1
+            pre_repair = dict(repaired=0, details=[], reverted='official_regression',
+                              attempted=pre_repair.get('details') or [])
+    before_off = lq.official_lines_through_nodes_report(data, skip)
+    report['before_official'] = before_off['count']
+    report['reactions'] = list(before_off.get('reactions') or [])
+    report['preserved_repair'] = pre_repair
+    if before_off['count'] <= 0:
+        report['before'] = None
+        report['after'] = None
+        report['after_official'] = 0
+        report['after_crossings'] = None
+        report['reason'] = 'official_clean'
+        report['preserved_repair_post'] = dict(repaired=0, details=[], skipped='official_clean_after_repair')
+        report['seconds'] = round(time.time() - t0, 2)
+        return report
+
+    before = lq.curves_through_nodes_report(data, skip)
+    index = lq.CrossingIndex(data, skip)
+    before_cross = int(index.headline())
+    edge_hits = Counter(
+        (p['reaction'], p['metabolite'])
+        for p in before_off.get('pairs') or []
+        if p.get('reaction') and p.get('metabolite')
+    )
+    # Fall back to OMM hit reactions (all spokes) when official is already clean.
+    target_rids = list(before_off['reactions']) or list(before['reactions'])
+    report['before'] = before['count']
+    report['before_crossings'] = before_cross
+    report['reactions'] = list(target_rids)
+    if not target_rids:
         report['reason'] = 'clean'
         report['after'] = before['count']
         report['after_official'] = before_off['count']
         report['after_crossings'] = before_cross
+        report['preserved_repair_post'] = repair_missing_preserved_spokes(data, skip)
         report['seconds'] = round(time.time() - t0, 2)
         return report
 
@@ -1145,10 +1565,16 @@ def clear_through_nodes(data, skip_edges=None, log=None, mode=None, gem_path=Non
         # Include preserved/source_path edges: routing-only (multimarker detours,
         # no node relocation). Nodes stay put — curated residual through-pairs
         # otherwise permanently hard-fail the official rule (example: ~44/66).
-        # Multiple rounds: first pass clears easy chords; later rounds + nudge
-        # finish clone-through residuals (need ≤4 official pairs for hard points).
+        # Budgets are try counts + idle rounds (hotspot-style), never wall-clock.
         skip_set = {tuple(e) for e in skip}
-        for _round in range(4):
+        n_rounds = max(1, int(max_rounds if max_rounds is not None else 4))
+        nudge_left = nudge_cap
+        report['nudge'] = {'tried': 0, 'kept': 0, 'cross_checks': 0, 'capped': False}
+        report['max_rounds'] = n_rounds
+        for rnd in range(n_rounds):
+            if report['edges_tried'] >= edge_cap:
+                report['capped'] = True
+                break
             live_pairs = lq.official_lines_through_nodes_report(data, skip)
             if live_pairs['count'] <= 0:
                 break
@@ -1160,9 +1586,20 @@ def clear_through_nodes(data, skip_edges=None, log=None, mode=None, gem_path=Non
             if not round_hits:
                 break
             round_kept = 0
+            off_round_start = live_pairs['count']
+            if log:
+                log(
+                    f"  clear through-nodes: round {rnd + 1}/{n_rounds} "
+                    f"residual_official={live_pairs['count']} "
+                    f"edge_tries={report['edges_tried']}/{edge_cap} "
+                    f"nudge_left={nudge_left}"
+                )
             for (rid, met), _n in round_hits.most_common():
+                if report['edges_tried'] >= edge_cap:
+                    report['capped'] = True
+                    break
                 live_off = lq.official_lines_through_nodes_count(data, skip)
-                live_cross = int(lq.CrossingIndex(data, skip).headline())
+                live_cross = int(index.headline())
                 if live_off <= 0:
                     break
                 preserved = (rid, met) in skip_set
@@ -1182,30 +1619,53 @@ def clear_through_nodes(data, skip_edges=None, log=None, mode=None, gem_path=Non
                     for k in ('bezier', 'corridor', 'relocated', 'materialized', 'degraded'):
                         if k in style:
                             style_acc[k] += int(style.get(k) or 0)
+                # Preserved template claim: never accept a restyle that severs
+                # mid→met (e_coli MDH→mal__L_c opened the TCA ring while official
+                # still dropped). Heal to straight mid→met at existing glyph
+                # positions; reject the trial if still unreachable.
+                if preserved and not _reaction_reaches_metabolite(trial, rid, met):
+                    repair_missing_preserved_spokes(trial, skip, gate_official=False)
+                    if not _reaction_reaches_metabolite(trial, rid, met):
+                        _force_straight_preserved_spoke(trial, rid, met)
+                    if not _reaction_reaches_metabolite(trial, rid, met):
+                        report['edges_tried'] += 1
+                        continue
                 after_off = lq.official_lines_through_nodes_count(trial, skip)
-                after_cross = int(lq.CrossingIndex(trial, skip).headline())
                 report['edges_tried'] += 1
                 official_drop = live_off - after_off
+                # Skip CrossingIndex rebuild when official did not improve.
+                if official_drop <= 0:
+                    continue
+                after_cross = int(lq.CrossingIndex(trial, skip).headline())
                 cross_delta = after_cross - live_cross
                 cross_ok = cross_delta <= 0 or (official_drop >= 1 and cross_delta <= 1)
                 # Preserved: also forbid any glyph move (relocated must stay 0).
                 reloc_ok = (not preserved) or int((style or {}).get('relocated') or 0) == 0
-                if official_drop > 0 and cross_ok and reloc_ok:
+                path_ok = (not preserved) or _reaction_reaches_metabolite(trial, rid, met)
+                if official_drop > 0 and cross_ok and reloc_ok and path_ok:
                     data[0], data[1] = trial[0], trial[1]
+                    index.rebuild(data)
                     report['edges_kept'] += 1
                     round_kept += 1
-            # Nudge after each routing round while residuals remain.
-            if lq.official_lines_through_nodes_count(data, skip) > 0:
-                nudge = _nudge_through_obstacles(data, skip)
-                if report.get('nudge') is None:
-                    report['nudge'] = {'tried': 0, 'kept': 0}
-                report['nudge']['tried'] = int(report['nudge'].get('tried', 0)) + int(nudge.get('tried', 0))
-                report['nudge']['kept'] = int(report['nudge'].get('kept', 0)) + int(nudge.get('kept', 0))
+            # Shared try-budget nudge between surgical rounds (unlocks residuals).
+            if nudge_left > 0 and lq.official_lines_through_nodes_count(data, skip) > 0:
+                nudge = _nudge_through_obstacles(
+                    data, skip, log=log, crossing_index=index,
+                    max_tries=nudge_left, max_rounds=1,
+                )
+                for k in ('tried', 'kept', 'cross_checks'):
+                    report['nudge'][k] = int(report['nudge'].get(k, 0)) + int(nudge.get(k, 0))
+                report['nudge']['capped'] = bool(
+                    report['nudge'].get('capped') or nudge.get('capped'))
+                nudge_left = max(0, nudge_left - int(nudge.get('tried') or 0))
                 if nudge.get('kept'):
                     report['edges_kept'] += int(nudge['kept'])
                     style_acc['nudged'] = int(style_acc.get('nudged', 0)) + int(nudge['kept'])
                     round_kept += int(nudge['kept'])
-            if round_kept == 0:
+                    index.rebuild(data)
+            # Idle stop on no keeps or no official progress (hotspot-style).
+            off_round_end = lq.official_lines_through_nodes_count(data, skip)
+            if round_kept == 0 or off_round_end >= off_round_start:
                 break
     else:
         # OMM-only residual: previous whole-reaction restyle (small maps / gallery).
@@ -1229,6 +1689,15 @@ def clear_through_nodes(data, skip_edges=None, log=None, mode=None, gem_path=Non
             report['edges_kept'] = 1
         report['edges_tried'] = 1
 
+    # Heal preserved spokes after surgical detours; revert if official regresses.
+    off_before_repair = lq.official_lines_through_nodes_count(data, skip)
+    snap0, snap1 = copy.deepcopy(data[0]), copy.deepcopy(data[1])
+    post = repair_missing_preserved_spokes(data, skip)
+    if post.get('repaired') and lq.official_lines_through_nodes_count(data, skip) > off_before_repair:
+        data[0], data[1] = snap0, snap1
+        post = dict(repaired=0, details=[], reverted='official_regression',
+                    attempted=post.get('details') or [])
+    report['preserved_repair_post'] = post
     after = lq.curves_through_nodes_report(data, skip)
     after_off = lq.official_lines_through_nodes_report(data, skip)
     after_cross = int(lq.CrossingIndex(data, skip).headline())
@@ -1241,7 +1710,10 @@ def clear_through_nodes(data, skip_edges=None, log=None, mode=None, gem_path=Non
     report['cross_delta'] = int(after_cross - before_cross)
     ok = report['edges_kept'] > 0 and after_off['count'] <= before_off['count']
     report['accepted'] = bool(ok)
-    report['reason'] = 'accepted' if ok else 'no_improvement'
+    if report.get('capped') and after_off['count'] > 0:
+        report['reason'] = 'try_budget_capped'
+    else:
+        report['reason'] = 'accepted' if ok else 'no_improvement'
     report['seconds'] = round(time.time() - t0, 2)
     if log:
         log(
@@ -1251,6 +1723,8 @@ def clear_through_nodes(data, skip_edges=None, log=None, mode=None, gem_path=Non
             f"crossings {before_cross}->{after_cross} "
             f"kept {report['edges_kept']}/{report['edges_tried']} "
             f"nudge={report.get('nudge')} "
-            f"({'kept' if ok else 'reverted'}) {report['seconds']}s"
+            f"repair={report.get('preserved_repair_post', {}).get('repaired', 0)} "
+            f"capped={report.get('capped')} "
+            f"({'kept' if ok else report['reason']}) {report['seconds']}s"
         )
     return report

@@ -446,6 +446,16 @@ def structure_local(model, scene, blocks, cur, reasons=None):
                 _detach_protected(scene, rid, mid)
                 parts[rid, mid] = key
             ok, _why, pc_after = _side_consistency_ok(model, scene, pc_base)
+            # Far foreign / shared attachments: prefer a local tuck over keeping a spoke.
+            if not ok:
+                old_d = []
+                for rid, old in members:
+                    if old and old in pos and ('r:' + rid) in pos:
+                        old_d.append(float(np.hypot(*(
+                            np.array(pos['r:' + rid], float) - np.array(pos[old], float)))))
+                if old_d and float(np.mean(old_d)) > FAR:
+                    ok = True
+                    pc_after = pc_base
             if not ok:
                 for rid, old in prev_parts.items():
                     if old is None:
@@ -616,6 +626,11 @@ def optimize(model, scene, blocks, cur, summary=True, reuse=True, split=True):
                 for r in members:
                     parts[r, mid] = best
                 ok, _why, pc_after = _side_consistency_ok(model, scene, pc_base)
+                # Side-consistency must not preserve spokes beyond FAR.
+                far_group = float(np.min(np.hypot(*(mp - here).T))) > FAR
+                if not ok and far_group:
+                    ok = True
+                    pc_after = pc_base
                 if not ok:
                     for r, old in prev_parts.items():
                         if old is None:
@@ -673,6 +688,9 @@ def optimize(model, scene, blocks, cur, summary=True, reuse=True, split=True):
                     for rid, _ in members:
                         parts[rid, mid] = key
                     ok, _why, pc_after = _side_consistency_ok(model, scene, pc_base)
+                    if not ok and mean_d > FAR:
+                        ok = True
+                        pc_after = pc_base
                     if not ok:
                         for rid, old in prev_parts.items():
                             if old is None:
@@ -720,6 +738,15 @@ def optimize(model, scene, blocks, cur, summary=True, reuse=True, split=True):
 
         ordered = sorted(holders, key=_join_priority)
         joins = share_joins(model, parts, mid, cur, ordered)
+        # Topology may mark a far reaction as a bridge, but a module-scale spoke
+        # is still a packing failure (iIT341 after #33: >1000 edges stayed high).
+        # Keep shared geometry only when the reaction sits within FAR of the glyph.
+        near_joins = set()
+        for rid in joins:
+            rp = np.array(pos.get('r:' + rid, here), float)
+            if float(np.hypot(*(rp - here))) <= FAR:
+                near_joins.add(rid)
+        joins = near_joins
         bridge_shared += len(joins)
         non = [rid for rid in ordered if rid not in joins]
         if not non:
