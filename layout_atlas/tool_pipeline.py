@@ -915,8 +915,13 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
         metric['edge_style'] = dict(edge_style.apply(data, skip_edges), seconds=round(time.time() - t_style, 1))
         if log:
                 log(f"  curated-style connections: {metric['edge_style']}")
-        # Early clear with try/round caps (Mac tip unbounded nudge was the hang).
-        if os.environ.get('OPM_CLEAR_THROUGH', 'on') != 'off':
+        # Early clear only on small maps. iIT341 starts with ~800 official pairs;
+        # a try-capped surgical pass still costs minutes per round. Final clear
+        # after island owns residuals on mid/large GEMs.
+        if (
+            os.environ.get('OPM_CLEAR_THROUGH', 'on') != 'off'
+            and len(model['reactions']) < 200
+        ):
             metric['clear_through_nodes'] = edge_style.clear_through_nodes(
                 data, skip_edges, log=log, mode='bezier',
                 max_rounds=5, max_edge_tries=160, max_nudge_tries=128)
@@ -1242,11 +1247,17 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
         # Single final clear (try/round caps — never wall-clock). Bezier
         # official_clear (not orthogonal) is what drove tip gate15 70→0; ortho
         # mode barely moves the count. Runs even when island did not move.
+        # Mid/large: smaller try ceilings so iIT341 cannot burn minutes/pair.
         if os.environ.get('OPM_CLEAR_THROUGH', 'on') != 'off':
             import edge_style as _es_isl
+            n_rx_clear = len(model['reactions'])
+            if n_rx_clear < 200:
+                _rounds, _edges, _nudge = 4, 120, 96
+            else:
+                _rounds, _edges, _nudge = 2, 48, 32
             metric['clear_through_nodes_final'] = _es_isl.clear_through_nodes(
                 data, skip_edges, log=log, mode='bezier',
-                max_rounds=4, max_edge_tries=120, max_nudge_tries=96)
+                max_rounds=_rounds, max_edge_tries=_edges, max_nudge_tries=_nudge)
             dump(output_names.map_json(folder), data)
             dump(folder / 'map.json', data)
     # Final --previous step: rigidly translate each curated structure toward previous
