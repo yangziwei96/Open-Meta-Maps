@@ -1064,12 +1064,9 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                 _es_post.apply(data, skip_edges), seconds=round(time.time() - t_style2, 1))
             if log:
                 log(f"  curated-style connections (post-restore): {metric['edge_style_post_restore']}")
-            if os.environ.get('OPM_CLEAR_THROUGH', 'on') != 'off':
-                # Sole mid-pipeline clear. Budgets are try counts (like hotspot),
-                # not wall-clock — Mac tip burned 2057 nudge trials / 105s.
-                metric['clear_through_nodes_post_restore'] = _es_post.clear_through_nodes(
-                    data, skip_edges, log=log, max_rounds=4,
-                    max_edge_tries=120, max_nudge_tries=128)
+            # No mid clear here: post-restore geometry is not final (hotspot /
+            # orthogonal / island still move nodes). One try-capped clear after
+            # island owns through→0 without stacking 3× surgical passes.
             dump(output_names.map_json(folder), data)
         # Hotspot repair AFTER rigid restore + overlap clear + squeeze + corridor
         # so accepted moves are not undone by absolute snap / padding slides.
@@ -1081,9 +1078,9 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                      reactions=list(b['reaction_ids']))
                 for b in blocks if len(b.get('reaction_ids') or []) >= 2]
             data[0].setdefault('metadata', {})['expert_structures'] = curated_structures_early
-            # Near stable-v1 hotspot cost (~8.8s e_coli); avoid post-#38 try inflation.
+            # Near stable-v1 hotspot (~8.8s e_coli / 465 tries): keep try scale small.
             n_rx = len(model['reactions'])
-            hs_budget = 10.0 if n_rx < 200 else 18.0
+            hs_budget = 9.0 if n_rx < 200 else 16.0
             hs_k = 5 if n_rx < 200 else 6
             # Mass-scaled try ceiling from budget_s (no wall-clock). Do not pass
             # PREVIOUS_ANCHORS as pinned_keys here: mid-pipeline --previous pins are
@@ -1091,7 +1088,7 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             # stay identical to the no-previous drawing.
             metric['hotspot_repair'] = hotspot_repair.repair(
                 data, model=model, scene=scene, blocks=blocks, skip_edges=skip_edges, log=log,
-                structures=curated_structures_early, k=hs_k, max_accepts=12,
+                structures=curated_structures_early, k=hs_k, max_accepts=8,
                 budget_s=hs_budget, max_rounds=4)
             if log:
                 hr = metric['hotspot_repair']
@@ -1165,13 +1162,6 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             seconds=round(time.time() - t_orth, 1))
         if log:
             log(f"  orthogonal algorithm routes (final): {metric['edge_style_orthogonal']}")
-        # Orthogonal rewrite can reintroduce through-node hits; clear with try
-        # caps (early-out when already 0 — never unbounded nudge).
-        if os.environ.get('OPM_CLEAR_THROUGH', 'on') != 'off':
-            metric['clear_through_nodes_post_orthogonal'] = _es_final.clear_through_nodes(
-                data, skip_edges, log=log, mode='orthogonal',
-                gem_path=str(gem_file) if gem_file else None,
-                max_rounds=3, max_edge_tries=64, max_nudge_tries=64)
         dump(folder / 'map.json', data)
     # Late per-reaction currency clones for Pathway-Scorer-style hubs (layout gate).
     # Runs after orthogonal multimarkers exist so the gate scores the same polylines
@@ -1255,18 +1245,16 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                     f"max_gap={cor2.get('max_gap')} min_len={cor2.get('min_len')}")
                 dump(output_names.map_json(folder), data)
                 dump(folder / 'map.json', data)
-            # Node translations can reintroduce official through-pairs; clear with
-            # extra rounds — soft-corridor tuck can leave a thicker residual set.
-            if os.environ.get('OPM_CLEAR_THROUGH', 'on') != 'off':
-                import edge_style as _es_isl
-                # Final clear after floater tuck (may reintroduce through pairs).
-                # Nudge try-cap keeps Mac from 2000+ trial hangs; rounds aim at →0.
-                metric['clear_through_nodes_post_island_tuck'] = _es_isl.clear_through_nodes(
-                    data, skip_edges, log=log, mode='orthogonal',
-                    gem_path=str(gem_file) if gem_file else None,
-                    max_rounds=4, max_edge_tries=96, max_nudge_tries=128)
-                dump(output_names.map_json(folder), data)
-                dump(folder / 'map.json', data)
+        # Single final clear (try/round caps — never wall-clock). Runs even when
+        # island did not move so through→0 is not gated on floater motion.
+        if os.environ.get('OPM_CLEAR_THROUGH', 'on') != 'off':
+            import edge_style as _es_isl
+            metric['clear_through_nodes_post_island_tuck'] = _es_isl.clear_through_nodes(
+                data, skip_edges, log=log, mode='orthogonal',
+                gem_path=str(gem_file) if gem_file else None,
+                max_rounds=5, max_edge_tries=140, max_nudge_tries=160)
+            dump(output_names.map_json(folder), data)
+            dump(folder / 'map.json', data)
     # Final --previous step: rigidly translate each curated structure toward previous
     # anchors.  Internal relatives stay identical to the no-previous drawing.
     # Do not clear overlaps afterwards — that pass can nudge duplicate rigid glyphs
