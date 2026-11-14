@@ -1254,7 +1254,7 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             import edge_style as _es_isl
             metric['clear_through_nodes_final'] = _es_isl.clear_through_nodes(
                 data, skip_edges, log=log, mode='bezier',
-                max_rounds=3, max_edge_tries=96, max_nudge_tries=72)
+                max_rounds=3, max_edge_tries=96, max_nudge_tries=64)
             dump(output_names.map_json(folder), data)
             dump(folder / 'map.json', data)
     # Final --previous step: rigidly translate each curated structure toward previous
