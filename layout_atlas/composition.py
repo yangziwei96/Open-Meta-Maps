@@ -727,21 +727,15 @@ def compose(model, scene, blocks, cur):
     scene, island_rep = tuck_islands_to_silhouette(
         model, scene, blocks, cur, spacing=spacing)
     report['island_tuck'] = island_rep
-    n_rx = len(model['reactions'])
-    if n_rx >= 200:
-        # Landscape reflow pocket-packs / near_kept leftovers can widen the
-        # canvas on mid/large GEMs vs stable-v1; keep silhouette tuck only.
-        report['landscape_reflow'] = dict(skipped='n_rx>=200_packing_gate')
-    else:
-        # Final landscape reflow: translation-only skyline of rigid visual components so the
-        # content bbox lands in 4:3–16:9 even when related-pulls left a tall column.
-        scene, reflow = reflow_landscape(model, scene, blocks, cur)
-        report['landscape_reflow'] = reflow
-        # Reflow may re-pocket/flush; one more silhouette tuck for anything still gapped.
-        scene, island_rep2 = tuck_islands_to_silhouette(
-            model, scene, blocks, cur, spacing=spacing)
-        if island_rep2.get('moved'):
-            report['island_tuck_after_reflow'] = island_rep2
+    # Final landscape reflow: translation-only skyline of rigid visual components so the
+    # content bbox lands in 4:3–16:9 even when related-pulls left a tall column.
+    scene, reflow = reflow_landscape(model, scene, blocks, cur)
+    report['landscape_reflow'] = reflow
+    # Reflow may re-pocket/flush; one more silhouette tuck for anything still gapped.
+    scene, island_rep2 = tuck_islands_to_silhouette(
+        model, scene, blocks, cur, spacing=spacing)
+    if island_rep2.get('moved'):
+        report['island_tuck_after_reflow'] = island_rep2
     scene['composition'] = report
     return scene, report
 
