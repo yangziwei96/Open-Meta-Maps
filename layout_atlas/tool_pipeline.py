@@ -1217,46 +1217,49 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                 dump(output_names.map_json(folder), data)
     # Last geometry pass: tuck floating islands flush with the dense main hull so
     # empty AABB voids (e_coli TR/top floaters) do not survive into the PNG.
+    # Mid/large: skip final island tuck — iIT341 burned ~120s here and blew blank
+    # / canvas height vs stable (0.54 blank, ~6.8k H vs 0.20 / 5.0k).
     if LAYOUT_STYLE == 'curated' and not PREVIOUS_SKIP_PACK:
-        import composition as _comp_isl
-        spacing_isl = _comp_isl.reaction_spacing_escher(data)
-        island = _comp_isl.tuck_islands_escher(
-            data, cur=currency(model), spacing=spacing_isl)
-        metric['island_tuck_escher'] = island
-        if composition_report is not None:
-            composition_report['island_tuck_escher'] = island
-        if log and island.get('moved'):
-            log(f"  island silhouette tuck (escher, final): moved {island['moved']}/"
-                f"{island.get('candidates', 0)} gap_thresh={island.get('gap_thresh')}")
-        if island.get('moved'):
-            fit_isl = _comp_isl.fit_canvas_to_content(data)
-            metric['canvas_fit_after_island_tuck'] = fit_isl
-            dump(output_names.map_json(folder), data)
-            dump(folder / 'map.json', data)
-            # Transport arms (FUMt2/MALt2) may still be long after rigid restore;
-            # re-run empty-corridor with TCA-core freeze before through-clear.
-            spacing_cor = _comp_isl.reaction_spacing_escher(data)
-            cor2 = _comp_isl.compact_empty_corridors_escher(data, spacing=spacing_cor)
-            metric['empty_corridor_escher_post_island'] = cor2
+        if len(model['reactions']) >= 200:
+            metric['island_tuck_escher'] = dict(skipped='n_rx>=200_packing_gate')
+            if log:
+                log('  island silhouette tuck (escher, final): skipped (n_rx>=200 packing gate)')
+        else:
+            import composition as _comp_isl
+            spacing_isl = _comp_isl.reaction_spacing_escher(data)
+            island = _comp_isl.tuck_islands_escher(
+                data, cur=currency(model), spacing=spacing_isl)
+            metric['island_tuck_escher'] = island
             if composition_report is not None:
-                composition_report['empty_corridor_escher_post_island'] = cor2
-            if log and cor2.get('shortened'):
-                log(f"  empty-corridor compact (post-island): shortened {cor2['shortened']} "
-                    f"max_gap={cor2.get('max_gap')} min_len={cor2.get('min_len')}")
+                composition_report['island_tuck_escher'] = island
+            if log and island.get('moved'):
+                log(f"  island silhouette tuck (escher, final): moved {island['moved']}/"
+                    f"{island.get('candidates', 0)} gap_thresh={island.get('gap_thresh')}")
+            if island.get('moved'):
+                fit_isl = _comp_isl.fit_canvas_to_content(data)
+                metric['canvas_fit_after_island_tuck'] = fit_isl
                 dump(output_names.map_json(folder), data)
                 dump(folder / 'map.json', data)
-        # Final clear only on small maps (stable had no clear_through). iIT341
-        # residual sets are ~1000 official pairs — even 48 try-capped trials stall.
-        if (
-            os.environ.get('OPM_CLEAR_THROUGH', 'on') != 'off'
-            and len(model['reactions']) < 200
-        ):
-            import edge_style as _es_isl
-            metric['clear_through_nodes_final'] = _es_isl.clear_through_nodes(
-                data, skip_edges, log=log, mode='bezier',
-                max_rounds=3, max_edge_tries=96, max_nudge_tries=64)
-            dump(output_names.map_json(folder), data)
-            dump(folder / 'map.json', data)
+                # Transport arms (FUMt2/MALt2) may still be long after rigid restore;
+                # re-run empty-corridor with TCA-core freeze before through-clear.
+                spacing_cor = _comp_isl.reaction_spacing_escher(data)
+                cor2 = _comp_isl.compact_empty_corridors_escher(data, spacing=spacing_cor)
+                metric['empty_corridor_escher_post_island'] = cor2
+                if composition_report is not None:
+                    composition_report['empty_corridor_escher_post_island'] = cor2
+                if log and cor2.get('shortened'):
+                    log(f"  empty-corridor compact (post-island): shortened {cor2['shortened']} "
+                        f"max_gap={cor2.get('max_gap')} min_len={cor2.get('min_len')}")
+                    dump(output_names.map_json(folder), data)
+                    dump(folder / 'map.json', data)
+            # Final clear only on small maps (stable had no clear_through).
+            if os.environ.get('OPM_CLEAR_THROUGH', 'on') != 'off':
+                import edge_style as _es_isl
+                metric['clear_through_nodes_final'] = _es_isl.clear_through_nodes(
+                    data, skip_edges, log=log, mode='bezier',
+                    max_rounds=3, max_edge_tries=96, max_nudge_tries=64)
+                dump(output_names.map_json(folder), data)
+                dump(folder / 'map.json', data)
     # Final --previous step: rigidly translate each curated structure toward previous
     # anchors.  Internal relatives stay identical to the no-previous drawing.
     # Do not clear overlaps afterwards — that pass can nudge duplicate rigid glyphs
