@@ -915,10 +915,11 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
         metric['edge_style'] = dict(edge_style.apply(data, skip_edges), seconds=round(time.time() - t_style, 1))
         if log:
                 log(f"  curated-style connections: {metric['edge_style']}")
-        # Skip early clear_through: post-restore edge_style reintroduces through
-        # pairs (gate15: 70→0 then 49 again), so the first bezier clear (~26–105s
-        # on Mac with unbounded nudge) is pure wall-time waste vs stable-v1 ~65s.
-        # Later clears (post-restore / post-orthogonal / post-island) own through→0.
+        # Early clear with try/round caps (Mac tip unbounded nudge was the hang).
+        if os.environ.get('OPM_CLEAR_THROUGH', 'on') != 'off':
+            metric['clear_through_nodes'] = edge_style.clear_through_nodes(
+                data, skip_edges, log=log, mode='bezier',
+                max_rounds=5, max_edge_tries=160, max_nudge_tries=128)
         import label_placement
         t_labels = time.time()
         metric['label_placement'] = dict(label_placement.optimize(data), seconds=round(time.time() - t_labels, 1))
@@ -1060,13 +1061,10 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
         if len(model['reactions']) < 200:
             import edge_style as _es_post
             t_style2 = time.time()
-            metric['edge_style_post_restore'] = dict(
-                _es_post.apply(data, skip_edges), seconds=round(time.time() - t_style2, 1))
-            if log:
-                log(f"  curated-style connections (post-restore): {metric['edge_style_post_restore']}")
-            # No mid clear here: post-restore geometry is not final (hotspot /
-            # orthogonal / island still move nodes). One try-capped clear after
-            # island owns through→0 without stacking 3× surgical passes.
+            # Skip full post-restore restyle: it reintroduced ~50 official through
+            # pairs after an early clear (gate15). Absolute snap already updated
+            # glyph xy; Beziers stay until the final try-capped clear.
+            metric['edge_style_post_restore'] = dict(skipped='avoid_through_reintro')
             dump(output_names.map_json(folder), data)
         # Hotspot repair AFTER rigid restore + overlap clear + squeeze + corridor
         # so accepted moves are not undone by absolute snap / padding slides.
@@ -1078,14 +1076,10 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                      reactions=list(b['reaction_ids']))
                 for b in blocks if len(b.get('reaction_ids') or []) >= 2]
             data[0].setdefault('metadata', {})['expert_structures'] = curated_structures_early
-            # Near stable-v1 hotspot (~8.8s e_coli / 465 tries): keep try scale small.
+            # Near stable-v1 hotspot (~8.8s e_coli): budget_s only scales tries.
             n_rx = len(model['reactions'])
             hs_budget = 9.0 if n_rx < 200 else 16.0
             hs_k = 5 if n_rx < 200 else 6
-            # Mass-scaled try ceiling from budget_s (no wall-clock). Do not pass
-            # PREVIOUS_ANCHORS as pinned_keys here: mid-pipeline --previous pins are
-            # deferred to the final rigid structure translate so curated relatives
-            # stay identical to the no-previous drawing.
             metric['hotspot_repair'] = hotspot_repair.repair(
                 data, model=model, scene=scene, blocks=blocks, skip_edges=skip_edges, log=log,
                 structures=curated_structures_early, k=hs_k, max_accepts=8,
@@ -1252,7 +1246,7 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             import edge_style as _es_isl
             metric['clear_through_nodes_final'] = _es_isl.clear_through_nodes(
                 data, skip_edges, log=log, mode='bezier',
-                max_rounds=4, max_edge_tries=120, max_nudge_tries=128)
+                max_rounds=4, max_edge_tries=120, max_nudge_tries=96)
             dump(output_names.map_json(folder), data)
             dump(folder / 'map.json', data)
     # Final --previous step: rigidly translate each curated structure toward previous
