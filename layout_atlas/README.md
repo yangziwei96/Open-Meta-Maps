@@ -12,7 +12,7 @@ This directory is the Python package behind Open Meta Maps. It builds a metaboli
 | `python3 project.py setup` | one-time build of the edge routers (needs `g++` or `clang++`, see below) |
 | `python3 project.py catalog` | rebuild the module catalog pages from the Atlas |
 
-A run writes `map.json` (Escher), `map.svg`, `report.json`, `reaction_provenance.json`, `layout_issues.json`, `licenses.json`, `skeleton.json` and `modules.json` into the output folder. `reaction_provenance.json` labels every reaction as curated (community layout), topology-only suggestion, functional (EC) suggestion, bridge or generated. Report curated, topology-only and EC suggestions as separate rates.
+A run writes `OpenMetaMaps_<name>_result.json` (Escher), matching `.svg` / `.sbgn` / `.sbml` / `.celldesigner.xml`, plus `report.json`, `reaction_provenance.json`, `layout_issues.json`, `licenses.json`, `skeleton.json` and `modules.json` into the output folder (`<name>` is the model file stem). `reaction_provenance.json` labels every reaction as curated (community layout), topology-only suggestion, functional (EC) suggestion, bridge or generated. Report curated, topology-only and EC suggestions as separate rates.
 
 ## Pipeline and main modules
 
@@ -24,7 +24,7 @@ A run writes `map.json` (Escher), `map.svg`, `report.json`, `reaction_provenance
 | Context and anchors for unmatched reactions | `context.py`, `completion_context.py`, `instances.py` (metabolite instances and protected shared connections), `orientation.py` |
 | Whole-map composition | `composition.py` (recovers stray components, arranges independent modules in rows), `peripheral.py` (exchange and transport modules), `block_relocation.py` (moves curated blocks that sit far from the reactions they connect to) |
 | Connections and labels | `edge_style.py` (Bézier connections from curated templates, joint routing per reaction), `reaction_templates.py`, `label_placement.py`, `line_render.py`, `routing.py` (libavoid) |
-| Local repair | `hotspot_repair.py` (post-layout pass: top-k crossing windows via shared `CrossingIndex`, incremental delta recount + window-scaled search budget; default on) |
+| Local repair | `hotspot_repair.py` (post-layout pass: worst_regions windows via shared `CrossingIndex`, incremental delta recount; accept/round caps from window crossing mass, stop after an idle pass; default on) |
 | Quality | `layout_quality.py` (final-geometry for the quality gate: curve crossings, overlaps, …), `quality_gate.py` (accepts a change only if the final geometry is not worse), `evaluation/` (layout-benchmark metrics + the same final-geometry block; CLI `python3 project.py evaluate`) |
 | Pages | `ui.py`, `navigation.py`, `gallery*.py` (tool UI is the committed `results/tool/index.html`) |
 

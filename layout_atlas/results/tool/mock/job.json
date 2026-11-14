@@ -47,6 +47,8 @@
    "reactions": 95,
    "metabolites": 72
   },
+  "result_stem": "e_coli_core",
+  "result_basename": "OpenMetaMaps_e_coli_core_result",
   "annotation_coverage": {
    "bigg": 1.0,
    "rhea": 0.72,
@@ -105,7 +107,7 @@
    "bytes": 2300
   },
   {
-   "name": "map.svg",
+   "name": "OpenMetaMaps_e_coli_core_result.svg",
    "title_en": "Completed map (SVG)",
    "kind": "svg",
    "bytes": 2600

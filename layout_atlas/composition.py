@@ -856,11 +856,16 @@ def reflow_landscape(model, scene, blocks, cur):
         base = max(math.sqrt(max(area * ar, 1.0)), widest)
         for scale in (0.7, 0.85, 1.0, 1.2):
             width_trials.append(max(base * scale, widest))
+    shelf_cache = {}
     a, b = widest, max(width_trials)
     for _ in range(10):
         mid = 0.5 * (a + b)
         width_trials.append(mid)
-        placed_try = skyline_pack(order, sizes, SHELF_GAP, mid, weights=w_use)
+        key = float(mid)
+        placed_try = shelf_cache.get(key)
+        if placed_try is None:
+            placed_try = skyline_pack(order, sizes, SHELF_GAP, key, weights=w_use)
+            shelf_cache[key] = placed_try
         bw, bh = skyline_extent(placed_try, sizes, SHELF_GAP)
         comb = (main_w + bw + g) / max(main_h, bh, 1.0)
         if comb < TARGET_ASPECT:
@@ -869,11 +874,15 @@ def reflow_landscape(model, scene, blocks, cur):
             b = mid
     seen = set()
     for tw in sorted(width_trials):
-        key = round(tw, 1)
-        if key in seen:
+        dedup = round(float(tw), 1)
+        if dedup in seen:
             continue
-        seen.add(key)
-        placed_try = skyline_pack(order, sizes, SHELF_GAP, tw, weights=w_use)
+        seen.add(dedup)
+        key = float(tw)
+        placed_try = shelf_cache.get(key)
+        if placed_try is None:
+            placed_try = skyline_pack(order, sizes, SHELF_GAP, key, weights=w_use)
+            shelf_cache[key] = placed_try
         bw, bh = skyline_extent(placed_try, sizes, SHELF_GAP)
         options = {
             'right': (mhi[0] + g, mlo[1], (main_w + bw + g) / max(main_h, bh, 1.0)),
@@ -1165,23 +1174,34 @@ def skyline_pack(order, sizes, gap, target_width, weights=None, link_cost=LINK_C
     Candidate x = 0 and every skyline segment start/end.  Compactness first (lowest y, then
     smallest x); when ``weights`` are given, among near-best compact slots prefer the one that
     shortens chemical links to already-placed partners (tile sits next to its strongest neighbour).
+    Neighbour-only link/cross scoring with AABB culling, branch-and-bound on (y, link), and
+    cached width trials.  Candidate x endpoints come from the append-only skyline strip list.
     """
     weights = weights or {}
-    skyline = []  # (x0, x1, height)
+    # Adjacency once: avoids O(n) ``_link_key`` scans inside every slot score.
+    nbrs = defaultdict(list)
+    for (a, b), wgt in weights.items():
+        w = float(wgt)
+        if w <= 0:
+            continue
+        nbrs[a].append((b, w))
+        nbrs[b].append((a, w))
+
+    skyline = []  # (x0, x1, height) — append-only candidate endpoints
     placed = {}
+    centres = {}
+    # Rects with gap padding for crossing tests, in placement order.
+    rect_ids = []
+    rects = {}
 
     def height_at(x0, x1):
         top = 0.0
         for a, b, h in skyline:
-            if a < x1 and x0 < b:
-                top = max(top, h)
+            if a < x1 and x0 < b and h > top:
+                top = h
         return top
 
-    def centre(name, xy):
-        w, h = sizes[name]
-        return (xy[0] + w / 2.0, xy[1] + h / 2.0)
-
-    # Prim-style order when links exist: seed with first of `order` (largest), then strongest link.
+    # Prim-style order: seed with first of `order` (largest), then strongest link.
     remaining = [m for m in order if m in sizes]
     if not remaining:
         return placed
@@ -1200,10 +1220,10 @@ def skyline_pack(order, sizes, gap, target_width, weights=None, link_cost=LINK_C
         w0, h0 = sizes[name]
         w, h = float(w0) + gap, float(h0) + gap
         cand = {0.0} | {a for a, _, _ in skyline} | {b for _, b, _ in skyline}
+        partners = [(p, wgt) for p, wgt in nbrs.get(name, ()) if p in placed]
         # Prefer slots flush with already-placed chemical partners (right / left-aligned).
-        for p, pxy in placed.items():
-            if weights.get(_link_key(name, p), 0.0) <= 0:
-                continue
+        for p, _wgt in partners:
+            pxy = placed[p]
             pw, _ph = sizes[p]
             cand.add(pxy[0])
             cand.add(pxy[0] + pw + gap)
@@ -1225,32 +1245,48 @@ def skyline_pack(order, sizes, gap, target_width, weights=None, link_cost=LINK_C
         if not compact:
             compact = scored
 
-        def slot_score(xy):
-            x, y = xy
-            # Primary: compactness.  Then chemical link length; among equal length, fewer
-            # centre-to-centre crossings through already-placed tiles.
-            link = 0.0
-            crosses = 0
-            cx, cy = centre(name, (x, y))
-            for p, pxy in placed.items():
-                wgt = weights.get(_link_key(name, p), 0.0)
-                if wgt <= 0:
+        if not partners:
+            # No chemical links → score is (y, 0, 0, x); pick lowest y then leftmost x.
+            best_x, best_y = min(compact, key=lambda xy: (xy[1], xy[0]))
+        else:
+            # Lexicographic score (y, link, cross, x). AABB-cull third-tile tests; evaluate
+            # in compact order and skip cross counts when (y, link) is already worse than the
+            # best full score — cannot change the winner.
+            best_sc = None
+            best_x = best_y = 0.0
+            for x, y in compact:
+                link = 0.0
+                cx = x + w0 / 2.0
+                cy = y + h0 / 2.0
+                for p, wgt in partners:
+                    px, py = centres[p]
+                    link += wgt * math.hypot(cx - px, cy - py)
+                link_term = link_cost * link
+                if best_sc is not None and (y, link_term) > best_sc[:2]:
                     continue
-                px, py = centre(p, pxy)
-                link += wgt * math.hypot(cx - px, cy - py)
-                # Segment (cx,cy)-(px,py) through a third placed tile?
-                for q, qxy in placed.items():
-                    if q == p:
-                        continue
-                    qw, qh = sizes[q]
-                    qx0, qy0 = qxy
-                    if _seg_hits_rect(cx, cy, px, py, qx0, qy0, qw + gap, qh + gap):
-                        crosses += 1
-                        break
-            return (y, link_cost * link, CROSS_COST * crosses, x)
+                crosses = 0
+                for p, wgt in partners:
+                    px, py = centres[p]
+                    minx, maxx = (cx, px) if cx <= px else (px, cx)
+                    miny, maxy = (cy, py) if cy <= py else (py, cy)
+                    for q in rect_ids:
+                        if q == p:
+                            continue
+                        qx0, qy0, qx1, qy1 = rects[q]
+                        if qx1 < minx or qx0 > maxx or qy1 < miny or qy0 > maxy:
+                            continue
+                        if _seg_hits_rect(cx, cy, px, py, qx0, qy0, qx1 - qx0, qy1 - qy0):
+                            crosses += 1
+                            break
+                sc = (y, link_term, CROSS_COST * crosses, x)
+                if best_sc is None or sc < best_sc:
+                    best_sc = sc
+                    best_x, best_y = x, y
 
-        best_x, best_y = min(compact, key=slot_score)
         placed[name] = (best_x, best_y)
+        centres[name] = (best_x + w0 / 2.0, best_y + h0 / 2.0)
+        rects[name] = (best_x, best_y, best_x + w0 + gap, best_y + h0 + gap)
+        rect_ids.append(name)
         skyline.append((best_x, best_x + w, best_y + h))
     return placed
 
@@ -1969,17 +2005,21 @@ def _pack_cross_cost(placed, sizes, gap, weights):
     for n, (x, y) in placed.items():
         w, h = sizes[n]
         centres[n] = (x + w / 2.0, y + h / 2.0)
-        rects[n] = (x, y, w + gap, h + gap)
+        rects[n] = (x, y, x + w + gap, y + h + gap)
     hits = 0
     for (a, b), wgt in weights.items():
         if a not in centres or b not in centres or wgt <= 0:
             continue
         ax, ay = centres[a]
         bx, by = centres[b]
-        for q, (rx, ry, rw, rh) in rects.items():
+        minx, maxx = (ax, bx) if ax <= bx else (bx, ax)
+        miny, maxy = (ay, by) if ay <= by else (by, ay)
+        for q, (qx0, qy0, qx1, qy1) in rects.items():
             if q == a or q == b:
                 continue
-            if _seg_hits_rect(ax, ay, bx, by, rx, ry, rw, rh):
+            if qx1 < minx or qx0 > maxx or qy1 < miny or qy0 > maxy:
+                continue
+            if _seg_hits_rect(ax, ay, bx, by, qx0, qy0, qx1 - qx0, qy1 - qy0):
                 hits += 1
                 break
     return hits
@@ -1996,6 +2036,18 @@ def pack_tiles_aspect(sizes, gap, weights, target_aspect=TARGET_ASPECT):
     widest = max(float(w) for w, h in sizes.values()) + gap
     area = sum((float(w) + gap) * (float(h) + gap) for w, h in sizes.values())
     order = sorted(sizes, key=lambda i: (-sizes[i][0] * sizes[i][1], str(i)))
+    # Cache packs by exact target width so binary-search probes are not recomputed.
+    pack_cache = {}
+
+    def pack_at(tw):
+        key = float(tw)
+        hit = pack_cache.get(key)
+        if hit is not None:
+            return hit
+        placed = skyline_pack(order, sizes, gap, key, weights=weights)
+        pack_cache[key] = placed
+        return placed
+
     # Search bracket: from a single column (widest) up to a wide landscape shelf.
     lo = widest
     hi = max(lo * 1.05, math.sqrt(max(area * ASPECT_MAX, 1.0)) * 1.6, math.sqrt(max(area * target_aspect, 1.0)) * 1.35)
@@ -2008,7 +2060,7 @@ def pack_tiles_aspect(sizes, gap, weights, target_aspect=TARGET_ASPECT):
     for _ in range(NODE_ASPECT_LOOPS):
         mid = 0.5 * (a + b)
         trials.append(mid)
-        placed = skyline_pack(order, sizes, gap, mid, weights=weights)
+        placed = pack_at(mid)
         bw, bh = skyline_extent(placed, sizes, gap)
         aspect = bw / max(bh, 1e-9)
         if aspect < target_aspect:
@@ -2061,7 +2113,7 @@ def pack_tiles_aspect(sizes, gap, weights, target_aspect=TARGET_ASPECT):
     hi_cap = max(widest * 4.0, seed_cap * 2.5)
     uniq = [tw for tw in uniq if tw <= hi_cap + 1e-9] or uniq[:1]
     for tw in uniq:
-        placed = skyline_pack(order, sizes, gap, tw, weights=weights)
+        placed = pack_at(tw)
         bw, bh = skyline_extent(placed, sizes, gap)
         aspect = bw / max(bh, 1e-9)
         placed, aspect, stretched = _stretch_to_band(placed, aspect)

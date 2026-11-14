@@ -38,6 +38,14 @@ def source_maps():
  with gzip.open(INPUTS/'map_observations.json.gz','rt') as f:return json.load(f)
 def chem(mid):return mid.split('@')[0] if '@' in mid else re.sub(r'_[a-z][0-9]?$','',mid)
 def comp(mid):return mid.split('@')[-1] if '@' in mid else (re.search(r'_([a-z][0-9]?)$',mid)[1] if re.search(r'_([a-z][0-9]?)$',mid) else 'unknown')
+
+def reaction_kind(reaction):
+ """Classify a GEM reaction as exchange, transport or metabolic."""
+ mets=list((reaction.get('metabolites') or {}))
+ if len(mets)==1:return 'exchange'
+ if len({comp(m) for m in mets})>1:return 'transport'
+ return 'metabolic'
+
 def xrefs(annotations):
  out=defaultdict(set)
  for a in annotations:

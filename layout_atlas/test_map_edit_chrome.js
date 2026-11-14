@@ -15,6 +15,16 @@ function almost(a, b, eps) {
   return Math.abs(a - b) <= (eps == null ? 0.6 : eps);
 }
 
+async function resultMapName(page, jobId) {
+  return page.evaluate(async (id) => {
+    const j = await (await fetch('/api/jobs/' + id)).json();
+    if (j.summary && j.summary.result_basename) return j.summary.result_basename + '.json';
+    const hit = (j.files || []).find((f) => /^OpenMetaMaps_.+_result\.json$/.test(f.name));
+    if (!hit) throw new Error('result map JSON not listed in job files');
+    return hit.name;
+  }, jobId);
+}
+
 async function nodeLabel(page, nid) {
   return page.evaluate((id) => {
     const c = window.OPM_SVG.querySelector('circle[data-n="' + CSS.escape(id) + '"]');
@@ -102,8 +112,9 @@ async function main() {
   });
   await page.waitForTimeout(400);
 
-  const before = await page.evaluate(async (id) => {
-    const r = await fetch('/api/jobs/' + id + '/files/map.json');
+  const mapName = await resultMapName(page, jobId);
+  const before = await page.evaluate(async ({id, mapName}) => {
+    const r = await fetch('/api/jobs/' + id + '/files/' + mapName);
     const j = await r.json();
     const nid = Object.keys(j[1].nodes).find(
       (k) => j[1].nodes[k].node_type === 'metabolite' && j[1].nodes[k].label_x != null
@@ -126,7 +137,7 @@ async function main() {
       originalLY: original ? original[1].nodes[nid].label_y : null,
       hadOriginal: !!original,
     };
-  }, jobId);
+  }, { id: jobId, mapName });
   if (!before.nid) throw new Error('no metabolite with label');
 
   await page.click('#pedit');
@@ -270,13 +281,13 @@ async function main() {
   await page.waitForFunction(() => !window.OPM_EDIT.isDirty(), null, { timeout: 600000 });
   await page.waitForTimeout(400);
 
-  const saved = await page.evaluate(async (id) => {
-    const r = await fetch('/api/jobs/' + id + '/files/map.json', { cache: 'no-store' });
+  const saved = await page.evaluate(async ({ id, mapName }) => {
+    const r = await fetch('/api/jobs/' + id + '/files/' + mapName, { cache: 'no-store' });
     return r.json();
-  }, jobId);
+  }, { id: jobId, mapName });
   const sn = saved[1].nodes[before.nid];
   if (almost(sn.x, before.x) && almost(sn.y, before.y)) {
-    throw new Error('saved map.json positions unchanged');
+    throw new Error('saved result map JSON positions unchanged');
   }
   // With lock on during last moves, relative offset should match current SVG
   const svgNow = await nodeLabel(page, before.nid);
@@ -334,10 +345,10 @@ async function main() {
     { timeout: 600000 }
   );
   await page.waitForTimeout(300);
-  const afterReset = await page.evaluate(async (id) => {
-    const r = await fetch('/api/jobs/' + id + '/files/map.json', { cache: 'no-store' });
+  const afterReset = await page.evaluate(async ({ id, mapName }) => {
+    const r = await fetch('/api/jobs/' + id + '/files/' + mapName, { cache: 'no-store' });
     return r.json();
-  }, jobId);
+  }, { id: jobId, mapName });
   const rn = afterReset[1].nodes[before.nid];
   const expectX = before.hadOriginal ? before.originalX : before.x;
   const expectY = before.hadOriginal ? before.originalY : before.y;

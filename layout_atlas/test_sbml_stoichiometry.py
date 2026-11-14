@@ -5,6 +5,7 @@ from pathlib import Path
 
 import compose_cli
 import model_io
+import output_names
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / 'tests'
@@ -16,7 +17,7 @@ def test_l2_stoichiometry_math_parse_and_compose(tmp_path):
     assert model['reactions'][0]['metabolites'] == {'A': -2.0, 'B': 1.0}
     assert 'E' not in model['reactions'][0]['metabolites']
     assert compose_cli.run(path, tmp_path / 'l2', no_library=True, source_paths=True) == 0
-    assert (tmp_path / 'l2' / 'map.json').is_file()
+    assert output_names.map_json(tmp_path / 'l2').is_file()
 
 
 def test_l3_missing_stoichiometry_parse_and_compose(tmp_path):
@@ -24,7 +25,7 @@ def test_l3_missing_stoichiometry_parse_and_compose(tmp_path):
     model = model_io.load_model(path)
     assert model['reactions'][0]['metabolites'] == {'A': -1.0, 'B': 1.0}
     assert compose_cli.run(path, tmp_path / 'l3_missing', no_library=True, source_paths=True) == 0
-    assert (tmp_path / 'l3_missing' / 'map.json').is_file()
+    assert output_names.map_json(tmp_path / 'l3_missing').is_file()
 
 
 def test_l3_assignment_rule_stoichiometry_parse_and_compose(tmp_path):
@@ -33,7 +34,7 @@ def test_l3_assignment_rule_stoichiometry_parse_and_compose(tmp_path):
     assert model['reactions'][0]['metabolites'] == {'A': -2.0, 'B': 1.0}
     assert 'E' not in model['reactions'][0]['metabolites']
     assert compose_cli.run(path, tmp_path / 'l3_rule', no_library=True, source_paths=True) == 0
-    assert (tmp_path / 'l3_rule' / 'map.json').is_file()
+    assert output_names.map_json(tmp_path / 'l3_rule').is_file()
 
 
 def test_unevaluable_variable_stoichiometry_defaults_to_one(tmp_path):

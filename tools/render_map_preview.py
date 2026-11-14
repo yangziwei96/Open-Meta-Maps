@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Crop an Open Meta Maps Escher map.json to a preview PNG.
+"""Crop an Open Meta Maps Escher result JSON to a preview PNG.
 
 White background, content-tight crop, every reaction and metabolite label
-of map.svg drawn. The default width keeps the smallest label at least
+of the result SVG drawn. The default width keeps the smallest label at least
 MIN_LABEL_PX tall; strokes are widened when they would drop below
 TARGET_STROKE px.
 
-  PYTHONPATH=layout_atlas python3 tools/render_map_preview.py map.json out.png
+  PYTHONPATH=layout_atlas python3 tools/render_map_preview.py OpenMetaMaps_<stem>_result.json out.png
 """
 from __future__ import annotations
 
@@ -144,7 +144,7 @@ def render_preview(map_path: Path, out_path: Path, width: int | None = None, max
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('map', type=Path, help='Escher map.json')
+    p.add_argument('map', type=Path, help='Escher OpenMetaMaps_<stem>_result.json')
     p.add_argument('out', type=Path, help='output PNG')
     p.add_argument('--width', type=int, default=None, help='output width in px (default: smallest label MIN_LABEL_PX tall)')
     p.add_argument('--max-bytes', type=int, default=MAX_BYTES)

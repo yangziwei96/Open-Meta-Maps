@@ -8,6 +8,7 @@ from pathlib import Path
 import jsonschema
 
 import map_edit
+import output_names
 import line_render
 
 
@@ -92,19 +93,25 @@ class TestMapEditSave(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix='omm_map_edit_'))
         self.map = _toy_map()
-        (self.tmp / 'map.json').write_text(json.dumps(self.map))
+        self.stem = 'toy'
+        self.map_name = output_names.result_filename(self.stem, 'json')
+        self.svg_name = output_names.result_filename(self.stem, 'svg')
+        output_names.write_meta(self.tmp, 'toy.xml', size=10)
+        (self.tmp / self.map_name).write_text(json.dumps(self.map))
         (self.tmp / 'job.json').write_text(json.dumps({
-            'id': 'j_testdummy1', 'status': 'done', 'summary': {'layout_quality': {}},
+            'id': 'j_testdummy1', 'status': 'done',
+            'summary': {'layout_quality': {}, 'result_stem': self.stem,
+                        'result_basename': output_names.result_basename(self.stem)},
             'files': [
-                {'name': 'map.json', 'bytes': 10, 'kind': 'json'},
-                {'name': 'map.svg', 'bytes': 10, 'kind': 'svg'},
+                {'name': self.map_name, 'bytes': 10, 'kind': 'json'},
+                {'name': self.svg_name, 'bytes': 10, 'kind': 'svg'},
                 {'name': 'report.json', 'bytes': 10, 'kind': 'json'},
             ],
         }))
         (self.tmp / 'report.json').write_text(json.dumps({
             'layout_quality': {'orientation_mode': 'off', 'final_geometry': {}},
         }))
-        line_render.render_file(self.tmp / 'map.json', self.tmp / 'map.svg')
+        line_render.render_file(self.tmp / self.map_name, self.tmp / self.svg_name)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -117,9 +124,9 @@ class TestMapEditSave(unittest.TestCase):
         self.assertTrue((self.tmp / 'map.original.json').is_file())
         original = json.loads((self.tmp / 'map.original.json').read_text())
         self.assertEqual(original[1]['nodes']['2']['x'], 200.0)
-        saved = json.loads((self.tmp / 'map.json').read_text())
+        saved = json.loads((self.tmp / self.map_name).read_text())
         self.assertEqual(saved[1]['nodes']['2']['x'], 260.0)
-        svg = (self.tmp / 'map.svg').read_text()
+        svg = (self.tmp / self.svg_name).read_text()
         self.assertIn('data-n="2"', svg)
         self.assertIn('cx="260.0"', svg)
         # second save must not overwrite the original
@@ -127,7 +134,7 @@ class TestMapEditSave(unittest.TestCase):
         self.assertFalse(r2['first_backup'])
         original2 = json.loads((self.tmp / 'map.original.json').read_text())
         self.assertEqual(original2[1]['nodes']['2']['x'], 200.0)
-        self.assertEqual(json.loads((self.tmp / 'map.json').read_text())[1]['nodes']['2']['x'], 300.0)
+        self.assertEqual(json.loads((self.tmp / self.map_name).read_text())[1]['nodes']['2']['x'], 300.0)
         self.assertIsNotNone(r2.get('layout_quality'))
         report = json.loads((self.tmp / 'report.json').read_text())
         self.assertIn('core', report['layout_quality']['final_geometry'])
@@ -138,13 +145,13 @@ class TestMapEditSave(unittest.TestCase):
 
     def test_reset_restores_original_and_svg(self):
         map_edit.save_map_edit(self.tmp, {'nodes': {'2': {'x': 260.0, 'y': 120.0, 'label_x': 270.0, 'label_y': 110.0}}})
-        self.assertEqual(json.loads((self.tmp / 'map.json').read_text())[1]['nodes']['2']['x'], 260.0)
+        self.assertEqual(json.loads((self.tmp / self.map_name).read_text())[1]['nodes']['2']['x'], 260.0)
         r = map_edit.reset_map(self.tmp)
         self.assertTrue(r['ok'])
-        restored = json.loads((self.tmp / 'map.json').read_text())
+        restored = json.loads((self.tmp / self.map_name).read_text())
         self.assertEqual(restored[1]['nodes']['2']['x'], 200.0)
         self.assertEqual(restored[1]['nodes']['2']['label_x'], 210.0)
-        svg = (self.tmp / 'map.svg').read_text()
+        svg = (self.tmp / self.svg_name).read_text()
         self.assertIn('cx="200.0"', svg)
         # original backup stays
         self.assertTrue((self.tmp / 'map.original.json').is_file())
@@ -161,8 +168,8 @@ class TestMapEditSave(unittest.TestCase):
         SAFE_FILE = re.compile(r'^(?:views/view-\d+\.(?:svg|json)|[A-Za-z0-9_.-]+)$')
         self.assertTrue(JOB_ID.match('j_0123456789'))
         self.assertFalse(JOB_ID.match('j_short'))
-        self.assertTrue(SAFE_FILE.match('map.json'))
-        self.assertFalse(SAFE_FILE.match('../map.json'))
+        self.assertTrue(SAFE_FILE.match(self.map_name))
+        self.assertFalse(SAFE_FILE.match('../' + self.map_name))
         with self.assertRaises(jsonschema.ValidationError):
             map_edit.validate_edit({'nodes': {'2': {'x': 1, 'y': 2, 'z': 3}}})
 

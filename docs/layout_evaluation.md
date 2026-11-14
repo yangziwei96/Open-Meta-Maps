@@ -9,7 +9,7 @@ CLI (optional deps: `pip install -r layout_atlas/requirements-eval.txt`):
 
 ```sh
 python3 project.py compose --gem examples/e_coli_core.xml --out results/eval_runs/e_coli_core --source-paths
-python3 project.py evaluate --gem examples/e_coli_core.xml --map results/eval_runs/e_coli_core/map.json --out results/evaluation/e_coli_core.json
+python3 project.py evaluate --gem examples/e_coli_core.xml --map results/eval_runs/e_coli_core/OpenMetaMaps_e_coli_core_result.json --out results/evaluation/e_coli_core.json
 ```
 
 One computation path:
@@ -32,7 +32,7 @@ and should be read from compose’s `layout_issues.json` / `report.json`.
 ## Metric table (e_coli_core · iIT341)
 
 Maps composed with `--source-paths` (Bézier / curated layout default). Geometry columns come from
-`layout_quality` on the final `map.json`.
+`layout_quality` on the final `OpenMetaMaps_<stem>_result.json`.
 
 Baseline (atlas-extraction-1 + compactness-aware select) vs +iCH360 (`--source-paths`):
 

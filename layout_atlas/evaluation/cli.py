@@ -1,7 +1,7 @@
 """CLI: score Open Meta Maps Escher output with the unified evaluation path.
 
-  python3 project.py evaluate --gem MODEL.xml --map DIR/map.json [--out DIR/evaluation.json]
-  python3 project.py evaluate --gem MODEL.xml --map DIR/map.json --reference REF.sbgn
+  python3 project.py evaluate --gem MODEL.xml --map DIR/OpenMetaMaps_<stem>_result.json [--out DIR/evaluation.json]
+  python3 project.py evaluate --gem MODEL.xml --map DIR/OpenMetaMaps_<stem>_result.json --reference REF.sbgn
   python3 project.py evaluate --batch MANIFEST.json --out results/evaluation/
 """
 
@@ -137,7 +137,7 @@ def run_batch(args) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     if manifest_path.is_dir():
         jobs = []
-        for map_json in sorted(manifest_path.glob("*/map.json")):
+        for map_json in sorted(manifest_path.glob("*/OpenMetaMaps_*_result.json")):
             # gem may be recorded in report.json
             gem = None
             report = map_json.with_name("report.json")
@@ -191,9 +191,9 @@ def main(argv=None) -> int:
             "(crossings, overlaps, continuity, blank/empty space)."
         ))
     p.add_argument("--gem", help="Input GEM: SBML (.xml/.sbml) or COBRA/BiGG JSON")
-    p.add_argument("--map", help="Composed Escher map.json to score")
+    p.add_argument("--map", help="Composed Escher OpenMetaMaps_<stem>_result.json to score")
     p.add_argument("--reference", help="Optional reference layout: SBGN, Escher JSON, or {id:[x,y]} JSON")
-    p.add_argument("--compare-map", help="Optional second map.json for reproducibility / stability metrics")
+    p.add_argument("--compare-map", help="Optional second result map JSON for reproducibility / stability metrics")
     p.add_argument("--batch", help="Batch manifest JSON, or a folder of compose result directories")
     p.add_argument("--out", help="Write JSON report here (file for one map, directory for --batch)")
     p.add_argument("--no-geometry", action="store_true",

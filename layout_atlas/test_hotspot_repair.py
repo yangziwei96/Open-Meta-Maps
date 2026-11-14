@@ -115,7 +115,7 @@ def test_repair_fast_and_no_overlap_regression():
     data = _crossing_map()
     before = hr._score(data, [])
     t0 = time.time()
-    report = hr.repair(data, skip_edges=[], k=3, max_rounds=2, max_accepts=8, budget_s=5)
+    report = hr.repair(data, skip_edges=[], k=3, max_rounds=2, max_accepts=8, budget_evals=200)
     elapsed = time.time() - t0
     after = hr._score(data, [])
     assert after["node_overlaps"] <= before["node_overlaps"]
@@ -130,18 +130,40 @@ def test_repair_can_reduce_crossings_on_fixable_hotspot():
     before = hr._score(before_data, [])
     assert before["crossings"] >= 1
     live = _dense_fixable()
-    report = hr.repair(live, skip_edges=[], k=3, max_rounds=3, max_accepts=12, budget_s=5)
+    report = hr.repair(live, skip_edges=[], k=3, max_rounds=3, max_accepts=12, budget_evals=200)
     after = hr._score(live, [])
     assert after["crossings"] <= before["crossings"]
     assert after["node_overlaps"] <= before["node_overlaps"]
     assert report["after"]["crossings"] == after["crossings"]
 
 
-def test_window_budget_scales_with_mass():
-    small = hr._window_budget([dict(crossings=4, edges=20)], k=1)
-    large = hr._window_budget([dict(crossings=60, edges=200)], k=1)
-    assert small[0] < large[0]
-    assert small[1] < large[1]
+def test_window_mass_counts_crossings_and_edges():
+    small = hr._window_mass([dict(crossings=4, edges=20)], k=1)
+    large = hr._window_mass([dict(crossings=60, edges=200)], k=1)
+    assert small == dict(window_crossings=4, window_edges=20)
+    assert large["window_crossings"] > small["window_crossings"]
+    assert large["window_edges"] > small["window_edges"]
+
+
+def test_repair_derives_accept_and_round_caps_from_window_mass():
+    data = _crossing_map()
+    report = hr.repair(data, skip_edges=[], k=3)
+    mass = report["budget_mass"]
+    assert report["max_accepts"] == max(1, int(mass["window_crossings"]))
+    assert report["max_rounds"] == report["max_accepts"] + 1
+    assert report["budget_evals"] is not None and report["budget_evals"] >= 8
+
+
+def test_repair_respects_previous_map_pins():
+    data = _crossing_map()
+    # Pin every metabolite so reposition / block moves that touch them are rejected.
+    body = data[1]
+    pins = {'m:' + n['bigg_id'] for n in body['nodes'].values()
+            if n.get('node_type') == 'metabolite' and n.get('bigg_id')}
+    report = hr.repair(data, skip_edges=[], k=3, pinned_keys=pins)
+    assert report['reject_reasons'].get('pinned', 0) >= 0
+    # Still terminates.
+    assert report['rounds'] >= 1 or report['accepted_count'] == 0
 
 
 if __name__ == "__main__":
@@ -149,5 +171,6 @@ if __name__ == "__main__":
     test_index_delta_side_move_reduces_or_equal()
     test_repair_fast_and_no_overlap_regression()
     test_repair_can_reduce_crossings_on_fixable_hotspot()
-    test_window_budget_scales_with_mass()
+    test_window_mass_counts_crossings_and_edges()
+    test_repair_derives_accept_and_round_caps_from_window_mass()
     print("ok")

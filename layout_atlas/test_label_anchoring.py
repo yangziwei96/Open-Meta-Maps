@@ -141,7 +141,8 @@ def test_reanchor_distant_pulls_floating_labels():
 def _assert_composed_labels_anchored(folder, max_dist=LP.MAX_ANCHOR_DIST):
     from pathlib import Path
     from core import read
-    path = Path(folder) / 'map.json'
+    import output_names
+    path = output_names.map_json(Path(folder))
     assert path.exists(), path
     data = read(path)
     mets = _met_label_dists(data)

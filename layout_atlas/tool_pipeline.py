@@ -24,6 +24,7 @@ import time
 import traceback
 
 from core import *
+import output_names
 
 LIMITS = dict(max_bytes=25 * 1024 * 1024, max_reactions=20000, full_routed_max_reactions=150, whole_map_max_reactions=3000, view_size=50)
 SOURCE_PATHS = False  # reuse the curated map's original curves (Escher Bezier chains) for the edges of matched structures
@@ -50,7 +51,6 @@ CONTEXT = 'auto'  # 'auto' (reactions without non-currency participants share no
 INSTANCES = 'auto'  # 'auto' (V3: decide how many visual instances each metabolite gets) | 'off'
 LAYOUT = 'global'  # 'global' (one map for the whole model, <=3,000 reactions) | 'tiled' (50-reaction views tiled on a grid; also the automatic fallback)
 GLOBAL_FAILURE = ''
-GLOBAL_BUDGET_S = 1500
 COMPLETION = 'spaced'  # 'spaced' (free nodes keep a minimum distance) | 'classic' (drawing.complete only)
 REACTION_STYLE = 'line'  # 'line' (reactions are lines between metabolites, like the curated maps) | 'marker' (earlier style: a dot per reaction)
 PREVIOUS_ANCHORS = None  # optional pins from --previous map.json: {'r:id':[x,y], 'm:id':[x,y]}
@@ -465,20 +465,20 @@ def draw_map_from_previous(model, selected, folder, full_model=None, log=None):
         log(f"  previous layout: reused map ({report['kept_reactions']} reactions, "
             f"{report['removed_reactions']} removed, {report['nodes']} nodes{extra}); "
             f"skipped packing/redraw")
-    dump(folder / 'map.json', data)
+    dump(output_names.map_json(folder), data)
     try:
         Draft4Validator(read(ESCHER_SCHEMA)).validate(data)
     except Exception:
         data[0].setdefault('metadata', {}).pop('protected_connections', None)
         Draft4Validator(read(ESCHER_SCHEMA)).validate(data)
-        dump(folder / 'map.json', data)
+        dump(output_names.map_json(folder), data)
     # SVG: prefer line render when available; else a minimal placeholder from export-less path.
     if REACTION_STYLE == 'line':
         import line_render
-        line_render.render_file(folder / 'map.json', folder / 'map.svg', {})
+        line_render.render_file(output_names.map_json(folder), output_names.map_svg(folder), {})
     else:
         # Lightweight SVG so the job always has a preview.
-        (folder / 'map.svg').write_text(
+        (output_names.map_svg(folder)).write_text(
             '<svg xmlns="http://www.w3.org/2000/svg"><text x="20" y="20">previous layout</text></svg>')
     quality_summary, quality_issues = layout_quality.evaluate(data)
     quality_summary['seconds'] = 0.0
@@ -498,14 +498,14 @@ def draw_map_from_previous(model, selected, folder, full_model=None, log=None):
         node_overlap_kinds=None, expert_geometry=None, curated_axes=None,
         constraints={}, peripheral=None,
     )
-    metric.update(metric_details(folder / 'map.json'))
-    assert_chemistry(model, folder / 'map.json')
+    metric.update(metric_details(output_names.map_json(folder)))
+    assert_chemistry(model, output_names.map_json(folder))
     assert uid(model) == original
     sources = [{k: b.get(k) for k in ('id', 'template_id', 'map_id', 'source', 'lineage', 'license', 'partition', 'source_citation', 'source_sha256', 'original_instance')} for b in (selected or [])]
     dump(folder / 'source_licenses.json', dict(layout_sources=sources, policy='Original licenses preserved; research-partition content keeps its own terms'))
-    data = read(folder / 'map.json')
+    data = read(output_names.map_json(folder))
     data[0].setdefault('metadata', {})['layout_sources'] = sources
-    dump(folder / 'map.json', data)
+    dump(output_names.map_json(folder), data)
     dump(folder / 'metrics.json', metric)
     # Minimal skeleton so downstream report steps find anchors.
     dump(folder / 'skeleton.json', dict(
@@ -872,11 +872,11 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
         lap('export (no routing)')
     sources = [{k: b.get(k) for k in ('id', 'template_id', 'map_id', 'source', 'lineage', 'license', 'partition', 'source_citation', 'source_sha256', 'original_instance')} for b in blocks]
     dump(folder / 'source_licenses.json', dict(layout_sources=sources, policy='Original licenses preserved; research-partition content keeps its own terms'))
-    data = read(folder / 'map.json')
+    data = read(output_names.map_json(folder))
     if PREVIOUS_ANCHORS:
         data, n_pin = prev.pin_escher(data, PREVIOUS_ANCHORS)
         if n_pin:
-            dump(folder / 'map.json', data)
+            dump(output_names.map_json(folder), data)
             if log:
                 log(f'  previous layout pin (escher): {n_pin} nodes')
     data[0]['metadata']['layout_sources'] = sources
@@ -965,9 +965,9 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                     log('  peripheral modules: skipped gate (n_rx=%d); ' % n_rx
                         + str({k: v for k, v in peripheral_report.items() if k not in ('details', 'gate_rows')}))
             else:
-                peri_budget, peri_max = 12.0, 2
+                peri_max = 2
                 data, gate = quality_gate.peripheral_pass(data, scene, props, skip_edges,
-                                                         budget_s=peri_budget, max_candidates=peri_max, log=log)
+                                                         max_candidates=peri_max, log=log)
                 for d in peripheral_report['details']:
                     row = next((r for r in gate['rows'] if r['exchange'] == d['exchange']), None)
                     if d['state'] == 'proposed' and row:
@@ -981,26 +981,24 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                 peripheral_report['gate_rows'] = gate['rows']
                 if log:
                     log('  peripheral modules: ' + str({k: v for k, v in peripheral_report.items() if k not in ('details', 'gate_rows')}))
-            dump(folder / 'map.json', data)
+            dump(output_names.map_json(folder), data)
         if os.environ.get('OPM_BLOCK_RELOC', 'off') == 'on':     # demoted: stress packing should place blocks; enable with OPM_BLOCK_RELOC=on for A/B
             import block_relocation
             data, reloc = block_relocation.relocate(data, model, scene, blocks, currency(model), skip_edges, log=log)
             metric['block_relocation'] = reloc
             if log:
                 log('  block relocation: ' + str({k: v for k, v in reloc.items() if k != 'rows'}))
-            dump(folder / 'map.json', data)
+            dump(output_names.map_json(folder), data)
         if os.environ.get('OPM_EXPERT_SUBMODULE', 'branch') in ('on', 'branch') and not PREVIOUS_SKIP_PACK:   # on by default: constrained relocation of exchange + transport modules inside big curated blocks; OPM_EXPERT_SUBMODULE=off disables it
             import block_relocation
-            n_rx = len(model['reactions'])
-            sub_budget = 45.0 if n_rx < 200 else (60.0 if n_rx < 800 else 90.0)
             data, sub = block_relocation.relocate_sub(data, model, scene, blocks, currency(model), skip_edges,
-                                                     budget_s=sub_budget, log=log,
+                                                     log=log,
                                                      simple=os.environ.get('OPM_EXPERT_SUBMODULE', 'branch') != 'branch')
             metric['expert_submodule'] = sub
             data[0].setdefault('metadata', {})['regenerated_expert_edges'] = sub['regenerated_expert_edges']
             if log:
                 log('  expert sub-module relocation: ' + str({k: v for k, v in sub.items() if k not in ('rows', 'regenerated_expert_edges')}))
-            dump(folder / 'map.json', data)
+            dump(output_names.map_json(folder), data)
         if os.environ.get('OPM_REGION_PLACE', 'off') == 'on' and not PREVIOUS_SKIP_PACK:     # opt-in pathway-aware region placement
             import region_placement
             data, rp = region_placement.place(data, model, scene, blocks, currency(model), skip_edges, log=log)
@@ -1009,7 +1007,7 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             data[0]['metadata']['regenerated_expert_edges'] += [e for row in rp.get('rows', []) for e in row.get('regenerated_expert_edges', [])]
             if log:
                 log('  region placement: ' + str({k: v for k, v in rp.items() if k != 'rows'}))
-            dump(folder / 'map.json', data)
+            dump(output_names.map_json(folder), data)
         # Compact long transport/exchange arms after peripheral / submodule moves
         # (those passes can re-stretch arms that were shortened earlier on the scene).
         if not PREVIOUS_SKIP_PACK:
@@ -1029,7 +1027,7 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             data, _ov_es = _ca_es.clear_rigid_node_overlaps_escher(data, blocks)
             if log and _ov_es.get('moved'):
                 log(f"  clear rigid node overlaps (escher): moved {_ov_es['moved']} nodes")
-            dump(folder / 'map.json', data)
+            dump(output_names.map_json(folder), data)
         # Final empty-band squeeze: collapse corridors wider than K × median reaction spacing
         # (nodes, labels and Bezier controls move together; monotone remap cannot add crossings).
         if not PREVIOUS_SKIP_PACK and os.environ.get('OPM_SQUEEZE', 'on') != 'off':
@@ -1058,7 +1056,7 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             # Monotone squeeze preserves relatives inside the rigid group — do not
             # restore here (that would re-expand BiGG-internal voids against a
             # squeezed surrounding canvas).
-            dump(folder / 'map.json', data)
+            dump(output_names.map_json(folder), data)
         # Shorten extreme empty axis-aligned corridors before hotspot so repair
         # can clean crossings introduced by midmarker slides.
         if not PREVIOUS_SKIP_PACK:
@@ -1080,7 +1078,7 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             if log and corridor.get('shortened'):
                 log(f"  empty-corridor compact (escher): shortened {corridor['shortened']} "
                     f"max_gap={corridor.get('max_gap')} min_len={corridor.get('min_len')}")
-            dump(folder / 'map.json', data)
+            dump(output_names.map_json(folder), data)
         # Rebuild algorithm Beziers against post-restore geometry on small maps
         # (early edge_style ran before absolute snap). Skip on mid/large — edge_style
         # alone is ~75 s on iIT341 and would blow the runtime gate.
@@ -1091,7 +1089,7 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                 _es_post.apply(data, skip_edges), seconds=round(time.time() - t_style2, 1))
             if log:
                 log(f"  curated-style connections (post-restore): {metric['edge_style_post_restore']}")
-            dump(folder / 'map.json', data)
+            dump(output_names.map_json(folder), data)
         # Hotspot repair AFTER rigid restore + overlap clear + squeeze + corridor
         # so accepted moves are not undone by absolute snap / padding slides.
         if os.environ.get('OPM_HOTSPOT_REPAIR', 'on') != 'off' and not PREVIOUS_SKIP_PACK:
@@ -1109,14 +1107,18 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             # enough search to recover the pre-corridor counted-crossing floor.
             hs_budget = 35.0 if n_rx < 200 else 45.0
             hs_k = 10 if n_rx < 200 else 8
+            # Mass-scaled try ceiling from budget_s (no wall-clock). Do not pass
+            # PREVIOUS_ANCHORS as pinned_keys here: mid-pipeline --previous pins are
+            # deferred to the final rigid structure translate so curated relatives
+            # stay identical to the no-previous drawing.
             metric['hotspot_repair'] = hotspot_repair.repair(
                 data, model=model, scene=scene, blocks=blocks, skip_edges=skip_edges, log=log,
-                structures=curated_structures_early, k=hs_k, max_accepts=100, budget_s=hs_budget,
-                max_rounds=8)
+                structures=curated_structures_early, k=hs_k, max_accepts=100,
+                budget_s=hs_budget, max_rounds=8)
             if log:
                 hr = metric['hotspot_repair']
                 log('  hotspot repair: ' + str({k: hr.get(k) for k in ('accepted_count', 'tries', 'rounds', 'seconds', 'improved')}))
-            dump(folder / 'map.json', data)
+            dump(output_names.map_json(folder), data)
         # Shrink canvas to content so empty frame padding does not inflate blank/empty gates.
         if not PREVIOUS_SKIP_PACK:
             import composition as _comp_fit
@@ -1124,7 +1126,7 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             metric['canvas_fit'] = fit
             if log and fit.get('applied'):
                 log(f"  canvas fit to content: {fit.get('content')} pad=40")
-            dump(folder / 'map.json', data)
+            dump(output_names.map_json(folder), data)
             # Final label pass after late geometry (rigid restore / overlap clear / squeeze /
             # hotspot). Root-cause stages already translate labels with nodes; this pass
             # re-anchors any residual detach and re-resolves text↔curve conflicts on the
@@ -1135,7 +1137,7 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                 _lp_final.optimize(data), seconds=round(time.time() - t_re, 1))
             if log:
                 log(f"  label placement (final): {metric['label_placement_final']}")
-            dump(folder / 'map.json', data)
+            dump(output_names.map_json(folder), data)
     elif not scalable and len(model['reactions']) <= 400:
         import edge_routing
         er = dict(mode=EDGE_ROUTING, before=edge_routing.measure(data, skip_edges))
@@ -1259,19 +1261,19 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
         # the extension keys are not accepted by the strict schema: keep the map interoperable and store the groups beside it
         dump(folder / 'protected_connections.json', data[0]['metadata'].pop('protected_connections', []))
         Draft4Validator(read(ESCHER_SCHEMA)).validate(data)
-    dump(folder / 'map.json', data)
-    svg = folder / 'map.svg'
+    dump(output_names.map_json(folder), data)
+    svg = output_names.map_svg(folder)
     text = svg.read_text()
     offset = text.index('>') + 1
     svg.write_text(text[:offset] + '<metadata>' + escape(json.dumps(dict(layout_sources=sources), ensure_ascii=False)) + '</metadata>' + text[offset:])
-    metric.update(metric_details(folder / 'map.json'))
+    metric.update(metric_details(output_names.map_json(folder)))
     metric['constraints'] = audit
     metric['routing_attempts'] = attempts
     metric['expert_geometry'] = expert_geometry
     metric['curated_axes'] = axes
     metric['orientation_mode'] = ORIENTATION
     metric['completion'] = metric_completion
-    assert_chemistry(model, folder / 'map.json')
+    assert_chemistry(model, output_names.map_json(folder))
     assert uid(model) == original
     used = {r for p in selected for r in p['reaction_ids']}
     bridge_ids = {r for b in bridges for r in b['reaction_ids']}
@@ -1367,7 +1369,7 @@ def merge_tiles(model, folder, view_ids, selected_count):
     height = max(o[1] + s[1] for o, s in zip(offsets, sizes))
     header = dict(maps[0][0], map_name=model['id'] + ' (tiled views)', map_description='Fixed 50-reaction views tiled on a grid; metabolites shared between views appear as separate copies.')
     header['metadata'] = dict(header.get('metadata', {}), layout_sources=sources, tiled_views=len(maps))
-    dump(folder / 'map.json', [header, dict(nodes=nodes, reactions=reactions, text_labels=labels, canvas=dict(x=0, y=0, width=width, height=height))])
+    dump(output_names.map_json(folder), [header, dict(nodes=nodes, reactions=reactions, text_labels=labels, canvas=dict(x=0, y=0, width=width, height=height))])
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width:.0f} {height:.0f}" width="{width:.0f}" height="{height:.0f}"><rect width="100%" height="100%" fill="white"/>']
     for vid, (dx, dy), (w, h) in zip(view_ids, offsets, sizes):
         inner = (folder / 'views' / (vid + '.svg')).read_text()
@@ -1375,16 +1377,17 @@ def merge_tiles(model, folder, view_ids, selected_count):
         parts.append(f'<svg x="{dx:.0f}" y="{dy:.0f}" width="{w:.0f}" height="{h:.0f}" viewBox="0 0 {w:.0f} {h:.0f}">{inner}</svg>')
         parts.append(f'<text x="{dx + 20:.0f}" y="{dy + 30:.0f}" font-family="Helvetica, Arial, sans-serif" font-size="22" fill="#5b7480">{vid}</text>')
     parts.append('</svg>')
-    (folder / 'map.svg').write_text('\n'.join(parts))
+    (output_names.map_svg(folder)).write_text('\n'.join(parts))
 
 
 def _write_map_exports(job, folder, model, upload):
-    """Write SBGN-ML, SBML Layout and CellDesigner SBML beside map.json (layout unchanged)."""
+    """Write SBGN-ML, SBML Layout and CellDesigner SBML beside the Escher result (layout unchanged)."""
     try:
         import map_exports
-        written = map_exports.write_all_exports(folder, model_path=upload, model=model)
-        titles = {name: title for name, _kind, title in map_exports.EXPORT_FILES}
-        kinds = {name: kind for name, kind, _title in map_exports.EXPORT_FILES}
+        stem = output_names.stem_from_folder(folder)
+        written = map_exports.write_all_exports(folder, model_path=upload, model=model, stem=stem)
+        titles = {name: title for name, _kind, title in map_exports.export_file_entries(stem)}
+        kinds = {name: kind for name, kind, _title in map_exports.export_file_entries(stem)}
         for name in written:
             job.add_file(name, titles.get(name, name), kinds.get(name, 'xml'))
         if written:
@@ -1472,30 +1475,31 @@ def global_network_metrics(model, map_path):
 def draw_global_map(job, model, selected, folder, prov_kinds, n_reactions, plan=None):
     """One map for the whole model (scalable global steps, see global_layout).  Returns the map note, or None when the global layout failed
     (the caller then falls back to the tiled views; the failure is recorded and shown, never hidden)."""
-    import global_layout as gl
     global GLOBAL_FAILURE
     job.log(f'Large model ({n_reactions} reactions): global layout of the whole network')
     t0 = time.time()
     try:
-        with gl.deadline(GLOBAL_BUDGET_S):
-            metric = draw_map(model, selected, folder / 'full', full_model=model, scalable=True, log=job.log, plan=plan)
-            for name, kind, en in (('map.svg', 'svg', 'Completed map (global layout)'), ('map.json', 'json', 'Completed map, Escher JSON'), ('layout_issues.json', 'json', 'Layout issues (where the problems are)')):
-                (folder / name).write_bytes((folder / 'full' / name).read_bytes())
-            if REACTION_STYLE == 'line':
-                import line_render
-                line_render.render_file(folder / 'map.json', folder / 'map.svg', prov_kinds)
-            else:
-                (folder / 'map.svg').write_text(epv.recolor_svg((folder / 'map.svg').read_text(), prov_kinds))
-    except Exception as e:  # includes the time budget
+        # No wall-clock deadline: stages use deterministic iteration/eval budgets.
+        metric = draw_map(model, selected, folder / 'full', full_model=model, scalable=True, log=job.log, plan=plan)
+        if (folder / 'full' / 'layout_issues.json').is_file():
+            (folder / 'layout_issues.json').write_bytes((folder / 'full' / 'layout_issues.json').read_bytes())
+        output_names.map_json(folder).write_bytes((folder / 'full' / 'map.json').read_bytes())
+        output_names.map_svg(folder).write_bytes((folder / 'full' / 'map.svg').read_bytes())
+        if REACTION_STYLE == 'line':
+            import line_render
+            line_render.render_file(output_names.map_json(folder), output_names.map_svg(folder), prov_kinds)
+        else:
+            (output_names.map_svg(folder)).write_text(epv.recolor_svg((output_names.map_svg(folder)).read_text(), prov_kinds))
+    except Exception as e:
         GLOBAL_FAILURE = f'{type(e).__name__}: {str(e)[:200]}'
         job.warn('global_failed', f'The global layout failed ({GLOBAL_FAILURE}); the map is built from tiled views instead.')
-        for name in ('map.svg', 'map.json'):
-            (folder / name).unlink(missing_ok=True)
+        output_names.map_json(folder).unlink(missing_ok=True)
+        output_names.map_svg(folder).unlink(missing_ok=True)
         return None
-    for name, kind, en in (('map.svg', 'svg', 'Completed map (global layout)'), ('map.json', 'json', 'Completed map, Escher JSON')):
-        job.add_file(name, en, kind)
+    job.add_file(output_names.map_svg(folder).name, 'Completed map (global layout)', 'svg')
+    job.add_file(output_names.map_json(folder).name, 'Completed map, Escher JSON', 'json')
     job.warn('global_degraded', 'Global map without routing: connections are straight lines (structure edges keep their own lines or curves); long edges and crossings are not optimised yet.')
-    network = global_network_metrics(model, folder / 'map.json')
+    network = global_network_metrics(model, output_names.map_json(folder))
     job.state['views'] = []  # a global map has no separate views; the modules tab lists the structures
     job.save()
     return dict(kind='global_degraded', requested_layout='global', degraded=['routing: none (straight connections)'], seconds=round(time.time() - t0, 1), network=network,
@@ -1771,14 +1775,18 @@ def run_job(folder):
         map_note = None
         if len(allids) <= LIMITS['full_routed_max_reactions']:
             metric = draw_map(model, selected, folder / 'full', full_model=model)
-            for name, kind, en in (('map.svg', 'svg', 'Completed map (routed)'), ('map.json', 'json', 'Completed map, Escher JSON'), ('layout_issues.json', 'json', 'Layout issues (where the problems are)')):
-                (folder / name).write_bytes((folder / 'full' / name).read_bytes())
-                job.add_file(name, en, kind)
+            if (folder / 'full' / 'layout_issues.json').is_file():
+                (folder / 'layout_issues.json').write_bytes((folder / 'full' / 'layout_issues.json').read_bytes())
+                job.add_file('layout_issues.json', 'Layout issues (where the problems are)', 'json')
+            output_names.map_json(folder).write_bytes((folder / 'full' / 'map.json').read_bytes())
+            output_names.map_svg(folder).write_bytes((folder / 'full' / 'map.svg').read_bytes())
+            job.add_file(output_names.map_svg(folder).name, 'Completed map (routed)', 'svg')
+            job.add_file(output_names.map_json(folder).name, 'Completed map, Escher JSON', 'json')
             if REACTION_STYLE == 'line':
                 import line_render
-                line_render.render_file(folder / 'map.json', folder / 'map.svg', prov_kinds)
+                line_render.render_file(output_names.map_json(folder), output_names.map_svg(folder), prov_kinds)
             else:
-                (folder / 'map.svg').write_text(epv.recolor_svg((folder / 'map.svg').read_text(), prov_kinds))
+                (output_names.map_svg(folder)).write_text(epv.recolor_svg((output_names.map_svg(folder)).read_text(), prov_kinds))
             map_note = dict(kind='routed_full', routing=(metric.get('routing') or {}).get('status'), routing_attempts=metric.get('routing_attempts'),
                             metrics={k: metric.get(k) for k in ('node_overlap_pairs', 'label_overlap_pairs', 'straight_crossings')}, source_paths=metric.get('source_paths'), expert_geometry=metric.get('expert_geometry'), instance_optimization=metric.get('instance_optimization'), context_placement=metric.get('context_placement'), completion_context=metric.get('completion_context'), layout_quality_final=metric.get('layout_quality_final'), edge_style=metric.get('edge_style'), peripheral=metric.get('peripheral'), block_relocation=metric.get('block_relocation'), region_placement=metric.get('region_placement'), regions=metric.get('regions'), expert_submodule=metric.get('expert_submodule'), label_placement=metric.get('label_placement'), hotspot_repair=metric.get('hotspot_repair'), protected=metric.get('protected'), node_overlap_kinds=metric.get('node_overlap_kinds'), edge_routing=metric.get('edge_routing'))
         elif len(allids) <= LIMITS['whole_map_max_reactions']:
@@ -1806,9 +1814,9 @@ def run_job(folder):
                     job.warn('views_failed', f'{len(failed)} of {len(views)} views could not be drawn and are missing from the tiled map.')
                 if done:
                     merge_tiles(model, folder, done, len(selected))
-                    (folder / 'map.svg').write_text(epv.recolor_svg((folder / 'map.svg').read_text(), {}))
-                    for name, kind, en in (('map.svg', 'svg', 'Completed map (tiled views, routed)'), ('map.json', 'json', 'Completed map, Escher JSON')):
-                        job.add_file(name, en, kind)
+                    (output_names.map_svg(folder)).write_text(epv.recolor_svg((output_names.map_svg(folder)).read_text(), {}))
+                    job.add_file(output_names.map_svg(folder).name, 'Completed map (tiled views, routed)', 'svg')
+                    job.add_file(output_names.map_json(folder).name, 'Completed map, Escher JSON', 'json')
                 map_note = dict(kind='tiled_fallback' if LAYOUT == 'global' else 'tiled_views', requested_layout=LAYOUT, fallback_reason=(GLOBAL_FAILURE or None), views_drawn=len(done), views_total=len(views), views_failed=failed,
                                 metrics={k: sum((m.get(k) or 0) for m in vmetrics.values()) for k in ('node_overlap_pairs', 'label_overlap_pairs', 'straight_crossings')})
             else:
@@ -1819,12 +1827,12 @@ def run_job(folder):
             map_note = dict(kind='skeleton_only', views_total=len(views))
 
         job.step('report')
-        if (folder / 'map.json').exists():
-            data = read(folder / 'map.json')
+        if (output_names.map_json(folder)).exists():
+            data = read(output_names.map_json(folder))
             data[0].setdefault('metadata', {})['reaction_provenance'] = prov_kinds
-            dump(folder / 'map.json', data)
+            dump(output_names.map_json(folder), data)
             _write_map_exports(job, folder, model, upload)
-        integrity = check_integrity(model, original, upload, folder / 'map.json' if (folder / 'map.json').exists() else None)
+        integrity = check_integrity(model, original, upload, output_names.map_json(folder) if (output_names.map_json(folder)).exists() else None)
         job.log('Integrity: ' + ', '.join(f"{k}={v['passed']}" for k, v in integrity.items()))
         best = {}
         for p in selected:
@@ -1833,9 +1841,19 @@ def run_job(folder):
                 if r not in best or LEVEL_RANK[level] < LEVEL_RANK[best[r]]:
                     best[r] = level
         counts = Counter(LEVEL_NAMES[v] for v in best.values())
+        kind_of = {r['id']: reaction_kind(r) for r in model['reactions']}
+        kind_totals = Counter(kind_of.values())
+        kind_curated = Counter(kind_of[rid] for rid in used)
         covered = dict(expert_module_reactions=len(used), complete_equation=counts['complete_equation'], reference_supported=counts['reference_supported'],
                        ec_topology=counts['ec_topology'], geometry_only=counts['geometry_only'], bridge_reactions=len(bridge_ids),
-                       algorithm_completed=len(allids) - len(used) - len(bridge_ids), total=len(allids))
+                       algorithm_completed=len(allids) - len(used) - len(bridge_ids), total=len(allids),
+                       by_kind=dict(
+                           metabolic=dict(total=kind_totals['metabolic'], curated=kind_curated['metabolic'],
+                                          coverage=round(kind_curated['metabolic'] / kind_totals['metabolic'], 4) if kind_totals['metabolic'] else None),
+                           transport=dict(total=kind_totals['transport'], curated=kind_curated['transport'],
+                                          coverage=round(kind_curated['transport'] / kind_totals['transport'], 4) if kind_totals['transport'] else None),
+                           exchange=dict(total=kind_totals['exchange'], curated=kind_curated['exchange'],
+                                         coverage=round(kind_curated['exchange'] / kind_totals['exchange'], 4) if kind_totals['exchange'] else None)))
         modules = []
         codes = module_codes(blocks)
         for b in sorted(blocks, key=lambda b: (-len(b['reaction_ids']), b['id'])):
@@ -1854,8 +1872,8 @@ def run_job(folder):
         pending = sorted(r for r, s in status.items() if s == 'pending_algorithm')
         import orientation as orientation_report
         layout_quality_report = dict(orientation_mode=ORIENTATION, expert_geometry=(map_note or {}).get('expert_geometry'), final_geometry=(map_note or {}).get('layout_quality_final'))
-        if (folder / 'map.json').exists():
-            layout_quality_report['orientation'] = orientation_report.summary(read(folder / 'map.json'), prov_kinds)
+        if (output_names.map_json(folder)).exists():
+            layout_quality_report['orientation'] = orientation_report.summary(read(output_names.map_json(folder)), prov_kinds)
         run_settings = dict(
             structure_library=library_kind, library_label={'windows': 'pathway-fragment reuse', 'units_sub': 'structure-unit reuse'}.get(library_kind, library_kind),
             sources=dict(core_open_cc0_ccby=bool(libs['core']), brenda_pathway_maps=True),
@@ -1874,8 +1892,10 @@ def run_job(folder):
                       limits='Matching depends on the model annotations; the skeleton covers only reactions with an expert structure; completion is algorithmic.')
         dump(folder / 'report.json', report)
         job.add_file('report.json', 'Report', 'json')
+        result_stem = output_names.stem_from_folder(folder)
         job.state['summary'] = dict(model=report['model'] | dict(id=model['id']), annotation_coverage=coverage, covered=covered, provenance=dict(prov_counts), ec_screening=ec_screening, layout_quality=layout_quality_report,
-                                    modules=dict(count=len(blocks), by_source=report['by_source']), map_kind=(map_note or {}).get('kind'), map_layout=dict(requested=(map_note or {}).get('requested_layout'), fallback_reason=(map_note or {}).get('fallback_reason'), degraded=(map_note or {}).get('degraded'), network=(map_note or {}).get('network')), seconds=report['seconds'])
+                                    modules=dict(count=len(blocks), by_source=report['by_source']), map_kind=(map_note or {}).get('kind'), map_layout=dict(requested=(map_note or {}).get('requested_layout'), fallback_reason=(map_note or {}).get('fallback_reason'), degraded=(map_note or {}).get('degraded'), network=(map_note or {}).get('network')), seconds=report['seconds'],
+                                    result_stem=result_stem, result_basename=output_names.result_basename(result_stem))
         failed = [k for k, v in integrity.items() if v['passed'] is False]
         if failed:
             job.fail('integrity', 'Integrity check failed: ' + ', '.join(failed) + '. The files were kept for inspection but must not be used.')

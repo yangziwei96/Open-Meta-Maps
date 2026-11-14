@@ -444,7 +444,7 @@ def evaluate(data, skip_edges=None, orientation_kinds=None, max_issues=4000, str
             bezier_coverage=bezier),  # not a card; quality-gate hard check + warning
         details=details,
         worst_regions=windows,
-        note='computed from the final map.json; crossings are counted on sampled final curves, source-split '
+        note='computed from the final result map JSON; crossings are counted on sampled final curves, source-split '
              '(algorithm×algorithm + algorithm×curated; curated×curated not in the headline) and role-split '
              '(main-metabolite vs currency-involved); worst_regions use uncapped counted crossings in true '
              '400 px / stride-200 boxes; structure continuity scores reused curated structures; '

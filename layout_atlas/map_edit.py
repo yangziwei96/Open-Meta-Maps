@@ -1,7 +1,9 @@
 """Apply interactive map edits to a finished tool job (positions only).
 
-Keeps the first original once as map.original.json, writes edited map.json,
-regenerates map.svg with line_render, and refreshes layout_quality in report.json.
+Keeps the first original once as map.original.json (intermediate), writes the
+edited OpenMetaMaps_<stem>_result.json, regenerates the matching result SVG with
+line_render, refreshes layout_quality in report.json, and rewrites the
+SBGN-ML / SBML Layout / CellDesigner result files.
 """
 from __future__ import annotations
 
@@ -11,6 +13,7 @@ import os
 from pathlib import Path
 
 import jsonschema
+import output_names
 
 # Patch body accepted by POST /api/jobs/<id>/map — only geometry fields.
 EDIT_SCHEMA = {
@@ -224,20 +227,52 @@ def _update_file_bytes(folder: Path, name: str):
     os.replace(tmp, job_path)
 
 
-def save_map_edit(folder: Path, edit, *, filename='map.json'):
+def _resolve_map_filename(folder: Path, filename=None) -> str:
+    """Return the result Escher JSON basename for this job folder."""
+    folder = Path(folder)
+    if filename:
+        name = Path(filename).name
+        if not output_names.is_result_map_json(name):
+            raise ValueError('only OpenMetaMaps_<name>_result.json can be edited')
+        if not (folder / name).is_file():
+            raise FileNotFoundError('%s missing' % name)
+        return name
+    path = output_names.find_map_json(folder)
+    if path is None:
+        raise FileNotFoundError('result map JSON missing')
+    return path.name
+
+
+def _result_export_names(folder: Path):
+    return [
+        output_names.map_export(folder, 'sbgn').name,
+        output_names.map_export(folder, 'sbml').name,
+        output_names.map_export(folder, 'celldesigner.xml').name,
+    ]
+
+
+def _refresh_exports(folder: Path):
+    """Rewrite SBGN-ML / SBML Layout / CellDesigner beside the current result map."""
+    upload = next(iter(sorted((folder / 'upload').glob('model.*'))), None)
+    if upload is None:
+        return
+    import map_exports
+    map_exports.write_all_exports(folder, model_path=upload)
+
+
+def save_map_edit(folder: Path, edit, *, filename=None):
     """Validate and persist an edit into the job folder.
 
     Returns dict(ok=True, layout_quality=..., original_kept=bool).
     Raises ValueError / jsonschema.ValidationError on bad input.
     """
-    if filename != 'map.json':
-        raise ValueError('only map.json can be edited')
-    map_path = folder / filename
-    if not map_path.is_file():
-        raise FileNotFoundError('map.json missing')
+    folder = Path(folder)
+    map_name = _resolve_map_filename(folder, filename)
+    map_path = folder / map_name
+    svg_path = output_names.map_svg(folder)
     data = json.loads(map_path.read_text())
     if not (isinstance(data, list) and len(data) == 2 and isinstance(data[1], dict)):
-        raise ValueError('map.json is not a valid Escher map array')
+        raise ValueError('result map JSON is not a valid Escher map array')
     edited = apply_edit(data, edit)
     original = folder / 'map.original.json'
     kept = original.is_file()
@@ -248,50 +283,42 @@ def save_map_edit(folder: Path, edit, *, filename='map.json'):
         first_backup = True
     else:
         first_backup = False
-    tmp = folder / 'map.json.tmp'
+    tmp = folder / (map_name + '.tmp')
     tmp.write_text(json.dumps(edited, ensure_ascii=False))
     os.replace(tmp, map_path)
     kinds = _prov_kinds(folder)
     import line_render
-    line_render.render_file(map_path, folder / 'map.svg', kinds)
+    line_render.render_file(map_path, svg_path, kinds)
     quality = _refresh_quality(folder, edited)
     _refresh_exports(folder)
-    for name in ('map.json', 'map.svg', 'report.json', 'map.sbgn', 'map.sbml', 'map.celldesigner.xml'):
+    for name in (map_name, svg_path.name, 'report.json', *_result_export_names(folder)):
         _update_file_bytes(folder, name)
     return dict(ok=True, layout_quality=quality, original_kept=True, first_backup=first_backup)
 
 
-def _refresh_exports(folder: Path):
-    """Rewrite SBGN-ML / SBML Layout / CellDesigner beside the current map.json."""
-    upload = next(iter(sorted((folder / 'upload').glob('model.*'))), None)
-    if upload is None:
-        return
-    import map_exports
-    map_exports.write_all_exports(folder, model_path=upload)
-
-
-def reset_map(folder: Path, *, filename='map.json'):
-    """Restore map.json from map.original.json and regenerate SVG + quality.
+def reset_map(folder: Path, *, filename=None):
+    """Restore the result map JSON from map.original.json and regenerate SVG + quality.
 
     Raises FileNotFoundError when no original backup exists.
     """
-    if filename != 'map.json':
-        raise ValueError('only map.json can be reset')
+    folder = Path(folder)
+    map_name = _resolve_map_filename(folder, filename)
+    map_path = folder / map_name
+    svg_path = output_names.map_svg(folder)
     original = folder / 'map.original.json'
     if not original.is_file():
         raise FileNotFoundError('map.original.json missing')
     data = json.loads(original.read_text())
     if not (isinstance(data, list) and len(data) == 2 and isinstance(data[1], dict)):
         raise ValueError('map.original.json is not a valid Escher map array')
-    map_path = folder / filename
-    tmp = folder / 'map.json.tmp'
+    tmp = folder / (map_name + '.tmp')
     tmp.write_text(json.dumps(data, ensure_ascii=False))
     os.replace(tmp, map_path)
     kinds = _prov_kinds(folder)
     import line_render
-    line_render.render_file(map_path, folder / 'map.svg', kinds)
+    line_render.render_file(map_path, svg_path, kinds)
     quality = _refresh_quality(folder, data)
     _refresh_exports(folder)
-    for name in ('map.json', 'map.svg', 'report.json', 'map.sbgn', 'map.sbml', 'map.celldesigner.xml'):
+    for name in (map_name, svg_path.name, 'report.json', *_result_export_names(folder)):
         _update_file_bytes(folder, name)
     return dict(ok=True, layout_quality=quality, original_kept=True)

@@ -7,6 +7,7 @@ from pathlib import Path
 import compose_cli
 import line_render
 import model_io
+import output_names
 import semantic_transfer as st
 from core import model_graph, participation_roles
 from tool_pipeline import Failure, normalize_model
@@ -64,7 +65,7 @@ def test_unique_equation_mapping_skips_factor_zero():
 def test_self_loop_compose_draws_every_reaction_and_species(tmp_path):
     out = tmp_path / 'self_loop'
     assert compose_cli.run(FIXTURE, out, no_library=True, source_paths=True) == 0
-    data = json.loads((out / 'map.json').read_text(encoding='utf-8'))
+    data = json.loads(output_names.map_json(out).read_text(encoding='utf-8'))
     body = data[1]
     drawn_rx = {r['bigg_id'] for r in body['reactions'].values()}
     assert drawn_rx == {'r_self', 'r_mixed'}

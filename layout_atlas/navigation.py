@@ -120,29 +120,30 @@ def about():
         '<h3>' + b('Matching and curated reuse') + '</h3>'
         + '<p>' + b('Reactions are matched to Atlas modules (EC currentisation, Rhea metabolite scoring, name normalisation, weighted Jaccard, vicinity propagation). Report curated, topology-only and optional EC suggestions as separate rates in reaction_provenance.json. EC similarity extension is off by default (CLI --ec). Matched geometry is kept as drawn; the rest uses layout_style=curated (Bézier). Orthogonal libavoid remains CLI --layout-style legacy only. Details: docs/reaction_map_matching.md · docs/methodology.md.') + '</p>'
         + '<h3>' + b('Layout stages') + '</h3>'
-        + '<p>' + b('After matching, the Composer keeps curated blocks rigid, completes uncovered reactions, orients free reactions, composes stray components, draws Bézier connections and places labels. Small models take the full path; mid-size models use a global plan then the same curated Bézier pass; larger models keep a skeleton and draw ~50-reaction views on demand. Full stage table: README §2.') + '</p>'
-        + '<h3>' + b('Layout rules and evaluation') + '</h3>'
-        + '<p>' + b('Rules (crossings, overlaps, long edges, participant consistency, compartments, compactness, reproducibility, scale): metric groups, acceptance criteria and status table in README §3. Compose writes layout_quality into layout_issues.json / report.json; python3 project.py evaluate adds layout-rules metrics.') + '</p>'
-        + '<ul>'
-        + '<li>' + b('Optimised (partially): crossings and unrelated overlaps; detour and bends; long lines and cofactor clones; participant placement; curated-structure continuity; periphery, aspect, blank space.') + '</li>'
-        + '<li>' + b('Not yet optimised: axis-aligned segments and axes; grid metabolites; chain turn angles; cycle placement; compartment packing.') + '</li>'
-        + '<li>' + b('Build-on-previous: compose --previous map.json pins matched nodes; evaluate --compare-map measures displacement.') + '</li>'
-        + '<li>' + b('Gaps: 2D component packing, harder orientation, compose --seed. Details: docs/layout_evaluation.md · docs/limitations.md.') + '</li>'
-        + '</ul>'
+        + '<p>' + b('After matching, the Composer keeps curated blocks rigid, completes uncovered reactions, orients free reactions, composes stray components, draws Bézier connections and places labels. Small models take the full path; mid-size models use a global plan then the same curated Bézier pass; larger models keep a skeleton and draw ~50-reaction views on demand. Each stage lists the layout targets it optimises in the README §2 table: rigid skeleton and matching keep curated-structure continuity; instances and composition/peripherals shorten long lines and cofactor clones and place exchange on the periphery, aspect and blank space; orientation sets participant placement; spacing/relaxation and Bézier connections (with the quality gate) reduce connection crossings, unrelated overlaps, detours, hooks and bends.') + '</p>'
+        + '<p>' + b('Determinism: fixed layout seed 20261105 (core.SEEDS), ELK/fCoSE seeds, PYTHONHASHSEED=0 on re-exec. Displacement measured by evaluate --compare-map only. compose --previous OpenMetaMaps_<stem>_result.json pins matched nodes and grafts leftovers.') + '</p>'
+        + '<p>' + b('Known gaps (docs/limitations.md): 2D component packing, harder orientation (incl. transporters), compartment-aware packing, stronger currency/biomass handling, crossing-aware composition acceptance, compose seed flag. Experimental off by default: OPM_REGIONS, OPM_LOWCONF, whole-block OPM_BLOCK_RELOC.') + '</p>'
         + '<h3>' + b('Example output') + '</h3>'
         + '<p>' + b('Maps composed from the bundled example models. Every reaction and metabolite is drawn.') + '</p>'
         + '<div class="fig">'
         + '<div><img src="' + e(ui.rel(about_path, 'docs/images/examples/e_coli_core.png')) + '" alt="' + b('Escherichia coli core map (e_coli_core, 95 reactions)') + '" width="700"/><p class="meta"><i>Escherichia coli</i> core (<code>e_coli_core</code>, 95 reactions)</p></div>'
         + '<div><img src="' + e(ui.rel(about_path, 'docs/images/examples/iIT341.png')) + '" alt="' + b('Helicobacter pylori iIT341 map (554 reactions)') + '" width="700"/><p class="meta"><i>Helicobacter pylori</i> iIT341 (554 reactions)</p></div>'
         + '</div>'
-        + '<p class="meta">' + b('Previews are cropped to content and draw every reaction and metabolite label of map.svg. Zoom in to read the labels.') + '</p>',
+        + '<p class="meta">' + b('Previews are cropped to content and draw every reaction and metabolite label of the result SVG. Zoom in to read the labels.') + '</p>',
+    )
+
+    s_eval = sec(
+        '3. Evaluation criteria',
+        '<p>' + b('Compose writes layout_quality into layout_issues.json / report.json; python3 project.py evaluate adds layout-rules metrics. Metric groups and status table: README §3. Details: docs/layout_evaluation.md.') + '</p>'
+        + '<p>' + b('Layout targets (including backlog) stay on Detailed metrics; non-targets under Debug (including main flow-direction share).') + '</p>'
+        + '<p>' + b('Rules and status (README §3): avoid crossings, overlaps and long lines, place participants consistently, aspect / compactness, reproducibility, build on previous layout and scale to GEMs are partial; respect compartments, compartment packing, axis-aligned segments and axes, grid metabolites, chain turns and cycle placement are not yet optimised.') + '</p>',
     )
 
     s_out = sec(
         'Outputs',
         '<ul>'
         + '<li><b>' + b('Reaction provenance') + '</b>: ' + b('curated (community layout), topology-only suggestion, functional (EC) suggestion, bridge or generated, with matching evidence') + '</li>'
-        + '<li><b>' + b('Download formats') + '</b>: ' + b('Escher JSON, SBGN-ML Process Description, SBML with Layout, CellDesigner SBML') + '</li>'
+        + '<li><b>' + b('Download formats') + '</b>: ' + b('OpenMetaMaps_<name>_result.{json,sbgn,sbml,celldesigner.xml,svg,png} (Escher JSON, SBGN-ML, SBML Layout, CellDesigner, SVG, PNG)') + '</li>'
         + '<li><b>' + b('Layout quality') + '</b> · <b>' + b('Generation settings') + '</b> · <b>' + b('Licensing metadata') + '</b> (<code>licenses.json</code>)</li>'
         + '</ul>'
         + '<p>' + b('Integrity check: all reactions drawn; stoichiometry and compartments unchanged.') + '</p>'
@@ -161,7 +162,7 @@ def about():
     ui.write(
         d / 'index.html',
         'About / Provenance',
-        HOME_CSS + s1 + s_data + s_layout + s_out + s_lic + s_docs,
+        HOME_CSS + s1 + s_data + s_layout + s_eval + s_out + s_lic + s_docs,
         section='about',
         lead=b('Curated-structure Atlas construction and layout optimisation for Open Meta Maps.'),
     )

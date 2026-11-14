@@ -1,9 +1,9 @@
-"""Round-trip export tests: Escher map.json → SBGN-ML, SBML Layout, CellDesigner SBML.
+"""Round-trip export tests: Escher result JSON → SBGN-ML, SBML Layout, CellDesigner SBML.
 
 Uses e_coli_core and iIT341 only. Every model reaction and species must appear in
 each export; SBGN-ML validates against the libSBGN 0.3 XSD; SBML and CellDesigner
-validate with libSBML (no errors); coordinates match map.json; the layout-benchmark
-SBGN reader matches every pathway node.
+validate with libSBML (no errors); coordinates match the result JSON; the
+layout-benchmark SBGN reader matches every pathway node.
 """
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from core import EXAMPLES, read
+import output_names
 from model_io import load_model
 import map_exports
 from evaluation.pathway import read_sbml
@@ -32,6 +33,11 @@ MODELS = [
     ('iIT341', EXAMPLES / 'iIT341.xml'),
 ]
 CACHE = ROOT / 'layout_atlas' / 'results' / 'export_test_maps'
+
+def _result(folder, ext):
+    return output_names.map_export(folder, ext)
+
+
 
 
 def collect_export_ids(data, model):
@@ -152,7 +158,8 @@ def coordinates_match(data, sbgn_path, tol=1.5):
 
 def _compose_if_needed(name: str, gem: Path) -> Path:
     out = CACHE / name
-    if (out / 'map.json').is_file() and (out / 'map.sbgn').is_file() and (out / 'map.sbml').is_file():
+    stem = output_names.sanitize_stem(gem.name)
+    if _result(out, 'json').is_file() and _result(out, 'sbgn').is_file() and _result(out, 'sbml').is_file():
         # Refresh exports with the current writer (compose layout kept).
         map_exports.write_all_exports(out, model_path=gem)
         return out
@@ -173,8 +180,9 @@ def _compose_if_needed(name: str, gem: Path) -> Path:
             f'stdout tail:\n{(proc.stdout or "")[-2000:]}\n'
             f'stderr tail:\n{(proc.stderr or "")[-2000:]}'
         )
-    assert (out / 'map.json').is_file(), f'missing map.json in {out}'
-    if not (out / 'map.sbgn').is_file():
+    assert _result(out, 'json').is_file(), f'missing result JSON in {out}'
+    assert _result(out, 'json').name == output_names.result_filename(stem, 'json')
+    if not _result(out, 'sbgn').is_file():
         map_exports.write_all_exports(out, model_path=gem)
     return out
 
@@ -185,38 +193,40 @@ def composed(request):
     assert gem.is_file(), gem
     folder = _compose_if_needed(name, gem)
     model = load_model(gem)
-    data = read(folder / 'map.json')
+    data = read(_result(folder, 'json'))
     return name, gem, folder, model, data
 
 
 def test_export_files_exist(composed):
     name, gem, folder, model, data = composed
-    for fname in ('map.json', 'map.sbgn', 'map.sbml', 'map.celldesigner.xml'):
-        assert (folder / fname).is_file(), f'{name}: missing {fname}'
+    for ext in ('json', 'sbgn', 'sbml', 'celldesigner.xml'):
+        path = _result(folder, ext)
+        assert path.is_file(), f'{name}: missing {path.name}'
+        assert path.name == output_names.result_filename(output_names.sanitize_stem(gem.name), ext)
 
 
 def test_sbgn_xsd_and_layout_benchmark_match(composed):
     name, gem, folder, model, data = composed
-    ok, errors = map_exports.validate_sbgn_xsd(folder / 'map.sbgn')
+    ok, errors = map_exports.validate_sbgn_xsd(_result(folder, 'sbgn'))
     assert ok, f'{name}: SBGN XSD errors: {errors[:10]}'
     pathway = read_sbml(gem)
-    matched = match_glyphs(pathway, folder / 'map.sbgn')
+    matched = match_glyphs(pathway, _result(folder, 'sbgn'))
     missing = sorted(set(pathway.graph) - set(matched))
     assert not missing, (
         f'{name}: layout-benchmark matched {len(matched)}/{pathway.graph.number_of_nodes()}; '
         f'missing {missing[:12]}'
     )
-    assert read_sbgn_glyphs(folder / 'map.sbgn')
-    assert read_sbgn_positions(folder / 'map.sbgn')
+    assert read_sbgn_glyphs(_result(folder, 'sbgn'))
+    assert read_sbgn_positions(_result(folder, 'sbgn'))
 
 
 def test_sbml_layout_validates(composed):
     name, gem, folder, model, data = composed
-    ok, errors = map_exports.validate_sbml_libsbml(folder / 'map.sbml')
+    ok, errors = map_exports.validate_sbml_libsbml(_result(folder, 'sbml'))
     assert ok, f'{name}: SBML errors: {errors[:10]}'
     import libsbml
     original = libsbml.readSBMLFromFile(str(gem))
-    exported = libsbml.readSBMLFromFile(str(folder / 'map.sbml'))
+    exported = libsbml.readSBMLFromFile(str(_result(folder, 'sbml')))
     assert original.getModel().getNumSpecies() == exported.getModel().getNumSpecies()
     assert original.getModel().getNumReactions() == exported.getModel().getNumReactions()
     plugin = exported.getModel().getPlugin('layout')
@@ -240,14 +250,14 @@ def test_sbml_layout_validates(composed):
                 seg = curve.getCurveSegment(k)
                 if seg.getTypeCode() == libsbml.SBML_LAYOUT_CUBICBEZIER:
                     n_bez += 1
-    assert n_bez == n_curved, f'{name}: CubicBezier {n_bez} != map.json curved segments {n_curved}'
+    assert n_bez == n_curved, f'{name}: CubicBezier {n_bez} != result JSON curved segments {n_curved}'
 
 
 def test_celldesigner_validates_and_has_identity(composed):
     name, gem, folder, model, data = composed
-    ok, errors = map_exports.validate_sbml_libsbml(folder / 'map.celldesigner.xml')
+    ok, errors = map_exports.validate_sbml_libsbml(_result(folder, 'celldesigner.xml'))
     assert ok, f'{name}: CellDesigner libSBML errors ({len(errors)}): {errors[:8]}'
-    root = ET.parse(folder / 'map.celldesigner.xml').getroot()
+    root = ET.parse(_result(folder, 'celldesigner.xml')).getroot()
 
     def local(tag):
         return tag.rsplit('}', 1)[-1]
@@ -276,18 +286,18 @@ def test_every_reaction_and_species_in_exports(composed):
     model_sp = {m['id'] for m in model['metabolites']}
 
     map_rx, map_sp = collect_export_ids(data, model)
-    assert model_rx <= map_rx, f'{name}: map.json missing reactions {sorted(model_rx - map_rx)[:10]}'
+    assert model_rx <= map_rx, f'{name}: result JSON missing reactions {sorted(model_rx - map_rx)[:10]}'
     assert map_sp
 
-    sbgn_rx, sbgn_sp = sbgn_ids(folder / 'map.sbgn')
+    sbgn_rx, sbgn_sp = sbgn_ids(_result(folder, 'sbgn'))
     assert model_rx <= sbgn_rx, f'{name}: SBGN missing reactions {sorted(model_rx - sbgn_rx)[:10]}'
     assert model_sp <= sbgn_sp, f'{name}: SBGN missing species {sorted(model_sp - sbgn_sp)[:10]}'
 
-    lay_rx, lay_sp = layout_ids(folder / 'map.sbml')
+    lay_rx, lay_sp = layout_ids(_result(folder, 'sbml'))
     assert model_rx <= lay_rx, f'{name}: SBML Layout missing reactions {sorted(model_rx - lay_rx)[:10]}'
     assert model_sp <= lay_sp, f'{name}: SBML Layout missing species {sorted(model_sp - lay_sp)[:10]}'
 
-    cd_rx, cd_sp = celldesigner_ids(folder / 'map.celldesigner.xml')
+    cd_rx, cd_sp = celldesigner_ids(_result(folder, 'celldesigner.xml'))
     assert model_rx <= cd_rx, f'{name}: CellDesigner missing reactions {sorted(model_rx - cd_rx)[:10]}'
     assert model_sp <= cd_sp, f'{name}: CellDesigner missing species {sorted(model_sp - cd_sp)[:10]}'
     # Ids only — display names must not satisfy coverage by themselves
@@ -298,17 +308,17 @@ def test_every_reaction_and_species_in_exports(composed):
 
 def test_coordinates_match_map_json(composed):
     name, gem, folder, model, data = composed
-    assert coordinates_match(data, folder / 'map.sbgn', tol=1.5), (
-        f'{name}: SBGN glyph centres do not match map.json'
+    assert coordinates_match(data, _result(folder, 'sbgn'), tol=1.5), (
+        f'{name}: SBGN glyph centres do not match result JSON'
     )
 
 
 def test_exports_do_not_alter_map_json(composed):
     name, gem, folder, model, data = composed
-    before = (folder / 'map.json').read_bytes()
+    before = (_result(folder, 'json')).read_bytes()
     map_exports.write_all_exports(folder, model_path=gem, model=model)
-    after = (folder / 'map.json').read_bytes()
-    assert before == after, f'{name}: map.json changed during export'
+    after = (_result(folder, 'json')).read_bytes()
+    assert before == after, f'{name}: result JSON changed during export'
     # The assertion must be able to fail: a deliberate mutation differs.
     mutated = bytearray(after)
     mutated[-2] = (mutated[-2] + 1) % 256
@@ -318,34 +328,55 @@ def test_exports_do_not_alter_map_json(composed):
 def test_map_edit_regenerates_exports(composed):
     name, gem, folder, model, data = composed
     import map_edit
+    import line_render
     with tempfile.TemporaryDirectory(prefix='omm_edit_export_') as tmp:
         tmp = Path(tmp)
-        # Minimal job folder: map + upload + original-ready
-        shutil.copy(folder / 'map.json', tmp / 'map.json')
+        stem = output_names.sanitize_stem(gem.name)
+        map_name = output_names.result_filename(stem, 'json')
+        svg_name = output_names.result_filename(stem, 'svg')
+        export_names = [output_names.result_filename(stem, ext)
+                        for ext in ('sbgn', 'sbml', 'celldesigner.xml')]
+        output_names.write_meta(tmp, gem.name, size=gem.stat().st_size)
+        shutil.copy(_result(folder, 'json'), tmp / map_name)
         (tmp / 'upload').mkdir()
         shutil.copy(gem, tmp / 'upload' / 'model.xml')
+        (tmp / 'job.json').write_text(json.dumps({
+            'id': 'j_editexport', 'status': 'done',
+            'summary': {
+                'result_stem': stem,
+                'result_basename': output_names.result_basename(stem),
+                'layout_quality': {},
+            },
+            'files': [
+                {'name': map_name, 'bytes': 10, 'kind': 'json'},
+                {'name': svg_name, 'bytes': 10, 'kind': 'svg'},
+                {'name': 'report.json', 'bytes': 10, 'kind': 'json'},
+            ],
+        }))
+        (tmp / 'report.json').write_text(json.dumps({
+            'layout_quality': {'orientation_mode': 'off', 'final_geometry': {}},
+        }))
+        line_render.render_file(tmp / map_name, tmp / svg_name)
         map_exports.write_all_exports(tmp, model_path=tmp / 'upload' / 'model.xml')
-        before = {n: (tmp / n).read_bytes() for n in ('map.sbgn', 'map.sbml', 'map.celldesigner.xml')}
-        # Move one metabolite node
+        before = {n: (tmp / n).read_bytes() for n in export_names}
         body = data[1]
         nid = next(k for k, n in body['nodes'].items() if n.get('node_type') == 'metabolite')
         node = body['nodes'][nid]
         edit = {'nodes': {nid: {'x': float(node['x']) + 25.0, 'y': float(node['y']) + 15.0}}}
         map_edit.save_map_edit(tmp, edit)
-        after = {n: (tmp / n).read_bytes() for n in ('map.sbgn', 'map.sbml', 'map.celldesigner.xml')}
-        assert after['map.sbgn'] != before['map.sbgn']
-        assert after['map.sbml'] != before['map.sbml']
-        assert after['map.celldesigner.xml'] != before['map.celldesigner.xml']
-        # Reset restores original map and rewrites exports
+        after = {n: (tmp / n).read_bytes() for n in export_names}
+        assert after[export_names[0]] != before[export_names[0]]
+        assert after[export_names[1]] != before[export_names[1]]
+        assert after[export_names[2]] != before[export_names[2]]
         map_edit.reset_map(tmp)
-        reset_sbgn = (tmp / 'map.sbgn').read_bytes()
-        assert reset_sbgn != after['map.sbgn']
-        ok, errs = map_exports.validate_sbgn_xsd(tmp / 'map.sbgn')
+        reset_sbgn = (tmp / export_names[0]).read_bytes()
+        assert reset_sbgn != after[export_names[0]]
+        ok, errs = map_exports.validate_sbgn_xsd(tmp / export_names[0])
         assert ok, errs[:5]
 
 
 def test_cobra_json_writes_all_formats():
-    """COBRA/BiGG JSON uploads get map.sbml via an SBML document built from the model."""
+    """COBRA/BiGG JSON uploads get result SBML via an SBML document built from the model."""
     # Minimal COBRA-like JSON
     model_json = {
         'id': 'tiny',
@@ -393,17 +424,22 @@ def test_cobra_json_writes_all_formats():
         (tmp / 'upload').mkdir()
         gem = tmp / 'upload' / 'model.json'
         gem.write_text(json.dumps(model_json))
-        (tmp / 'map.json').write_text(json.dumps(data))
-        written = map_exports.write_all_exports(tmp, model_path=gem)
-        assert written == ['map.sbgn', 'map.sbml', 'map.celldesigner.xml']
-        assert (tmp / 'map.sbml').stat().st_size > 0
+        output_names.write_meta(tmp, 'model.json', size=gem.stat().st_size)
+        stem = 'model'
+        map_name = output_names.result_filename(stem, 'json')
+        (tmp / map_name).write_text(json.dumps(data))
+        written = map_exports.write_all_exports(tmp, model_path=gem, stem=stem)
+        expect = [output_names.result_filename(stem, ext)
+                  for ext in ('sbgn', 'sbml', 'celldesigner.xml')]
+        assert written == expect
+        assert (tmp / expect[1]).stat().st_size > 0
         # Temporary SBML for JSON uploads is written under the job folder (and removed after).
         assert not (tmp / 'export_model.xml').exists()
-        ok, errs = map_exports.validate_sbml_libsbml(tmp / 'map.sbml')
+        ok, errs = map_exports.validate_sbml_libsbml(tmp / expect[1])
         assert ok, errs[:5]
-        ok2, errs2 = map_exports.validate_sbml_libsbml(tmp / 'map.celldesigner.xml')
+        ok2, errs2 = map_exports.validate_sbml_libsbml(tmp / expect[2])
         assert ok2, errs2[:5]
-        ok3, errs3 = map_exports.validate_sbgn_xsd(tmp / 'map.sbgn')
+        ok3, errs3 = map_exports.validate_sbgn_xsd(tmp / expect[0])
         assert ok3, errs3[:5]
 
 

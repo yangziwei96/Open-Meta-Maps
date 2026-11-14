@@ -24,6 +24,7 @@ from evaluation.escher_bridge import escher_positions, load_escher
 from evaluation.pathway import read_sbml
 from evaluation.stability import position_displacement
 from layout_quality import evaluate as lq_evaluate
+import output_names
 
 RM3 = ('ME1', 'PPCK', 'FRD7')
 RM5 = ('MALt2_2', 'FBP', 'PFK', 'ADK1', 'ALCD2x')  # seed-7 list from the gap analysis
@@ -82,8 +83,9 @@ def _compose(gem: Path, out: Path, previous: Path | None = None) -> Path:
     if proc.returncode != 0:
         raise AssertionError(
             f'compose failed ({proc.returncode}):\nSTDOUT:\n{proc.stdout[-2000:]}\nSTDERR:\n{proc.stderr[-2000:]}')
-    assert (out / 'map.json').is_file()
-    return out / 'map.json'
+    path = output_names.map_json(out)
+    assert path.is_file()
+    return path
 
 
 def _quality(map_path: Path) -> dict:

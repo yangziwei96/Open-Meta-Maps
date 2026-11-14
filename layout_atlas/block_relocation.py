@@ -192,23 +192,25 @@ def _diagnose(data, scene, unit, delta, old_issues, new_issues, radius=400.0):
     return dict(new_near_module=near, new_elsewhere=far, reactions=sorted(x for x in names if x)[:8])
 
 
-def relocate(data, model, scene, blocks, cur, skip_edges, budget_s=150.0, max_units=20, log=None):
-    """Try the relocation candidates of every unit on copies of the final map; keep what the unified gate accepts.  -> (data, report)."""
+def relocate(data, model, scene, blocks, cur, skip_edges, max_units=20, log=None):
+    """Try the relocation candidates of every unit on copies of the final map; keep what the unified gate accepts.  -> (data, report).
+
+    Stops on a deterministic unit budget, never on wall-clock.  Each unit tries at
+    most two ranked candidates; the joint-pair pass keeps its fixed pair/candidate caps.
+    """
     import edge_style
     import quality_gate as qg
     t0 = time.time()
     units = find(model, scene, blocks, cur)
-    report = dict(units=len(units), accepted=0, rejected=0, budget_exhausted=0, spacing_px=round(units[0]['spacing'], 1) if units else None, rows=[])
+    truncated = max(0, len(units) - max_units)
+    report = dict(units=len(units), accepted=0, rejected=0, budget_exhausted=truncated,
+                  spacing_px=round(units[0]['spacing'], 1) if units else None, rows=[])
     if not units:
         return data, report
     far = len(units)
     rejected_units = []
     base, summary, issues = qg.evaluate_map(data, skip_edges, disconnected=far)
     for unit in units[:max_units]:
-        if time.time() - t0 > budget_s:
-            report['budget_exhausted'] += 1
-            report['rows'].append(dict(block=unit['block'], decision='budget_exhausted'))
-            continue
         row = dict(block=unit['block'], reactions=unit['reactions'][:6], longest_px=unit['long'][0][2], longest_in_spacings=round(unit['long'][0][2] / unit['spacing'], 1),
                    connections=[(r, m, px) for r, m, px, _ in unit['long'][:4]], tries=[])
         won = False
@@ -270,7 +272,7 @@ def relocate(data, model, scene, blocks, cur, skip_edges, budget_s=150.0, max_un
             log(f"  block relocation {unit['block'][:8]} ({unit['reactions'][:3]}): {row['decision']} (longest {row['longest_in_spacings']} spacings)")
     # coupled units: two rejected units that share a non-currency metabolite pull on each other (moving one changes the other's connections), so a move that is
     # not good alone can be good together.  Try joint candidates (a few positions for each, moved together) for the most displaced pairs.
-    data, base, issues, far = _joint_pairs(data, model, scene, blocks, cur, skip_edges, rejected_units, base, issues, far, report, t0, budget_s, log)
+    data, base, issues, far = _joint_pairs(data, model, scene, blocks, cur, skip_edges, rejected_units, base, issues, far, report, log)
     report['seconds'] = round(time.time() - t0, 1)
     return data, report
 
@@ -333,7 +335,7 @@ def _box(scene, keys, delta):
     return arr.min(0) - 60.0, arr.max(0) + 60.0
 
 
-def _joint_pairs(data, model, scene, blocks, cur, skip_edges, rejected, base, issues, far, report, t0, budget_s, log):
+def _joint_pairs(data, model, scene, blocks, cur, skip_edges, rejected, base, issues, far, report, log):
     import edge_style
     import quality_gate as qg
     rx = {r['id']: r for r in model['reactions']}
@@ -346,9 +348,8 @@ def _joint_pairs(data, model, scene, blocks, cur, skip_edges, rejected, base, is
                 pairs.append((a['long'][0][2] + b['long'][0][2], a, b))
     pairs.sort(key=lambda x: -x[0])
     report['joint_pairs'] = []
+    # Joint search is bounded by JOINT_PAIRS × JOINT_CANDIDATES² gate attempts.
     for _, a, b in pairs[:JOINT_PAIRS]:
-        if time.time() - t0 > budget_s:
-            break
         ca = candidates(scene, a)[:JOINT_CANDIDATES]
         cb = candidates(scene, b)[:JOINT_CANDIDATES]
         row = dict(units=[a['reactions'][:4], b['reactions'][:4]], shared=sorted(mets[id(a)] & mets[id(b)])[:6], tries=[])
@@ -570,12 +571,14 @@ def _whole_block_unit(model, scene, block, cur, long_hint, spacing):
                 block_size=len(inside), cross=[], whole_block=True)
 
 
-def relocate_sub(data, model, scene, blocks, cur, skip_edges, budget_s=150.0, max_units=12, log=None, simple=True):
+def relocate_sub(data, model, scene, blocks, cur, skip_edges, max_units=12, log=None, simple=True):
     """Relocate whole curated blocks triggered by a long exchange+transport submodule.
 
     Detection still uses ``find_sub`` (exchange + transport with an abnormally long link inside a
     large expert block), but the move always translates the **entire** block.  Pulling only
     EX_mal/MALt2_2 (or EX_fum/FUMt2_2) out of the curated structure is forbidden.
+
+    Stops on unit / per-unit try caps only (never wall-clock).
     """
     import edge_style
     import quality_gate as qg
@@ -591,21 +594,18 @@ def relocate_sub(data, model, scene, blocks, cur, skip_edges, budget_s=150.0, ma
         whole = _whole_block_unit(model, scene, block_by_id[bid], cur, sub['long'], sub['spacing'])
         if whole is not None:
             units.append(whole)
+    truncated = max(0, len(units) - max_units)
     report = dict(mode='whole-block (triggered by simple transport)' if simple else 'whole-block (triggered by branch transport)',
-                  units=len(units), accepted=0, rejected=0, budget_exhausted=0,
+                  units=len(units), accepted=0, rejected=0, budget_exhausted=truncated,
                   regenerated_expert_edges=[], rows=[], submodule_triggers=len(subs))
     if not units:
         return data, report
     far = len(units)
     base, summary, issues = qg.evaluate_map(data, skip_edges, disconnected=far)
-    # Cap expensive whole-block trials: translating a 40-reaction curated block rarely
-    # passes the gate and dominated e_coli_core runtime (+16 s of rejected tries).
+    # Cap expensive whole-block trials: translating a large curated block rarely passes the gate.
     max_tries = 2
     max_move_px = 900.0
     for unit in units[:max_units]:
-        if time.time() - t0 > budget_s:
-            report['budget_exhausted'] += 1
-            continue
         row = dict(block=unit['block'], block_size=unit['block_size'], module=unit['reactions'][:8],
                    longest_px=unit['long'][0][2],
                    longest_in_spacings=round(unit['long'][0][2] / unit['spacing'], 1), tries=[])

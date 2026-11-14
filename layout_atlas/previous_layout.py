@@ -1,4 +1,4 @@
-"""Build-on-previous layout: pin reaction/metabolite positions from a prior map.json.
+"""Build-on-previous layout: pin reaction/metabolite positions from a prior result map JSON.
 
 When enough reactions are already placed (≥ ``PACK_SKIP_SHARE``), module packing is
 skipped and only free nodes are completed around the pinned anchors.
@@ -23,7 +23,7 @@ NEW_COMPONENT_GAP = 120.0
 
 
 def load_previous_anchors(path, model=None):
-    """Read reaction midmarkers and primary metabolites from an Escher ``map.json``.
+    """Read reaction midmarkers and primary metabolites from an Escher result map JSON.
 
     Returns ``{ 'r:<id>': [x, y], 'm:<id>': [x, y] }``.  When ``model`` is given,
     only identifiers present in that model are kept.

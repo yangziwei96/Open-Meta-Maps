@@ -4,14 +4,17 @@ After Bézier routing and label placement, reuses ``layout_quality``'s shared
 crossing detector (``build_edges`` / ``_seg_hits`` / ``CrossingIndex``) to find
 the top-k densest 400 px windows and try cheap generic moves.  A move is kept
 only when the headline crossing count (algorithm×algorithm + algorithm×curated)
-strictly falls and node/label overlaps do not rise.  Curated geometry moves only
-as a whole-block translation.
+strictly falls and node/label overlaps do not rise. Curated geometry moves only
+as a whole-block translation. Previous-map pins are never moved.
 
 Evaluation is incremental: a spatial segment index is built once; each candidate
-only recounts segments of the touched reactions (delta counting).  Candidate
+only recounts segments of the touched reactions (delta counting). Candidate
 generation is pruned to nodes/edges that participate in crossings inside the
-window.  The time budget scales with window crossing/edge mass, not a fixed
-model-specific constant.  Deterministic and model-agnostic.
+window. Each visit tries that window's ranked candidates (regenerating after
+an accept); the first accepting window ends the round. Search stops when a
+full pass accepts nothing, or when accept / round / mass-scaled try caps bind.
+Try caps replace wall-clock: same window-mass coefficients as before, never a
+timer. Deterministic and model-agnostic.
 """
 from __future__ import annotations
 
@@ -26,16 +29,66 @@ import edge_style
 import layout_quality as lq
 from core import CURRENCY, chem
 
-DEFAULT_K = 3
-MAX_ROUNDS = 4
-MAX_ACCEPTS = 20
+DEFAULT_K = 5  # layout_quality.evaluate worst_regions count (tests / explicit k)
 WINDOW_PAD = 40.0
-# Budget scales with window mass: seconds ≈ α·crossings + β·edges, summed over top-k.
-BUDGET_CROSS = 0.05   # search-seconds per crossing in the top-k windows
-BUDGET_EDGE = 0.002   # search-seconds per edge touching those windows
-BUDGET_FLOOR = 0.8    # search floor (index build is timed separately)
-BUDGET_CAP = 30.0     # absolute search cap (mid GEMs need headroom past the old 12 s)
-TRIES_PER_CROSS = 4.0 # evaluation tries scale with window crossings
+# Mass-scaled try budget from window crossings/edges; try ceiling only —
+# never as wall-clock. Caller may raise the implied depth via budget_s.
+BUDGET_CROSS = 0.05
+BUDGET_EDGE = 0.002
+BUDGET_FLOOR = 0.8
+BUDGET_CAP = 30.0
+TRIES_PER_CROSS = 4.0
+# Legacy callers pass wall-clock ``budget_s``. The inflated try ceiling
+# (auto_tries × budget_s / auto_budget) is larger than wall-clock typically
+# exhausted; keep ~this fraction so maps stay equivalent to the wall-limited
+# stable tip (iIT341 A/B: 1815 / 3365 tries in 45s).
+_WALL_TRY_FRACTION = 0.54
+# Default k=DEFAULT_K matches layout_quality.evaluate worst_regions. Caps:
+#   max_accepts / max_rounds from caller (tool_pipeline) or window crossing mass
+#   max_tries from window mass × TRIES_PER_CROSS, scaled when budget_s > auto
+# Per window visit: ranked candidates with regen after each accept;
+# the first accepting window ends the round. Stop after an idle round.
+# Never wall-clock.
+
+
+
+
+
+def _window_budget(windows, k=DEFAULT_K):
+    """Try/second budget from window mass (main formula); seconds unused at runtime."""
+    wins = list(windows or [])[:k]
+    mass_c = sum(int(w.get('crossings') or 0) for w in wins)
+    mass_e = sum(int(w.get('edges') or 0) for w in wins)
+    seconds = min(BUDGET_CAP, max(BUDGET_FLOOR, BUDGET_CROSS * mass_c + BUDGET_EDGE * mass_e))
+    tries = max(8, int(TRIES_PER_CROSS * max(mass_c, 1)))
+    return seconds, tries, dict(window_crossings=mass_c, window_edges=mass_e)
+
+
+def _touches_pins(data, moved_nids, pinned_keys):
+    """True when a move relocates a previous-map pin (reaction mid or metabolite)."""
+    if not pinned_keys or not moved_nids:
+        return False
+    body = data[1] if isinstance(data, list) else data
+    nodes = body.get('nodes') or {}
+    pinned_r = {k[2:] for k in pinned_keys if k.startswith('r:')}
+    pinned_m = {k[2:] for k in pinned_keys if k.startswith('m:')}
+    if not pinned_r and not pinned_m:
+        return False
+    if pinned_r:
+        for rx in (body.get('reactions') or {}).values():
+            rid = rx.get('bigg_id')
+            if rid not in pinned_r:
+                continue
+            for seg in (rx.get('segments') or {}).values():
+                for end in ('from_node_id', 'to_node_id'):
+                    nid = seg.get(end)
+                    if nid in moved_nids and (nodes.get(nid) or {}).get('node_type') == 'midmarker':
+                        return True
+    for nid in moved_nids:
+        n = nodes.get(nid) or {}
+        if n.get('node_type') == 'metabolite' and n.get('bigg_id') in pinned_m:
+            return True
+    return False
 
 
 def _is_currency(bigg):
@@ -76,14 +129,14 @@ def _score(data, skip_edges, structures=None):
     )
 
 
-def _window_budget(windows, k=DEFAULT_K):
-    """Time/try budget from window size (crossings + edges), not a model id."""
-    wins = list(windows or [])[:k]
+def _window_mass(windows, k=None):
+    """Crossing/edge mass of the selected hotspot windows (reporting only)."""
+    wins = list(windows or [])
+    if k is not None:
+        wins = wins[:k]
     mass_c = sum(int(w.get('crossings') or 0) for w in wins)
     mass_e = sum(int(w.get('edges') or 0) for w in wins)
-    seconds = min(BUDGET_CAP, max(BUDGET_FLOOR, BUDGET_CROSS * mass_c + BUDGET_EDGE * mass_e))
-    tries = max(8, int(TRIES_PER_CROSS * max(mass_c, 1)))
-    return seconds, tries, dict(window_crossings=mass_c, window_edges=mass_e)
+    return dict(window_crossings=mass_c, window_edges=mass_e)
 
 
 def _spacing_from_nodes(nodes):
@@ -362,6 +415,7 @@ def _candidate_moves(data, scene, blocks, win, skip, expert, spacing, cross_rids
             moves.append(dict(kind='reroute', rid=rid, order=(2, rid)))
 
     # Small free-node nudges for crossing participants that are free.
+    # Stable sort; at most the first 12 free participants get 4-direction probes.
     free = []
     for nid in sorted(focus_nids):
         n = nodes.get(nid)
@@ -612,13 +666,27 @@ def diagnose_windows(data, skip_edges=None, k=DEFAULT_K):
 
 
 def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K,
-           max_rounds=MAX_ROUNDS, max_accepts=MAX_ACCEPTS, budget_s=None, log=None,
-           structures=None):
-    """Greedy local repair of the top-k crossing hotspots. Mutates ``data`` in place when accepting."""
+           max_rounds=None, max_accepts=None, budget_evals=None, budget_s=None, log=None,
+           structures=None, pinned_keys=None):
+    """Greedy local repair of crossing hotspots. Mutates ``data`` when accepting.
+
+    ``k`` is the max number of separated positive-crossing windows (same count as
+    ``layout_quality.evaluate`` worst_regions; default ``DEFAULT_K``). Pass
+    ``k=None`` to keep every positive window after the 300 px separation filter.
+    Each window visit walks ranked candidates and regenerates after an accept;
+    the first accepting window ends the round. A full pass with no accept stops
+    search. Defaults: ``max_accepts`` = sum of crossings in those windows;
+    ``max_rounds`` = ``max_accepts + 1``. Try ceiling from window mass
+    (``TRIES_PER_CROSS``), scaled when ``budget_s`` exceeds the mass-derived
+    second estimate; ``budget_evals`` overrides that ceiling (tests). Never
+    wall-clock. ``pinned_keys`` are previous-map ``r:`` / ``m:`` anchors that
+    must not move.
+    """
     t0 = time.time()
     skip = _skip_set(data, skip_edges)
     expert = _expert_reaction_ids(blocks, data)
     structures = structures or (data[0].get('metadata') or {}).get('expert_structures')
+    pinned_keys = set(pinned_keys or ())
 
     # Setup (not charged to the search budget): shared index + light metrics (no full evaluate).
     # Use the same skip set as evaluate (preserved + source_paths), not the raw caller list.
@@ -631,23 +699,36 @@ def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K
     from evaluation.continuity import structure_continuity as _structure_continuity
     cont = _structure_continuity(data, structures=structures)
     before = _metrics_from_index(index, windows, node_ov0, lab_ov0, cont, length_p90, spacing)
-    auto_budget, auto_tries, mass = _window_budget(windows, k)
-    if budget_s is None:
-        budget_s = auto_budget
-    # When the caller raises the time budget, scale tries so search is not try-capped first.
-    max_tries = auto_tries
-    if budget_s > auto_budget and auto_budget > 0:
-        max_tries = max(auto_tries, int(auto_tries * budget_s / auto_budget))
+    mass = _window_mass(windows, k)
+    # Caps from the windows we search: each accept removes ≥1 of that crossing mass.
+    if max_accepts is None:
+        max_accepts = max(1, int(mass['window_crossings'] or before['crossings'] or 1))
+    else:
+        max_accepts = int(max_accepts)
+    if max_rounds is None:
+        max_rounds = max_accepts + 1
+    else:
+        max_rounds = int(max_rounds)
+    # Try ceiling from window mass. ``budget_s`` (legacy wall seconds) scales
+    # tries when above the mass-derived second estimate — never a wall-clock stop.
+    auto_budget, auto_tries, _mass2 = _window_budget(windows, k if k is not None else DEFAULT_K)
+    if budget_evals is not None:
+        max_tries = int(budget_evals)
+    else:
+        max_tries = auto_tries
+        if budget_s is not None and auto_budget > 0 and float(budget_s) > auto_budget:
+            scaled = max(auto_tries, int(auto_tries * float(budget_s) / auto_budget))
+            max_tries = max(8, int(scaled * _WALL_TRY_FRACTION))
     setup_s = round(time.time() - t0, 2)
-
     report = dict(
         enabled=True, k=k, before={kk: before[kk] for kk in (
             'crossings', 'top_window_crossings', 'worst_window', 'node_overlaps', 'label_overlaps',
             'continuity_share', 'split_structures', 'length_p90', 'currency_involved', 'main_metabolite')},
         accepted=[], rejected=0, tries=0, rounds=0, reject_reasons={},
-        budget_s=round(budget_s, 2), budget_mass=mass, setup_s=setup_s, diagnosis=[],
+        budget_evals=max_tries, budget_mass=mass, setup_s=setup_s, diagnosis=[],
+        max_rounds=max_rounds, max_accepts=max_accepts,
     )
-    for win in windows[:k]:
+    for win in windows:
         report['diagnosis'].append(index.window_breakdown(win) | dict(
             window=[win['x'], win['y']], listed_crossings=win.get('crossings'),
             reactions=win.get('reactions')))
@@ -656,36 +737,31 @@ def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K
     current_cross = index.headline()
     if log:
         log(f"  hotspot repair: start crossings={before['crossings']} worst_window={report['before']['worst_window']} "
-            f"search_budget={budget_s:.1f}s tries≤{max_tries} setup={setup_s}s spacing={spacing:.1f}")
+            f"search_budget=idle stop / rounds≤{max_rounds} accepts≤{max_accepts} tries≤{max_tries} "
+            f"setup={setup_s}s spacing={spacing:.1f}")
 
     t_search = time.time()
     for rnd in range(max_rounds):
-        if time.time() - t_search > budget_s or accepts >= max_accepts or report['tries'] >= max_tries:
+        if accepts >= max_accepts or (max_tries is not None and report['tries'] >= max_tries):
             break
         report['rounds'] = rnd + 1
         if not windows or all(w.get('crossings', 0) <= 0 for w in windows):
             break
         progressed = False
         for win in windows:
-            if time.time() - t_search > budget_s or accepts >= max_accepts or report['tries'] >= max_tries:
+            if accepts >= max_accepts or (max_tries is not None and report['tries'] >= max_tries):
                 break
             cross_rids, cross_nids = index.participants_in_window(win)
             if not cross_rids:
                 # Fall back to the window's listed reactions so we still try side flips.
                 cross_rids = set(win.get('reactions') or [])
             moves = _candidate_moves(data, scene, blocks, win, skip, expert, spacing, cross_rids, cross_nids)
-            win_share = max(1, int(win.get('crossings') or 1))
-            win_try_cap = max(6, int(max_tries * win_share / max(mass['window_crossings'], 1)))
-            tried_here = 0
             mi = 0
             while mi < len(moves):
-                if time.time() - t_search > budget_s or accepts >= max_accepts or report['tries'] >= max_tries:
-                    break
-                if tried_here >= win_try_cap:
+                if accepts >= max_accepts or (max_tries is not None and report['tries'] >= max_tries):
                     break
                 move = moves[mi]
                 mi += 1
-                tried_here += 1
                 report['tries'] += 1
                 result = _apply_move_inplace(data, scene, blocks, move, skip, expert)
                 if result[0] is None:
@@ -694,6 +770,11 @@ def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K
                     report['reject_reasons'][reason] = report['reject_reasons'].get(reason, 0) + 1
                     continue
                 undo, changed, moved = result
+                if _touches_pins(data, moved, pinned_keys):
+                    undo()
+                    report['rejected'] += 1
+                    report['reject_reasons']['pinned'] = report['reject_reasons'].get('pinned', 0) + 1
+                    continue
                 if moved and not _local_node_overlap_ok(data, moved):
                     undo()
                     report['rejected'] += 1
@@ -744,7 +825,6 @@ def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K
                     cross_rids = set(win.get('reactions') or [])
                 moves = _candidate_moves(data, scene, blocks, win, skip, expert, spacing, cross_rids, cross_nids)
                 mi = 0
-                tried_here = 0
             if progressed:
                 break
         if not progressed:
@@ -773,8 +853,13 @@ def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K
     return report
 
 
-def _windows_from_index(index, k):
-    """Rebuild top-k worst regions from the index events (same 400/200 boxes as evaluate)."""
+
+def _windows_from_index(index, k=None):
+    """Worst crossing windows from the index (same 400/200 boxes as evaluate).
+
+    When ``k`` is None, keep every positive-crossing cell that survives the
+    300 px separation filter (problem-sized window list).
+    """
     if not index.edges:
         return []
     centres = np.array([[n['x'], n['y']] for n in index.nodes.values()
@@ -805,6 +890,6 @@ def _windows_from_index(index, k):
         out.append(dict(x=round(wx, 1), y=round(wy, 1), w=int(lq.REGION_WINDOW), h=int(lq.REGION_WINDOW),
                         crossings=c['crossings'], edges=c['edges'],
                         reactions=sorted(c['reactions'])[:10]))
-        if len(out) == k:
+        if k is not None and len(out) == k:
             break
     return out

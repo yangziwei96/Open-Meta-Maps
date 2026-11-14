@@ -2,7 +2,8 @@
 
   python3 project.py compose --gem examples/e_coli_core.xml --out results/local_mvp/ [--ec] [--no-library] [--library windows|units_sub]
 
-Writes the whole job folder (map.json, map.svg, report.json, skeleton.*, modules.json, licenses.json, views/ ...).
+Writes the whole job folder (OpenMetaMaps_<stem>_result.{json,svg,sbgn,...}, report.json,
+skeleton.*, modules.json, licenses.json, views/ ...).
 Exit code 0 only when the pipeline finished and the integrity checks passed.
 """
 import shutil
@@ -11,9 +12,10 @@ import sys
 import time
 
 from core import *
+import output_names
 import tool_server
 
-RESULT_FILES = ['job.json', 'map.json', 'map.svg', 'map.sbgn', 'map.sbml', 'map.celldesigner.xml', 'report.json', 'skeleton.json', 'skeleton.svg', 'modules.json', 'licenses.json', 'selected.json.gz', 'views.json']
+RESULT_FILES = ['job.json', 'report.json', 'skeleton.json', 'skeleton.svg', 'modules.json', 'licenses.json', 'selected.json.gz', 'views.json', 'layout_issues.json', 'reaction_provenance.json', 'meta.json', 'options.json']
 
 
 def run(gem, out, ec=False, no_library=False, library='windows', reaction_style='line', completion='spaced', source_paths=False, layout='global', orientation='full', block_layout='auto', instances='auto', context='auto', edge_routing='libavoid', completion_context='auto', layout_style='curated', previous=None):
@@ -33,10 +35,13 @@ def run(gem, out, ec=False, no_library=False, library='windows', reaction_style=
     out.mkdir(parents=True, exist_ok=True)
     for name in RESULT_FILES:  # drop stale results of an earlier run in the same folder
         (out / name).unlink(missing_ok=True)
+    output_names.clear_stale_results(out)
     shutil.rmtree(out / 'views', ignore_errors=True)
+    shutil.rmtree(out / 'full', ignore_errors=True)
     shutil.rmtree(out / 'upload', ignore_errors=True)
     (out / 'upload').mkdir()
     shutil.copy(gem, out / 'upload' / ('model' + gem.suffix.lower()))
+    output_names.write_meta(out, gem.name, size=gem.stat().st_size)
     libraries = dict(core=not no_library, ec=bool(ec))
     options = dict(libraries=libraries, library=library, reaction_style=reaction_style, completion=completion, source_paths=bool(source_paths), layout=layout, orientation=orientation, block_layout=block_layout, instances=instances, context=context, edge_routing=edge_routing, completion_context=completion_context, layout_style=layout_style)
     if previous_path is not None:

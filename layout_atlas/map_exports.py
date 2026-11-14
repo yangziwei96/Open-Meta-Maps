@@ -1,4 +1,4 @@
-"""Export a composed Escher map.json to SBGN-ML, SBML Layout, and CellDesigner SBML.
+"""Export a composed Escher result JSON to SBGN-ML, SBML Layout, and CellDesigner SBML.
 
 Exports read the final map geometry and the input GEM. They do not change layout
 coordinates or the model stoichiometry. Shared helpers live here so CLI compose,
@@ -29,11 +29,20 @@ MACRO_W, MACRO_H = 80.0, 40.0
 # SBO terms that map to macromolecule glyphs / PROTEIN in CellDesigner.
 SBO_MACRO = {245, 252, 253, 254, 297, 336}
 
-EXPORT_FILES = (
-    ('map.sbgn', 'sbgn', 'Completed map, SBGN-ML'),
-    ('map.sbml', 'sbml', 'Completed map, SBML with Layout'),
-    ('map.celldesigner.xml', 'xml', 'Completed map, CellDesigner SBML'),
+EXPORT_KINDS = (
+    ('sbgn', 'sbgn', 'Completed map, SBGN-ML'),
+    ('sbml', 'sbml', 'Completed map, SBML with Layout'),
+    ('celldesigner.xml', 'xml', 'Completed map, CellDesigner SBML'),
 )
+
+
+def export_file_entries(stem):
+    """Return (filename, kind, title) tuples for the three map export formats."""
+    import output_names
+    return tuple(
+        (output_names.result_filename(stem, ext), kind, title)
+        for ext, kind, title in EXPORT_KINDS
+    )
 
 _NCNAME = re.compile(r'^[A-Za-z_][A-Za-z0-9_\-.]*$')
 
@@ -1071,13 +1080,15 @@ def write_celldesigner(path, data, model):
 # ------------------------------------------------------------------------------------------------ Orchestration
 
 
-def write_all_exports(folder, model_path=None, map_path=None, model=None):
-    """Write SBGN-ML, SBML Layout and CellDesigner SBML next to map.json.
+def write_all_exports(folder, model_path=None, map_path=None, model=None, stem=None):
+    """Write SBGN-ML, SBML Layout and CellDesigner SBML next to the Escher result JSON.
 
-    Returns a list of written filenames. Missing map.json yields an empty list.
+    Returns a list of written filenames. Missing map JSON yields an empty list.
     """
+    import output_names
     folder = Path(folder)
-    map_path = Path(map_path) if map_path else folder / 'map.json'
+    stem = stem or output_names.stem_from_folder(folder)
+    map_path = Path(map_path) if map_path else output_names.map_json(folder, stem)
     if not map_path.is_file():
         return []
     data = read(map_path)
@@ -1090,12 +1101,15 @@ def write_all_exports(folder, model_path=None, map_path=None, model=None):
         model = load_model(model_path)
     model_path = Path(model_path) if model_path else None
 
+    sbgn_path = output_names.map_export(folder, 'sbgn', stem)
+    sbml_out = output_names.map_export(folder, 'sbml', stem)
+    cd_path = output_names.map_export(folder, 'celldesigner.xml', stem)
     sbml_path, temporary = _ensure_sbml_path(model_path, model, folder=folder)
     try:
-        write_sbgn(folder / 'map.sbgn', data, model, sbml_path=sbml_path)
-        write_sbml_layout(folder / 'map.sbml', sbml_path, data, model=model)
-        write_celldesigner(folder / 'map.celldesigner.xml', data, model)
+        write_sbgn(sbgn_path, data, model, sbml_path=sbml_path)
+        write_sbml_layout(sbml_out, sbml_path, data, model=model)
+        write_celldesigner(cd_path, data, model)
     finally:
         if temporary:
             Path(sbml_path).unlink(missing_ok=True)
-    return ['map.sbgn', 'map.sbml', 'map.celldesigner.xml']
+    return [sbgn_path.name, sbml_out.name, cd_path.name]

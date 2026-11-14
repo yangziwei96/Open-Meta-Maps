@@ -95,7 +95,7 @@ def _step(ctx, unit, nb_keys, exclude_units, keys_of, label, row_extra):
     import block_relocation as br
     import edge_style
     import quality_gate as qg
-    data, scene, skip_edges, base, spacing, budget_end = ctx['data'], ctx['scene'], ctx['skip'], ctx['base'], ctx['spacing'], ctx['budget_end']
+    data, scene, skip_edges, base, spacing = ctx['data'], ctx['scene'], ctx['skip'], ctx['base'], ctx['spacing']
     mine = _rect(scene, unit['keys'])
     theirs = _rect(scene, nb_keys)
     gap_before = _gap(mine, theirs)
@@ -120,8 +120,6 @@ def _step(ctx, unit, nb_keys, exclude_units, keys_of, label, row_extra):
     row = dict(label=label, reactions=len(unit['reactions']), gap_before_spacings=round(gap_before / spacing, 1), tries=[], **row_extra)
     best = None
     for side, align, delta in cands:
-        if time.time() > budget_end:
-            break
         d1, detached = br._detach_cross_edges(data, scene, unit)
         d2, redo, _ = qg.translate_module(d1, scene, unit['keys'], delta, set(unit['reactions']), skip_edges)
         sk = [e for e in skip_edges if list(e) not in detached]
@@ -159,7 +157,8 @@ def _spread(scene, keys_of, region_units):
     return max(min(_gap(a, b) for j, b in enumerate(rects) if j != i) for i, a in enumerate(rects))
 
 
-def place(data, model, scene, blocks, cur, skip_edges, budget_s=300.0, log=None):
+def place(data, model, scene, blocks, cur, skip_edges, log=None):
+    """Place regions beside linked neighbours. Adjacency tries at most MAX_REGIONS; no wall-clock."""
     import block_relocation as br
     import quality_gate as qg
     t0 = time.time()
@@ -169,7 +168,7 @@ def place(data, model, scene, blocks, cur, skip_edges, budget_s=300.0, log=None)
         return data, report
     spacing = br._spacing(scene['positions'])
     base, summary, issues = qg.evaluate_map(data, skip_edges, disconnected=0)
-    ctx = dict(data=data, scene=scene, skip=skip_edges, base=base, spacing=spacing, budget_end=t0 + budget_s, tried=0, accepted=0, rejected=0)
+    ctx = dict(data=data, scene=scene, skip=skip_edges, base=base, spacing=spacing, tried=0, accepted=0, rejected=0)
     size = {i: sum(len(reactions_of[u]) for u in r) for i, r in enumerate(regs)}
     anchor = max(size, key=lambda i: (size[i], -i))
     region_of_unit = {u: i for i, r in enumerate(regs) for u in r}
@@ -179,14 +178,14 @@ def place(data, model, scene, blocks, cur, skip_edges, budget_s=300.0, log=None)
         unit_link[uids[b], uids[a]] += w
     # --- 1. compaction: inside each region the units are brought beside their strongest partner in the same region
     for ri, region in enumerate(regs):
-        if len(region) < 2 or time.time() > ctx['budget_end']:
+        if len(region) < 2:
             continue
         spread_before = _spread(scene, keys_of, region)
         big = max(region, key=lambda u: (len(reactions_of[u]), u))
         placed_units = {big}
         todo = [u for u in region if u != big]
         info = dict(region=ri, units=len(region), spread_before_spacings=round(spread_before / spacing, 1), moves=[])
-        while todo and time.time() < ctx['budget_end']:
+        while todo:
             nxt = max(todo, key=lambda u: (sum(unit_link.get((u, v), 0.0) for v in placed_units), len(reactions_of[u]), u))
             w_best = sum(unit_link.get((nxt, v), 0.0) for v in placed_units)
             todo.remove(nxt)
@@ -219,9 +218,6 @@ def place(data, model, scene, blocks, cur, skip_edges, budget_s=300.0, log=None)
         remaining.discard(nxt)
     done = {anchor}
     for ri in order[:MAX_REGIONS]:
-        if time.time() > ctx['budget_end']:
-            report['rows'].append(dict(region=regs[ri], decision='budget_exhausted'))
-            continue
         nb = max(done, key=lambda j: link.get((min(ri, j), max(ri, j)), 0.0))
         unit = _region_unit(model, scene, reactions_of, keys_of, regs[ri])
         nb_keys = set().union(*[keys_of[u] for u in regs[nb]])

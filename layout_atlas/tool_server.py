@@ -8,8 +8,8 @@
 * GET /<path>                read-only static files from results/ (catalog, atlas_browser, experiment pages, ...); tool_runs is NOT served this way
 * POST /api/jobs             multipart/form-data: `model` (.xml SBML or .json COBRA/BiGG) + `options` (JSON string)
 * GET  /api/jobs/<id>        job state (see tool_pipeline.Job)
-* GET  /api/jobs/<id>/files/<name>   result files (skeleton.svg, map.svg, map.json, modules.json, report.json, licenses.json, views/<view>.svg ...)
-* POST /api/jobs/<id>/map            save interactive position edits into map.json (keeps map.original.json once; regenerates map.svg + layout quality)
+* GET  /api/jobs/<id>/files/<name>   result files (skeleton.svg, OpenMetaMaps_<stem>_result.*, modules.json, report.json, licenses.json, views/<view>.svg ...)
+* POST /api/jobs/<id>/map            save interactive position edits into the result Escher JSON (keeps map.original.json once; regenerates result SVG + layout quality)
 * POST /api/jobs/<id>/views/<view_id>  draw one view (queued behind running jobs)
 * DELETE /api/jobs/<id>      cancel a running job and delete its folder
 * GET  /api/atlas/meta       Atlas Browser filter vocabulary + counts (builds index on first use)
@@ -392,7 +392,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_json(400, error('bad_format', 'The body is not valid JSON.'))
         try:
             import map_edit
-            result = map_edit.save_map_edit(jd, edit, filename='map.json')
+            result = map_edit.save_map_edit(jd, edit)
         except Exception as e:
             import jsonschema
             if isinstance(e, jsonschema.ValidationError):
@@ -417,7 +417,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.rfile.read(min(length, MAX_BYTES))
         try:
             import map_edit
-            result = map_edit.reset_map(jd, filename='map.json')
+            result = map_edit.reset_map(jd)
         except FileNotFoundError:
             return self.send_json(404, error('no_original', 'No original map backup to restore.'))
         except Exception as e:
@@ -492,7 +492,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         (jd / 'upload').mkdir(parents=True)
         (jd / 'upload' / ('model' + ext)).write_bytes(data)
         (jd / 'options.json').write_text(json.dumps(options))
-        (jd / 'meta.json').write_text(json.dumps(dict(original_name=Path(filename or 'model').name, bytes=len(data), created=time.time())))
+        import output_names
+        output_names.write_meta(jd, filename or 'model', size=len(data))
         write_state(jd, queued_state(job_id))
         tasks.put((jd, None))
         self.send_json(201, dict(id=job_id, status='queued'))
