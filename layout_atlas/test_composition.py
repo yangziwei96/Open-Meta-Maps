@@ -250,6 +250,192 @@ def test_pack_into_main_pockets_places_beside_main():
     assert -80 <= x <= 160 and -80 <= y <= 160
 
 
+def test_reflow_landscape_in_band_keeps_near_tiles():
+    """In-band frame: pocket far outliers only; do not shelf near leftovers to the side.
+
+    Regression for e_coli TR floaters / iIT341 spokes: leftover used to mean
+    ``all sizes − pocketed``, which yanked near tiles onto an external shelf.
+    """
+    # Landscape main ~1080×720 (aspect 1.5). Chain reactions through a shared
+    # backbone metabolite so they form one MAIN_MIN+ component.
+    reactions = []
+    parts = {}
+    pos = {}
+    n_main = max(C.MAIN_MIN, 30)
+    cols = 6
+    for i in range(n_main):
+        rid = f'M{i}'
+        mid = f'm{i}'
+        mets = {'backbone': -1.0, mid: 1.0} if i else {mid: -1.0, 'backbone': 1.0}
+        reactions.append({'id': rid, 'metabolites': mets})
+        for m in mets:
+            parts[rid, m] = f'm:{m}'
+        x = (i % cols) * 180.0
+        y = (i // cols) * 180.0
+        pos[f'r:{rid}'] = [x, y]
+        pos[f'm:{mid}'] = [x + 40.0, y + 20.0]
+    pos['m:backbone'] = [500.0, 360.0]
+    # Near free component (inside main AABB, well under FAR_OUTLIER_FRAC · span).
+    reactions.append({'id': 'NEAR', 'metabolites': {'n': -1.0}})
+    parts['NEAR', 'n'] = 'm:n'
+    pos['r:NEAR'] = [500.0, 400.0]
+    pos['m:n'] = [540.0, 420.0]
+    near_before = list(pos['r:NEAR'])
+    # Far free component to the right; combined aspect stays in 4:3–16:9 so the
+    # in-band path runs, while distance still exceeds FAR_OUTLIER_FRAC · span.
+    reactions.append({'id': 'FAR', 'metabolites': {'f': -1.0}})
+    parts['FAR', 'f'] = 'm:f'
+    pos['r:FAR'] = [1200.0, 360.0]
+    pos['m:f'] = [1240.0, 380.0]
+    model = {'reactions': reactions}
+    scene = {'positions': pos, 'participants': parts, 'labels': {}}
+    cur = set()
+    out, rep = C.reflow_landscape(model, scene, blocks=[], cur=cur)
+    assert C.ASPECT_MIN - 1e-3 <= rep.get('aspect_before', 0) <= C.ASPECT_MAX + 1e-3, rep
+    assert rep.get('reason') == 'main_pocket_pack', rep
+    assert rep.get('pocket', {}).get('near_kept', 0) >= 1, rep
+    # Near tile must not be skyline-shelved far from its original pose.
+    near_after = out['positions']['r:NEAR']
+    assert abs(near_after[0] - near_before[0]) < 1e-6, (near_before, near_after, rep)
+    assert abs(near_after[1] - near_before[1]) < 1e-6, (near_before, near_after, rep)
+    # Far leftover must not stay parked at the wide skyline shelf; flush-tuck
+    # (or pocket) pulls it beside main (leftover count → 0).
+    assert rep.get('pocket', {}).get('leftover', 1) == 0, rep
+    far_after = out['positions']['r:FAR']
+    assert far_after[0] < 1100.0, (far_after, rep)
+
+
+def test_flush_tuck_against_main_stacks_flush():
+    """Leftover boxes stack flush with main (east preferred when in-band)."""
+    sizes = {0: (80.0, 60.0), 1: (70.0, 50.0)}
+    centres = {0: np.array([2000.0, 100.0]), 1: np.array([2100.0, 200.0])}
+    placed, rep = C.flush_tuck_against_main(
+        [0, 1], sizes, centres, main_lo=(0.0, 0.0), main_hi=(1000.0, 700.0))
+    assert set(placed) == {0, 1}, rep
+    assert rep.get('side') == 'right', rep
+    # Flush: top-left x sits at main_hi + gap, not a multi-thousand skyline shelf.
+    gap = C.FLUSH_TUCK_GAP
+    assert abs(placed[0][0] - (1000.0 + gap)) < 1e-6
+    assert placed[0][1] < placed[1][1]
+
+
+def test_tuck_islands_escher_closes_min_point_gap():
+    """Escher-map island with a large empty corridor slides flush to main."""
+    # Main cluster of midmarkers + metabolites forming MAIN_MIN reactions.
+    nodes = {}
+    reactions = {}
+    n_main = max(C.MAIN_MIN, 24)
+    for i in range(n_main):
+        mid = f'mid{i}'
+        met = f'met{i}'
+        nodes[mid] = {'node_type': 'midmarker', 'x': (i % 6) * 100.0, 'y': (i // 6) * 100.0}
+        nodes[met] = {'node_type': 'metabolite', 'bigg_id': f'm{i}_c',
+                      'x': (i % 6) * 100.0 + 40.0, 'y': (i // 6) * 100.0 + 20.0}
+        rid = f'M{i}'
+        reactions[str(i)] = {
+            'bigg_id': rid,
+            'segments': {
+                '0': {'from_node_id': mid, 'to_node_id': met},
+            },
+        }
+    # Shared backbone metabolite so mains form one visual component.
+    nodes['bb'] = {'node_type': 'metabolite', 'bigg_id': 'backbone_c', 'x': 250.0, 'y': 150.0}
+    for i in range(n_main):
+        reactions[str(i)]['segments']['1'] = {
+            'from_node_id': f'mid{i}', 'to_node_id': 'bb'}
+    # Far island above main.
+    nodes['imid'] = {'node_type': 'midmarker', 'x': 200.0, 'y': -900.0}
+    nodes['imet'] = {'node_type': 'metabolite', 'bigg_id': 'z_c', 'x': 220.0, 'y': -880.0}
+    reactions['isl'] = {
+        'bigg_id': 'ISL',
+        'segments': {'0': {'from_node_id': 'imid', 'to_node_id': 'imet'}},
+    }
+    data = [{}, {'nodes': nodes, 'reactions': reactions}]
+    before_y = nodes['imid']['y']
+    rep = C.tuck_islands_escher(data, cur=set(), spacing=100.0)
+    assert rep.get('moved', 0) >= 1, rep
+    assert nodes['imid']['y'] > before_y + 300.0, (before_y, nodes['imid']['y'], rep)
+
+
+def test_tuck_islands_escher_far_not_swallowed_by_near_cluster():
+    """A far floater next to a near island must still tuck (not min-gap skip)."""
+    nodes = {}
+    reactions = {}
+    n_main = max(C.MAIN_MIN, 24)
+    for i in range(n_main):
+        mid = f'mid{i}'
+        met = f'met{i}'
+        nodes[mid] = {'node_type': 'midmarker', 'x': (i % 6) * 100.0, 'y': (i // 6) * 100.0}
+        nodes[met] = {'node_type': 'metabolite', 'bigg_id': f'm{i}_c',
+                      'x': (i % 6) * 100.0 + 40.0, 'y': (i // 6) * 100.0 + 20.0}
+        reactions[str(i)] = {
+            'bigg_id': f'M{i}',
+            'segments': {'0': {'from_node_id': mid, 'to_node_id': met}},
+        }
+    nodes['bb'] = {'node_type': 'metabolite', 'bigg_id': 'backbone_c', 'x': 250.0, 'y': 150.0}
+    for i in range(n_main):
+        reactions[str(i)]['segments']['1'] = {
+            'from_node_id': f'mid{i}', 'to_node_id': 'bb'}
+    # Near island just above main (within join radius of the far one).
+    nodes['nmid'] = {'node_type': 'midmarker', 'x': 200.0, 'y': -80.0}
+    nodes['nmet'] = {'node_type': 'metabolite', 'bigg_id': 'near_c', 'x': 220.0, 'y': -60.0}
+    reactions['near'] = {
+        'bigg_id': 'NEAR',
+        'segments': {'0': {'from_node_id': 'nmid', 'to_node_id': 'nmet'}},
+    }
+    # Far island ~900 px above; spatial join would swallow it into NEAR's min-gap.
+    nodes['imid'] = {'node_type': 'midmarker', 'x': 200.0, 'y': -900.0}
+    nodes['imet'] = {'node_type': 'metabolite', 'bigg_id': 'z_c', 'x': 220.0, 'y': -880.0}
+    reactions['isl'] = {
+        'bigg_id': 'ISL',
+        'segments': {'0': {'from_node_id': 'imid', 'to_node_id': 'imet'}},
+    }
+    data = [{}, {'nodes': nodes, 'reactions': reactions}]
+    before_y = nodes['imid']['y']
+    rep = C.tuck_islands_escher(data, cur=set(), spacing=100.0)
+    assert rep.get('moved', 0) >= 1, rep
+    assert any(d.get('reactions') and 'ISL' in d['reactions'] for d in rep.get('details') or []), rep
+    assert nodes['imid']['y'] > before_y + 300.0, (before_y, nodes['imid']['y'], rep)
+
+
+def test_tuck_islands_to_silhouette_closes_aabb_void():
+    """Island parked in an AABB void (leftover=0 look) slides flush to main hull."""
+    reactions = []
+    parts = {}
+    pos = {}
+    n_main = max(C.MAIN_MIN, 24)
+    cols = 6
+    for i in range(n_main):
+        rid = f'M{i}'
+        mid = f'm{i}'
+        mets = {'backbone': -1.0, mid: 1.0} if i else {mid: -1.0, 'backbone': 1.0}
+        reactions.append({'id': rid, 'metabolites': mets})
+        for m in mets:
+            parts[rid, m] = f'm:{m}'
+        x = (i % cols) * 120.0
+        y = (i // cols) * 120.0
+        pos[f'r:{rid}'] = [x, y]
+        pos[f'm:{mid}'] = [x + 30.0, y + 20.0]
+    pos['m:backbone'] = [300.0, 200.0]
+    # Far island above the main hull across ~800 px empty corridor (still may sit
+    # inside a padded AABB after pocket-pack — the visual floater case).
+    reactions.append({'id': 'ISL', 'metabolites': {'z': -1.0, 'w': 1.0}})
+    parts['ISL', 'z'] = 'm:z'
+    parts['ISL', 'w'] = 'm:w'
+    pos['r:ISL'] = [200.0, -800.0]
+    pos['m:z'] = [180.0, -820.0]
+    pos['m:w'] = [220.0, -780.0]
+    before = list(pos['r:ISL'])
+    model = {'reactions': reactions}
+    scene = {'positions': pos, 'participants': parts, 'labels': {}}
+    out, rep = C.tuck_islands_to_silhouette(model, scene, blocks=[], cur=set(), spacing=120.0)
+    assert rep.get('moved', 0) >= 1, rep
+    after = out['positions']['r:ISL']
+    # Pulled downward toward main (y increases from -800 toward ~0..400).
+    assert after[1] > before[1] + 200.0, (before, after, rep)
+    assert after[1] < 500.0, (after, rep)
+
+
 def test_fit_canvas_to_content_shrinks_frame():
     data = [
         {},
@@ -270,6 +456,117 @@ def test_fit_canvas_to_content_shrinks_frame():
     assert abs(can['y'] - 160.0) < 1e-6
     assert abs(can['width'] - 380.0) < 1e-6
     assert abs(can['height'] - 380.0) < 1e-6
+
+
+def test_empty_corridor_does_not_drag_curated_companions():
+    """ICL→succ empty column must not yank curated ACONTb via shared icit."""
+    # Vertical empty corridor: ICL mid at y=0 to shared succ at y=2000.
+    # Real e_coli TCA expert cluster lists CS+ACONTa+ACONTb+ICL together.
+    data = [{
+        'metadata': {'expert_structures': [
+            {'id': 'tca', 'reactions': ['CS', 'ACONTa', 'ACONTb', 'ICL']},
+        ]},
+    }, {
+        'nodes': {
+            'icl_mid': {'node_type': 'midmarker', 'x': 100.0, 'y': 0.0},
+            'icit': {'node_type': 'metabolite', 'bigg_id': 'icit_c', 'x': 100.0, 'y': 40.0},
+            'glx': {'node_type': 'metabolite', 'bigg_id': 'glx_c', 'x': 60.0, 'y': 40.0},
+            'succ': {'node_type': 'metabolite', 'bigg_id': 'succ_c', 'x': 100.0, 'y': 2000.0},
+            'acb_mid': {'node_type': 'midmarker', 'x': 140.0, 'y': 20.0},
+            'acon': {'node_type': 'metabolite', 'bigg_id': 'acon_C_c', 'x': 180.0, 'y': 20.0},
+            'h2o': {'node_type': 'metabolite', 'bigg_id': 'h2o_c', 'x': 140.0, 'y': 50.0},
+            'cs_mid': {'node_type': 'midmarker', 'x': 40.0, 'y': 80.0},
+            'cit': {'node_type': 'metabolite', 'bigg_id': 'cit_c', 'x': 40.0, 'y': 120.0},
+            # Filler so corridor emptiness check is not blocked by dense cloud.
+            'other_mid': {'node_type': 'midmarker', 'x': 800.0, 'y': 1000.0},
+            'other_met': {'node_type': 'metabolite', 'bigg_id': 'z_c', 'x': 820.0, 'y': 1000.0},
+        },
+        'reactions': {
+            'icl': {'bigg_id': 'ICL', 'segments': {
+                '0': {'from_node_id': 'icl_mid', 'to_node_id': 'icit'},
+                '1': {'from_node_id': 'icl_mid', 'to_node_id': 'glx'},
+                '2': {'from_node_id': 'icl_mid', 'to_node_id': 'succ'},
+            }},
+            'acb': {'bigg_id': 'ACONTb', 'segments': {
+                '0': {'from_node_id': 'acb_mid', 'to_node_id': 'icit'},
+                '1': {'from_node_id': 'acb_mid', 'to_node_id': 'acon'},
+                '2': {'from_node_id': 'acb_mid', 'to_node_id': 'h2o'},
+            }},
+            'cs': {'bigg_id': 'CS', 'segments': {
+                '0': {'from_node_id': 'cs_mid', 'to_node_id': 'cit'},
+            }},
+            'aca': {'bigg_id': 'ACONTa', 'segments': {
+                '0': {'from_node_id': 'acb_mid', 'to_node_id': 'cit'},
+            }},
+            'oth': {'bigg_id': 'OTH', 'segments': {
+                '0': {'from_node_id': 'other_mid', 'to_node_id': 'other_met'},
+            }},
+        },
+    }]
+    before_acb = (data[1]['nodes']['acb_mid']['x'], data[1]['nodes']['acb_mid']['y'])
+    before_icl = (data[1]['nodes']['icl_mid']['x'], data[1]['nodes']['icl_mid']['y'])
+    rep = C.compact_empty_corridors_escher(data, max_gap=200.0, spacing=150.0)
+    after_acb = (data[1]['nodes']['acb_mid']['x'], data[1]['nodes']['acb_mid']['y'])
+    after_icl = (data[1]['nodes']['icl_mid']['x'], data[1]['nodes']['icl_mid']['y'])
+    assert after_acb == before_acb, (before_acb, after_acb, rep)
+    assert after_icl == before_icl, (before_icl, after_icl, rep)
+
+
+def test_empty_corridor_shortens_non_tca_transport_arm():
+    """FUMt2→fum_c may collapse even when listed in a non-TCA expert structure."""
+    data = [{
+        'metadata': {'expert_structures': [
+            {'id': 'tca', 'reactions': ['CS', 'ACONTa', 'ACONTb', 'ICL']},
+            {'id': 'fum_t', 'reactions': ['FUMt2_2', 'EX_fum_e']},
+        ]},
+    }, {
+        'nodes': {
+            'f_mid': {'node_type': 'midmarker', 'x': 100.0, 'y': 0.0},
+            'fum_e': {'node_type': 'metabolite', 'bigg_id': 'fum_e', 'x': 100.0, 'y': 40.0},
+            'h_c': {'node_type': 'metabolite', 'bigg_id': 'h_c', 'x': 80.0, 'y': 40.0},
+            'fum_c': {'node_type': 'metabolite', 'bigg_id': 'fum_c', 'x': 100.0, 'y': 2000.0},
+            'ex_mid': {'node_type': 'midmarker', 'x': 100.0, 'y': -80.0},
+            'cs_mid': {'node_type': 'midmarker', 'x': 400.0, 'y': 1800.0},
+            'cit': {'node_type': 'metabolite', 'bigg_id': 'cit_c', 'x': 400.0, 'y': 1840.0},
+            # Currency in the column must not block transport collapse.
+            'h2o': {'node_type': 'metabolite', 'bigg_id': 'h2o_c', 'x': 105.0, 'y': 1000.0},
+            'other_mid': {'node_type': 'midmarker', 'x': 800.0, 'y': 1000.0},
+            'other_met': {'node_type': 'metabolite', 'bigg_id': 'z_c', 'x': 820.0, 'y': 1000.0},
+        },
+        'reactions': {
+            'fumt': {'bigg_id': 'FUMt2_2', 'segments': {
+                '0': {'from_node_id': 'f_mid', 'to_node_id': 'fum_e'},
+                '1': {'from_node_id': 'f_mid', 'to_node_id': 'h_c'},
+                '2': {'from_node_id': 'f_mid', 'to_node_id': 'fum_c'},
+            }},
+            'ex': {'bigg_id': 'EX_fum_e', 'segments': {
+                '0': {'from_node_id': 'ex_mid', 'to_node_id': 'fum_e'},
+            }},
+            'cs': {'bigg_id': 'CS', 'segments': {
+                '0': {'from_node_id': 'cs_mid', 'to_node_id': 'cit'},
+            }},
+            'aca': {'bigg_id': 'ACONTa', 'segments': {
+                '0': {'from_node_id': 'cs_mid', 'to_node_id': 'cit'},
+            }},
+            'acb': {'bigg_id': 'ACONTb', 'segments': {
+                '0': {'from_node_id': 'cs_mid', 'to_node_id': 'cit'},
+            }},
+            'oth': {'bigg_id': 'OTH', 'segments': {
+                '0': {'from_node_id': 'other_mid', 'to_node_id': 'other_met'},
+            }},
+        },
+    }]
+    before = data[1]['nodes']['f_mid']['y']
+    # fum_c is shared with a dummy holder so the shared-corridor path runs.
+    data[1]['reactions']['hold'] = {
+        'bigg_id': 'FUM', 'segments': {
+            '0': {'from_node_id': 'cs_mid', 'to_node_id': 'fum_c'},
+        },
+    }
+    rep = C.compact_empty_corridors_escher(data, max_gap=200.0, spacing=150.0)
+    after = data[1]['nodes']['f_mid']['y']
+    assert after > before + 500.0, (before, after, rep)
+    assert data[1]['nodes']['ex_mid']['y'] > -80.0 + 500.0, (data[1]['nodes']['ex_mid']['y'], rep)
 
 
 def test_glyph_circle_overlapping_pairs_counts_disks():

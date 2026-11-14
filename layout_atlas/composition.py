@@ -56,6 +56,250 @@ ARM_TARGET = 150.0
 # Pocket pack: search empty cells inside/flush with the main AABB before external shelving.
 POCKET_CELL_FRAC = 0.55
 POCKET_PAD_CELLS = 1
+# When the frame is already in 4:3–16:9, only pocket-pack components this far from the
+# main centre (fraction of main diagonal). Near tiles must stay put — treating them as
+# shelf leftovers reopens TR floaters and stretches connected stubs into long spokes.
+FAR_OUTLIER_FRAC = 0.28
+# Second-chance pad for far outliers that miss the tight flush search (fraction of span).
+FAR_OUTLIER_PAD_FRAC = 0.18
+# Third-chance: when pockets are full, stack leftovers in a compact strip flush with
+# the main AABB (SHELF_STANDOFF only — never a wide skyline shelf that parks TR floaters).
+FLUSH_TUCK_GAP = SHELF_STANDOFF
+# Islands that sit inside the main AABB but across a large empty corridor to the
+# dense main hull (oversized boxes parked in AABB voids). Pull them along the
+# shortest gap until standoff — visual tuck even when leftover==0.
+ISLAND_GAP_FRAC = 1.05          # gap > this × spacing → candidate
+ISLAND_GAP_FLOOR = 160.0        # absolute px floor
+ISLAND_STANDOFF_FRAC = 0.5      # leave this × spacing to the hull after tuck
+ISLAND_CLEAR_FRAC = 0.35        # min clearance to foreign glyphs after move
+
+
+def flush_tuck_against_main(ids, sizes, centres, main_lo, main_hi, gap=None):
+    """Place leftover boxes in a single compact strip flush with the main AABB.
+
+    Prefers the east edge when that keeps / improves landscape aspect; otherwise
+    south. Returns ``{id: (top_left_x, top_left_y)}`` absolute placements.
+    """
+    if not ids:
+        return {}, dict(placed=0, side=None)
+    gap = FLUSH_TUCK_GAP if gap is None else float(gap)
+    mlo = np.asarray(main_lo, float)
+    mhi = np.asarray(main_hi, float)
+    main_w = float(mhi[0] - mlo[0])
+    main_h = float(mhi[1] - mlo[1])
+    order = sorted(ids, key=lambda i: (-sizes[i][0] * sizes[i][1], i))
+    # Mean leftover centre picks the nearer of east vs south when both keep aspect.
+    mean_c = np.mean([centres[i] for i in order], axis=0)
+
+    def _stack_east():
+        x0 = float(mhi[0] + gap)
+        y = float(mlo[1])
+        placed = {}
+        for i in order:
+            w, h = sizes[i]
+            placed[i] = (x0, y)
+            y += h + SHELF_GAP
+        bh = y - float(mlo[1]) - SHELF_GAP
+        bw = max(sizes[i][0] for i in order)
+        asp = (main_w + gap + bw) / max(main_h, bh, 1.0)
+        return placed, asp, 'right'
+
+    def _stack_south():
+        y0 = float(mhi[1] + gap)
+        x = float(mlo[0])
+        placed = {}
+        for i in order:
+            w, h = sizes[i]
+            placed[i] = (x, y0)
+            x += w + SHELF_GAP
+        bw = x - float(mlo[0]) - SHELF_GAP
+        bh = max(sizes[i][1] for i in order)
+        asp = max(main_w, bw) / max(main_h + gap + bh, 1.0)
+        return placed, asp, 'below'
+
+    east, east_asp, east_side = _stack_east()
+    south, south_asp, south_side = _stack_south()
+
+    def _band_score(asp, side):
+        in_band = ASPECT_MIN - 1e-3 <= asp <= ASPECT_MAX + 1e-3
+        # Prefer the side facing the leftovers' current cluster.
+        side_pen = 0.0
+        if side == 'right' and mean_c[0] < mlo[0]:
+            side_pen = 1.0
+        if side == 'below' and mean_c[1] < mlo[1]:
+            side_pen = 1.0
+        return (0 if in_band else 1,
+                abs(math.log(max(asp, 1e-9) / TARGET_ASPECT)),
+                side_pen)
+
+    if _band_score(east_asp, east_side) <= _band_score(south_asp, south_side):
+        placed, asp, side = east, east_asp, east_side
+    else:
+        placed, asp, side = south, south_asp, south_side
+    return placed, dict(placed=len(placed), side=side, aspect=round(asp, 3),
+                        gap=round(gap, 1))
+
+
+def tuck_islands_to_silhouette(model, scene, blocks, cur, spacing=None):
+    """Translate movable islands across empty corridors flush with the main hull.
+
+    Pocket-pack can park oversized tiles in large AABB voids (still ``leftover=0``)
+    far from any main glyph. This pass closes the gap: slide each non-main
+    component toward its nearest main point until ``ISLAND_STANDOFF``, or
+    teleport into a silhouette-adjacent pocket when the slide is blocked.
+    Translation only — curated internals stay rigid (no deformation).
+    """
+    scene = dict(scene, positions={k: list(v) for k, v in scene['positions'].items()})
+    pos = scene['positions']
+    comps = components(model, scene, cur)
+    # Hull reference = large connected components only. Do NOT freeze same_map_rigid
+    # tiles as main — those are often the visual islands we must tuck (translation
+    # preserves their internal geometry).
+    main = [i for i, c in enumerate(comps) if len(c['reactions']) >= MAIN_MIN]
+    if not main:
+        main = [int(np.argmax([len(c['reactions']) for c in comps]))] if comps else []
+    if not main:
+        return scene, dict(moved=0, candidates=0, reason='no_main')
+    main_set = set(main)
+    main_pts = np.array(
+        [pos[k] for i in main for k in comps[i]['keys']
+         if k in pos and not k.startswith('side:')], float)
+    if len(main_pts) < 2:
+        return scene, dict(moved=0, candidates=0, reason='few_main_pts')
+    spacing = float(spacing if spacing is not None else max(spacing_from_main(main_pts), 40.0))
+    gap_thresh = max(ISLAND_GAP_FLOOR, ISLAND_GAP_FRAC * spacing)
+    standoff = max(SHELF_GAP, ISLAND_STANDOFF_FRAC * spacing)
+    clear = max(30.0, ISLAND_CLEAR_FRAC * spacing)
+    tree = cKDTree(main_pts)
+    movable = [i for i in range(len(comps)) if i not in main_set]
+    # Largest islands first so small stubs fill remaining silhouette pockets after.
+    movable.sort(key=lambda i: (-len(comps[i]['reactions']), comps[i]['reactions'][0]))
+    moved = 0
+    candidates = 0
+    details = []
+    parts = scene.get('participants') or {}
+    rx = {r['id']: r for r in model['reactions']}
+
+    def _keys_of(i):
+        ks = [k for k in comps[i]['keys'] if k in pos and not k.startswith('side:')]
+        for rid in comps[i]['reactions']:
+            rk = 'r:' + rid
+            if rk in pos and rk not in ks:
+                ks.append(rk)
+            for mid in rx.get(rid, {}).get('metabolites', {}):
+                k = parts.get((rid, mid))
+                if k and k in pos and not k.startswith('side:') and k not in ks:
+                    ks.append(k)
+        return ks
+
+    def _apply_delta(i, keys, delta):
+        for k in keys:
+            pos[k] = [pos[k][0] + float(delta[0]), pos[k][1] + float(delta[1])]
+
+    for i in movable:
+        keys = _keys_of(i)
+        if len(keys) < 1:
+            continue
+        pts = np.array([pos[k] for k in keys], float)
+        dists, idxs = tree.query(pts, k=1)
+        gap = float(np.min(dists))
+        if gap <= gap_thresh:
+            continue
+        candidates += 1
+        j = int(np.argmin(dists))
+        near = main_pts[int(idxs[j])]
+        src = pts[j]
+        vec = near - src
+        vlen = float(np.hypot(*vec))
+        if vlen < 1e-6:
+            continue
+        travel = max(0.0, gap - standoff)
+        if travel < 20.0:
+            continue
+        unit = vec / vlen
+        clo, chi = pts.min(0), pts.max(0)
+        bw = float(max(chi[0] - clo[0], 40.0) + 60.0)
+        bh = float(max(chi[1] - clo[1], 40.0) + 60.0)
+
+        def _collides(delta):
+            trial = pts + delta
+            foreign = np.array(
+                [pos[k] for k2, c in enumerate(comps) if k2 != i
+                 for k in c['keys'] if k in pos and not k.startswith('side:')],
+                float)
+            if len(foreign) < 1:
+                return False
+            ft = cKDTree(foreign)
+            dmin, _ = ft.query(trial, k=1)
+            return float(np.min(dmin)) < clear
+
+        # 1) Slide toward hull.
+        lo_t, hi_t = 0.0, travel
+        best_t = 0.0
+        best_delta = None
+        for _ in range(14):
+            mid = 0.5 * (lo_t + hi_t)
+            delta = unit * mid
+            if _collides(delta):
+                hi_t = mid
+            else:
+                best_t = mid
+                best_delta = delta
+                lo_t = mid
+        if best_t < 0.45 * travel:
+            for sign in (-1.0, 1.0):
+                lateral = np.array([-unit[1], unit[0]], float) * (0.35 * spacing * sign)
+                for scale in (1.0, 0.7, 0.4):
+                    delta = unit * (travel * scale) + lateral
+                    if not _collides(delta):
+                        dlen = float(np.hypot(*delta))
+                        if dlen > best_t:
+                            best_t = dlen
+                            best_delta = delta
+                        break
+
+        reason = 'tucked'
+        # 2) If slide barely helps, teleport into a silhouette-adjacent pocket.
+        if best_t < max(80.0, 0.35 * travel):
+            pocket_tl, prep = pack_into_main_pockets(
+                [(i, bw, bh)], main_pts, spacing, prefer_c=main_pts.mean(0),
+                prefer_void=False,
+                search_pad=max(0.22 * max(float(main_pts.max(0)[0] - main_pts.min(0)[0]),
+                                          float(main_pts.max(0)[1] - main_pts.min(0)[1]), 1.0),
+                               spacing * 1.5 + SHELF_GAP))
+            if i in pocket_tl:
+                origin = pocket_tl[i]
+                target_c = np.array([origin[0] + 0.5 * bw, origin[1] + 0.5 * bh], float)
+                old_c = 0.5 * (clo + chi)
+                delta = target_c - old_c
+                # Accept teleport only if it actually closes the hull gap.
+                trial = pts + delta
+                new_gap = float(np.min(tree.query(trial, k=1)[0]))
+                if new_gap < gap - 40.0 and not _collides(delta):
+                    best_t = float(np.hypot(*delta))
+                    best_delta = delta
+                    reason = 'pocket_teleport'
+                    prep_note = prep
+                else:
+                    prep_note = dict(prep, rejected_gap=round(new_gap, 1))
+            else:
+                prep_note = prep
+        else:
+            prep_note = None
+
+        if best_delta is None or best_t < 40.0:
+            details.append(dict(reactions=comps[i]['reactions'][:4], gap=round(gap, 1),
+                                moved_px=0.0, reason='blocked', pocket=prep_note))
+            continue
+        _apply_delta(i, keys, best_delta)
+        moved += 1
+        details.append(dict(reactions=comps[i]['reactions'][:4], gap=round(gap, 1),
+                            moved_px=round(best_t, 1), reason=reason,
+                            pocket=prep_note if reason == 'pocket_teleport' else None))
+        main_pts = np.vstack([main_pts, pts + best_delta])
+        tree = cKDTree(main_pts)
+    return scene, dict(moved=moved, candidates=candidates, gap_thresh=round(gap_thresh, 1),
+                       standoff=round(standoff, 1), details=details[:24])
 
 
 def components(model, scene, cur):
@@ -473,10 +717,20 @@ def compose(model, scene, blocks, cur):
             break
     if iter_reps:
         report['interior_repack'] = iter_reps
+    # Close empty corridors between islands and the dense main hull (AABB voids that
+    # pocket-pack leaves with leftover=0 but still look like TR/top floaters).
+    scene, island_rep = tuck_islands_to_silhouette(
+        model, scene, blocks, cur, spacing=spacing)
+    report['island_tuck'] = island_rep
     # Final landscape reflow: translation-only skyline of rigid visual components so the
     # content bbox lands in 4:3–16:9 even when related-pulls left a tall column.
     scene, reflow = reflow_landscape(model, scene, blocks, cur)
     report['landscape_reflow'] = reflow
+    # Reflow may re-pocket/flush; one more silhouette tuck for anything still gapped.
+    scene, island_rep2 = tuck_islands_to_silhouette(
+        model, scene, blocks, cur, spacing=spacing)
+    if island_rep2.get('moved'):
+        report['island_tuck_after_reflow'] = island_rep2
     scene['composition'] = report
     return scene, report
 
@@ -549,6 +803,12 @@ def _find_pocket_origin(occ, size_w, size_h, prefer_c, content_lo=None, content_
     empty = (grid == 0).astype(np.int32)
     integ = np.pad(empty, ((1, 0), (1, 0)), mode='constant')
     integ = integ.cumsum(0).cumsum(1)
+    # Distance (in cells) from each empty cell to nearest occupied — silhouette cue.
+    try:
+        from scipy.ndimage import distance_transform_edt
+        sil_map = distance_transform_edt(grid == 0) * cell
+    except Exception:
+        sil_map = None
     best = None
     step = 1 if occ['nx'] * occ['ny'] < 40_000 else 2
     want_wide = False
@@ -603,11 +863,18 @@ def _find_pocket_origin(occ, size_w, size_h, prefer_c, content_lo=None, content_
             ix0 = max(0, ix - ring); ix1 = min(occ['nx'], ix + nw + ring)
             neigh = integ[iy1, ix1] - integ[iy0, ix1] - integ[iy1, ix0] + integ[iy0, ix0]
             void_pen = -float(neigh)
+            # Silhouette distance at slot centre — prefer flush with main glyphs,
+            # not the middle of a large AABB void corridor.
+            if sil_map is not None:
+                sil_dist = float(sil_map[min(iy + nh // 2, occ['ny'] - 1),
+                                         min(ix + nw // 2, occ['nx'] - 1)])
+            else:
+                sil_dist = float(np.sqrt(dist))
             if prefer_void:
-                score = (aspect_pen, expand_pen, void_pen, dist, iy, ix)
+                score = (aspect_pen, expand_pen, sil_dist, void_pen, dist, iy, ix)
             else:
                 # Prefer slots tucked against occupied cells, then near the main
-                # centre so TR floaters pull inward (small-map / few-tile packs).
+                # silhouette / centre so TR floaters pull inward.
                 ring1 = 1
                 iy0b = max(0, iy - ring1); iy1b = min(occ['ny'], iy + nh + ring1)
                 ix0b = max(0, ix - ring1); ix1b = min(occ['nx'], ix + nw + ring1)
@@ -618,7 +885,7 @@ def _find_pocket_origin(occ, size_w, size_h, prefer_c, content_lo=None, content_
                 border_cells = max(1, area_cells - nw * nh)
                 occupied_contact = border_cells - border_empty
                 tuck_pen = -float(occupied_contact)
-                score = (aspect_pen, expand_pen, tuck_pen, dist, iy, ix)
+                score = (aspect_pen, expand_pen, tuck_pen, sil_dist, dist, iy, ix)
             if best is None or score < best[0]:
                 best = (score, x0, y0)
     if best is None:
@@ -626,11 +893,13 @@ def _find_pocket_origin(occ, size_w, size_h, prefer_c, content_lo=None, content_
     return best[1], best[2]
 
 
-def pack_into_main_pockets(boxes, main_pts, spacing, prefer_c=None, prefer_void=False):
+def pack_into_main_pockets(boxes, main_pts, spacing, prefer_c=None, prefer_void=False,
+                           search_pad=None):
     """Place boxes into empty pockets inside/flush with the main AABB.
 
     ``boxes``: list of ``(id, size_w, size_h)`` largest-first preferred.
     Returns ``{id: (x, y)}`` top-left placements for those that fit; others omitted.
+    ``search_pad`` overrides the default flush strip outside the main AABB.
     """
     if not boxes or len(main_pts) < 2:
         return {}, dict(placed=0, missed=len(boxes))
@@ -641,7 +910,11 @@ def pack_into_main_pockets(boxes, main_pts, spacing, prefer_c=None, prefer_void=
     # small components fill the largest free regions before the canvas grows.
     pts = np.asarray(main_pts, float)
     lo, hi = pts.min(0), pts.max(0)
-    pad = min(float(spacing) * 1.25 + SHELF_GAP, 0.08 * max(float(hi[0] - lo[0]), float(hi[1] - lo[1]), 1.0))
+    span_xy = max(float(hi[0] - lo[0]), float(hi[1] - lo[1]), 1.0)
+    if search_pad is None:
+        pad = min(float(spacing) * 1.25 + SHELF_GAP, 0.08 * span_xy)
+    else:
+        pad = max(float(search_pad), 0.0)
     # Seed occupancy with main points only; pocket search covers the padded AABB.
     seed = []
     for x, y in pts:
@@ -783,39 +1056,110 @@ def reflow_landscape(model, scene, blocks, cur):
     # Prefer pocket-packing movables into empty space flush with main before an external shelf.
     # When already in-band, only pull far outliers in (not every non-main tile) — packing
     # hundreds of tiles into pockets collapses large maps toward a square and raises empty/cross.
+    # Critical: near tiles that were *not* pack candidates must never become shelf leftovers;
+    # shelving them (e_coli TR floaters / iIT341 long spokes) is what reopens the corridor.
     prefer_c = main_pts.mean(0)
     span = max(float(np.hypot(*(mhi - mlo))), 1.0)
+    span_xy = max(float(mhi[0] - mlo[0]), float(mhi[1] - mlo[1]), 1.0)
+    spacing = max(spacing_from_main(main_pts), 40.0)
     if in_band0:
         pack_ids = [i for i in sizes
-                    if float(np.hypot(*(centres[i] - prefer_c))) > 0.32 * span]
+                    if float(np.hypot(*(centres[i] - prefer_c))) > FAR_OUTLIER_FRAC * span]
     else:
         pack_ids = list(sizes)
     pocket_boxes = sorted(
         [(i, sizes[i][0], sizes[i][1]) for i in pack_ids],
         key=lambda t: (-t[1] * t[2], t[0]))
     pocket_tl, pocket_rep = pack_into_main_pockets(
-        pocket_boxes, main_pts, max(spacing_from_main(main_pts), 40.0),
+        pocket_boxes, main_pts, spacing,
         prefer_c=prefer_c, prefer_void=len(pocket_boxes) > 20)
-    if in_band0 and not pocket_tl:
+    # Wider flush retry for far outliers that missed the tight pad (in-band only).
+    if in_band0 and pocket_boxes:
+        missed_boxes = [(i, w, h) for i, w, h in pocket_boxes if i not in pocket_tl]
+        if missed_boxes:
+            more_tl, more_rep = pack_into_main_pockets(
+                missed_boxes, main_pts, spacing, prefer_c=prefer_c,
+                prefer_void=len(missed_boxes) > 20,
+                search_pad=max(FAR_OUTLIER_PAD_FRAC * span_xy, spacing * 1.5 + SHELF_GAP))
+            kept = {}
+            for bid, (x0, y0) in more_tl.items():
+                bw, bh = sizes[bid]
+                hit = False
+                for oi, (px, py) in pocket_tl.items():
+                    ow, oh = sizes[oi]
+                    if x0 < px + ow and px < x0 + bw and y0 < py + oh and py < y0 + bh:
+                        hit = True
+                        break
+                if not hit:
+                    kept[bid] = (x0, y0)
+            if kept:
+                pocket_tl.update(kept)
+                pocket_rep = dict(
+                    pocket_rep,
+                    placed=len(pocket_tl),
+                    missed=len(pocket_boxes) - len(pocket_tl),
+                    retry=dict(more_rep, accepted=len(kept)))
+    if in_band0 and not pocket_tl and not pack_ids:
         report.update(aspect_after=round(aspect0, 3), reason='already_in_band',
                       pocket=pocket_rep)
         return scene, report
-    if pocket_tl:
+    if pocket_tl or (in_band0 and pack_ids):
         pocket_keys = {i: list(keys_of[i]) for i in pocket_tl}
         pocket_placed = {i: (x, y) for i, (x, y) in pocket_tl.items()}
         # Absolute top-lefts with origin (0,0): _apply_placed targets top-left + size/2.
-        aspect_p = _apply_placed(pocket_placed, (0.0, 0.0))
-        leftover = [i for i in sizes if i not in pocket_tl]
-        report['pocket'] = dict(pocket_rep, leftover=len(leftover))
+        aspect_p = _apply_placed(pocket_placed, (0.0, 0.0)) if pocket_placed else aspect0
+        # Shelf leftovers are only tiles that were pack candidates but still missed.
+        # Near non-candidates (in-band) and successfully pocketed tiles stay put.
+        leftover = [i for i in pack_ids if i not in pocket_tl]
+        report['pocket'] = dict(pocket_rep, leftover=len(leftover),
+                                near_kept=max(0, len(sizes) - len(pack_ids)))
         aspect_p_in = ASPECT_MIN - 1e-3 <= aspect_p <= ASPECT_MAX + 1e-3
 
-        def _pocket_done(reason, left):
-            report.update(applied=bool(pocket_tl), aspect_after=round(aspect_p, 3),
-                          reason=reason,
-                          pack=dict(side='pocket', movable=len(pocket_tl) - len(left),
-                                    leftover=len(left), aspect=round(aspect_p, 3),
-                                    in_band=ASPECT_MIN - 1e-3 <= aspect_p <= ASPECT_MAX + 1e-3))
+        def _pocket_done(reason, left, flush_rep=None):
+            pack = dict(side='pocket', movable=len(pocket_tl),
+                        leftover=len(left), aspect=round(aspect_p, 3),
+                        in_band=ASPECT_MIN - 1e-3 <= aspect_p <= ASPECT_MAX + 1e-3)
+            if flush_rep:
+                pack['flush_tuck'] = flush_rep
+                pack['side'] = flush_rep.get('side') or 'pocket'
+            report.update(applied=bool(pocket_tl) or bool(flush_rep),
+                          aspect_after=round(aspect_p, 3),
+                          reason=reason, pack=pack)
             return scene, report
+
+        # Started in-band: pocket-pack, then flush-tuck any missed far outliers against
+        # the main AABB. Never peel onto a wide skyline shelf (reopens TR floaters).
+        if in_band0:
+            flush_rep = None
+            if leftover:
+                # Bounds after pocket apply so flush strip sits beside the filled main.
+                pts_now = np.array(
+                    [pos[k] for i in main for k in comps[i]['keys']
+                     if k in pos and not k.startswith('side:')]
+                    + [pos[k] for i, ks in pocket_keys.items() for k in ks if k in pos],
+                    float)
+                if len(pts_now) >= 2:
+                    flo, fhi = pts_now.min(0), pts_now.max(0)
+                else:
+                    flo, fhi = mlo, mhi
+                # Snapshot so flush _apply_placed moves leftovers from current (post-pocket) pose.
+                origin_centres = {i: np.asarray(centres[i], float).copy() for i in leftover}
+                for i in leftover:
+                    ks = keys_of[i]
+                    arr = np.array([pos[k] for k in ks if k in pos], float)
+                    if len(arr):
+                        origin_centres[i] = arr.mean(0)
+                origin_pos = {k: list(v) for k, v in pos.items()}
+                tucked, flush_rep = flush_tuck_against_main(
+                    leftover, sizes, origin_centres, flo, fhi)
+                if tucked:
+                    aspect_p = _apply_placed(tucked, (0.0, 0.0))
+                    pocket_tl.update(tucked)
+                    leftover = []
+                    report['pocket'] = dict(
+                        report.get('pocket') or {},
+                        leftover=0, flush_tuck=flush_rep)
+            return _pocket_done('main_pocket_pack', leftover, flush_rep=flush_rep)
 
         # If every movable fitted in a pocket but the frame is still tall/narrow,
         # peel the largest pocketed tiles onto an east shelf so width can catch up
@@ -830,9 +1174,6 @@ def reflow_landscape(model, scene, blocks, cur):
             report['pocket'] = dict(pocket_rep, leftover=len(leftover), peeled=len(leftover))
             pocket_keys = {i: list(keys_of[i]) for i in keep}
         elif aspect_p_in and not leftover:
-            return _pocket_done('main_pocket_pack', [])
-        elif in_band0 and not leftover:
-            # Started in-band; pocket-pack only (no external re-shelf that reopens gaps).
             return _pocket_done('main_pocket_pack', [])
         elif not leftover:
             return _pocket_done('main_pocket_pack', [])
@@ -1029,6 +1370,44 @@ def _curated_structure_node_ids(data):
                 if nid is not None and nid in nodes:
                     out.add(nid)
     return out
+
+
+# Core citrate-cycle (+ glyoxylate ICL) reactions whose relative geometry defines
+# the closed TCA silhouette. Whole atlas windows often list these together with
+# FUMt2/EX_fum transport — freezing the *entire* window blocks corridor collapse
+# of those tall source arms (README shortens them to ~400–900px).
+_TCA_CORE_RX = frozenset({
+    'CS', 'ACONTa', 'ACONTb', 'ICDHyr', 'AKGDH', 'SUCOAS', 'SUCDi', 'FUM', 'MDH',
+    'ICL',
+})
+
+
+def _tca_expert_rx_and_nodes(data):
+    """Citrate-cycle core reactions + node ids for freeze / no-drag.
+
+    Matches expert structures that contain CS+ACONTb (or CS+ACONTa+ACONTb), but
+    only freezes ``_TCA_CORE_RX`` members — not co-listed transport/EX arms.
+    """
+    tca_rx = set()
+    for s in ((data[0] or {}).get('metadata') or {}).get('expert_structures') or []:
+        rxset = set(s.get('reactions') or s.get('reaction_ids') or [])
+        if {'CS', 'ACONTa', 'ACONTb'} <= rxset or (
+                'CS' in rxset and 'ACONTb' in rxset):
+            tca_rx |= (rxset & _TCA_CORE_RX)
+    if not tca_rx:
+        return set(), set()
+    body = data[1]
+    nodes = body.get('nodes') or {}
+    frozen = set()
+    for rxn in (body.get('reactions') or {}).values():
+        if (rxn.get('bigg_id') or '') not in tca_rx:
+            continue
+        for seg in (rxn.get('segments') or {}).values():
+            for end in ('from_node_id', 'to_node_id'):
+                nid = seg.get(end)
+                if nid is not None and nid in nodes:
+                    frozen.add(str(nid))
+    return tca_rx, frozen
 
 
 def _previous_pinned_node_ids(data, previous_anchors):
@@ -1256,11 +1635,19 @@ def compact_empty_corridors_escher(data, max_gap=None, spacing=None):
     reaction unit (midmarker + private spoke metabolites) toward that shared
     pool — never yank the shared glyph, and never leave private heads behind.
     Private (degree-1) metabolites may move alone.
+
+    Freeze only the citrate-cycle expert cluster (CS/ACONTa/ACONTb + co-listed
+    ICL): collapsing ICL→succ dragged ACONTb via icit and squashed TCA
+    circularity (0.95 → ~0.64). Transport arms (FUMt2/EX_fum, …) stay free so
+    they can tuck to README-like distances instead of leaving tall empty canvas.
     """
     import curated_axes as ca
+    from core import CURRENCY
+
     body = data[1]
     nodes = body.get('nodes') or {}
     reactions = body.get('reactions') or {}
+    tca_rx, frozen_nids = _tca_expert_rx_and_nodes(data)
     # Metabolite node -> reaction bigg_ids that touch it.
     holders = defaultdict(set)
     rx_parts = {}  # rid -> (mid_id, [met_ids])
@@ -1317,11 +1704,15 @@ def compact_empty_corridors_escher(data, max_gap=None, spacing=None):
     shortened = 0
     removed = 0.0
     moved = set()
-    max_shorten = 2
+    # FUMt2 + MALt2 (+ a couple of other long arms) in one pass.
+    max_shorten = 4
     candidates.sort(reverse=True)
     for length, rid, mid_id, met_id, vertical in candidates:
         if shortened >= max_shorten:
             break
+        # Freeze citrate-cycle cluster only (not every expert match / transport).
+        if rid in tca_rx or str(mid_id) in frozen_nids:
+            continue
         mid = nodes.get(mid_id); met = nodes.get(met_id)
         if mid is None or met is None or 'x' not in mid or 'x' not in met:
             continue
@@ -1336,7 +1727,7 @@ def compact_empty_corridors_escher(data, max_gap=None, spacing=None):
         pad = max(span * 0.12, float(max_gap) * 0.5, 40.0)
         cx, cy = 0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])
         band = 18.0 + 0.5 * (abs(a[0] - b[0]) if vertical else abs(a[1] - b[1]))
-        blocked = False
+        blockers = []
         for k, xy in cloud.items():
             if k in (mid_id, met_id):
                 continue
@@ -1345,28 +1736,61 @@ def compact_empty_corridors_escher(data, max_gap=None, spacing=None):
                 if abs(p[0] - cx) > band:
                     continue
                 if lo[1] + pad < p[1] < hi[1] - pad:
-                    blocked = True; break
+                    blockers.append((k, p))
             else:
                 if abs(p[1] - cy) > band:
                     continue
                 if lo[0] + pad < p[0] < hi[0] - pad:
-                    blocked = True; break
-        if blocked:
-            continue
+                    blockers.append((k, p))
+        # Currency cofactors in the column are not real packing obstacles for
+        # transport-arm collapse (h2o sitting on the MALt2→mal__L_c line).
+        hard = []
+        for k, p in blockers:
+            bn = nodes.get(k) or {}
+            bigg = bn.get('bigg_id')
+            if bn.get('node_type') == 'metabolite' and bigg and chem(bigg) in CURRENCY:
+                continue
+            hard.append((k, p))
+        # Ideal shared-corridor target; may stop short of a hard blocker.
         shared = len(holders.get(met_id, ())) > 1
         if shared and not vertical:
             # Horizontal shared corridors are often inter-block metabolic links;
             # collapsing them splits structures and costs continuity.
             continue
+        target_len = max(float(max_gap) * 1.35, 320.0)
+        target_len = min(target_len, length - 1.0)
+        if hard:
+            # Transport / exchange arms (FUMt2, EX_*) often have a single stray
+            # PPP glyph in the column (e.g. 6pgc). Allow collapse through ≤2 hard
+            # blockers for those; otherwise stop with standoff before the nearest.
+            is_transport = (
+                rid.startswith('EX_')
+                or rid.endswith('t2')
+                or rid.endswith('t2r')
+                or rid.endswith('t2_2')
+                or 't2_' in rid
+            )
+            if not (is_transport and len(hard) <= 2):
+                standoff = max(float(max_gap) * 0.9, 140.0)
+                ab = b - a
+                ab_len = float(np.hypot(*ab)) or 1.0
+                u = ab / ab_len
+                nearest = None
+                for _k, p in hard:
+                    t = float(np.dot(p - a, u))
+                    if 0.0 < t < ab_len:
+                        nearest = t if nearest is None else min(nearest, t)
+                if nearest is None:
+                    continue
+                capped = max(target_len, nearest - standoff)
+                if capped >= length - 80.0:
+                    continue
+                target_len = capped
         if shared:
             # Translate the whole reaction unit toward the shared pool: mid + every
             # other metabolite on this reaction (including shared _e/_p partners).
             # Companion EX/uptake reactions that only hold those moved partners are
             # dragged by the same delta so their spokes stay short.
-            # Leave a little more than max_gap so the mid does not dive into the
-            # dense chemistry around the shared pool (extra spoke crossings).
-            target_len = max(float(max_gap) * 1.35, 320.0)
-            target_len = min(target_len, length - 1.0)
             target = b + (a - b) * (target_len / length)
             delta = target - a
             move_ids = {mid_id}
@@ -1381,6 +1805,9 @@ def compact_empty_corridors_escher(data, max_gap=None, spacing=None):
                 for other_rid in holders.get(sid, ()):
                     if other_rid == rid or other_rid not in rx_parts:
                         continue
+                    # Do not drag citrate-cycle companions (ACONTb via icit).
+                    if other_rid in tca_rx:
+                        continue
                     omid, omets = rx_parts[other_rid]
                     # Simple EX/uptake companions only (≤3 metabolite heads).
                     if len(omets) > 3:
@@ -1389,6 +1816,9 @@ def compact_empty_corridors_escher(data, max_gap=None, spacing=None):
                     for o in omets:
                         if o != met_id:
                             move_ids.add(o)
+            # Abort if any citrate-cycle glyph would move.
+            if any(str(sid) in frozen_nids for sid in move_ids):
+                continue
             for sid in move_ids:
                 n = nodes.get(sid)
                 if n is None or 'x' not in n:
@@ -1978,6 +2408,583 @@ def compact_long_arms_scene(model, scene, cur, max_arm=ARM_MAX, target=ARM_TARGE
     report = dict(shortened=shortened, pulled_midmarkers=pulled_mids,
                   max_arm=max_arm, target=target, details=details[:40])
     return scene, report
+
+
+def tuck_islands_escher(data, cur=None, spacing=None):
+    """Pull spatially floating reaction islands flush with the dense main hull.
+
+    Runs on the finished Escher map (after squeeze / corridor) so later geometry
+    passes cannot reopen the empty corridors that scene-level tuck closed.
+    Gap is the minimum point-to-hull distance (not component centres). Translation
+    only; Bezier ``b1``/``b2`` shift with their reaction.
+    """
+    from core import CURRENCY
+    cur = set(cur or ()) | set(CURRENCY)
+    body = data[1]
+    nodes, reactions = body['nodes'], body['reactions']
+    parent = {}
+
+    def find(a):
+        while parent.setdefault(a, a) != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        parent[find(a)] = find(b)
+
+    met_to_rx = defaultdict(set)
+    rx_nodes = defaultdict(set)
+    rid_xy = {}
+    for rx in reactions.values():
+        rid = rx.get('bigg_id') or ''
+        if not rid:
+            continue
+        for seg in (rx.get('segments') or {}).values():
+            for end in ('from_node_id', 'to_node_id'):
+                nid = seg.get(end)
+                n = nodes.get(nid) or nodes.get(str(nid)) or {}
+                if not n or 'x' not in n:
+                    continue
+                key = nid if nid in nodes else str(nid)
+                rx_nodes[rid].add(key)
+                if n.get('node_type') == 'metabolite':
+                    mb = n.get('bigg_id') or ''
+                    if chem(mb) in cur:
+                        continue
+                    met_to_rx[key].add(rid)
+                if n.get('node_type') == 'midmarker':
+                    rid_xy[rid] = (float(n['x']), float(n['y']))
+    for _nid, s in met_to_rx.items():
+        s = list(s)
+        for i in range(1, len(s)):
+            union(s[0], s[i])
+    comps = defaultdict(list)
+    for rid in rid_xy:
+        comps[find(rid)].append(rid)
+    rows = sorted(comps.values(), key=len, reverse=True)
+    if len(rows) < 2:
+        return dict(moved=0, candidates=0, reason='few_components')
+    main = rows[0]
+    main_pts = []
+    for rid in main:
+        for nid in rx_nodes[rid]:
+            n = nodes.get(nid) or nodes.get(str(nid))
+            if n and 'x' in n:
+                main_pts.append((float(n['x']), float(n['y'])))
+    if len(main_pts) < 2:
+        return dict(moved=0, candidates=0, reason='few_main_pts')
+    main_pts = np.array(main_pts, float)
+    tree = cKDTree(main_pts)
+    spacing = float(spacing if spacing is not None else reaction_spacing_escher(data) or 150.0)
+    gap_thresh = max(ISLAND_GAP_FLOOR, ISLAND_GAP_FRAC * spacing)
+    # Slightly tighter than SHELF_GAP so residual floaters can sit flush with the
+    # main hull instead of stopping a full shelf-width away.
+    standoff = max(80.0, ISLAND_STANDOFF_FRAC * spacing)
+    clear = max(30.0, ISLAND_CLEAR_FRAC * spacing)
+    moved = 0
+    candidates = 0
+    details = []
+
+    def _island_pts(members):
+        nids = set()
+        for rid in members:
+            nids |= set(rx_nodes.get(rid) or ())
+        pts, ids = [], []
+        for nid in nids:
+            n = nodes.get(nid) or nodes.get(str(nid))
+            if n and 'x' in n:
+                pts.append((float(n['x']), float(n['y'])))
+                ids.append(nid)
+        return (np.array(pts, float) if pts else np.zeros((0, 2))), ids
+
+    # Freeze only the TCA / citrate-cycle expert component (and co-listed ICL),
+    # not every tiny matched structure — those include the floaters we must tuck
+    # (GLCpts, BIOMASS, …).
+    tca_rx, frozen_tca = _tca_expert_rx_and_nodes(data)
+
+    def _apply(members, ids, delta):
+        for nid in ids:
+            if str(nid) in frozen_tca:
+                continue
+            n = nodes.get(nid) or nodes.get(str(nid))
+            if n and 'x' in n:
+                n['x'] = float(n['x'] + delta[0])
+                n['y'] = float(n['y'] + delta[1])
+        for rid in members:
+            if rid in tca_rx:
+                continue
+            for rx in reactions.values():
+                if (rx.get('bigg_id') or '') != rid:
+                    continue
+                for seg in (rx.get('segments') or {}).values():
+                    for bk in ('b1', 'b2'):
+                        b = seg.get(bk)
+                        if isinstance(b, dict) and 'x' in b:
+                            b['x'] = float(b['x'] + delta[0])
+                            b['y'] = float(b['y'] + delta[1])
+        return {str(i) for i in ids}
+
+    def _through_gated_delta(members, ids, delta, unit_vec=None, max_add=1):
+        """Largest scale of ``delta`` that adds at most ``max_add`` official throughs."""
+        if delta is None or float(np.hypot(*delta)) < 40.0:
+            return None
+        try:
+            import layout_quality as _lq_gate
+            skip_gate = list(
+                ((data[0] or {}).get('metadata') or {}).get('preserved_edges') or [])
+            before_th = int(_lq_gate.official_lines_through_nodes_count(data, skip_gate))
+            lo_s, hi_s, ok = 0.0, 1.0, None
+            for _ in range(11):
+                mid_s = 0.5 * (lo_s + hi_s)
+                trial = delta * mid_s
+                _apply(members, ids, trial)
+                th = int(_lq_gate.official_lines_through_nodes_count(data, skip_gate))
+                _apply(members, ids, -trial)
+                if th <= before_th + max_add:
+                    ok = trial
+                    lo_s = mid_s
+                else:
+                    hi_s = mid_s
+            if ok is None or float(np.hypot(*ok)) < 40.0:
+                return None
+            return ok
+        except Exception:
+            return delta
+
+    # Spatially cluster nearby FAR islands only (currency-only links split ETC etc.)
+    # so CYTBD/NADH/O2t tuck as one rigid body. Never join a far floater to a
+    # near island: min-gap over the union would drop below thresh and skip the
+    # whole group (e_coli glucose/ETC sitting across an AABB void next to FBA).
+    islands = list(rows[1:])
+    island_pts_cache = []
+    island_gaps = []
+    for members in islands:
+        pts, _ids = _island_pts(members)
+        island_pts_cache.append(pts)
+        if len(pts) < 1:
+            island_gaps.append(0.0)
+        else:
+            island_gaps.append(float(np.min(tree.query(pts, k=1)[0])))
+    far_idx = [i for i, g in enumerate(island_gaps) if g > gap_thresh]
+    cluster_parent = {i: i for i in far_idx}
+
+    def cfind(a):
+        while cluster_parent[a] != a:
+            cluster_parent[a] = cluster_parent[cluster_parent[a]]
+            a = cluster_parent[a]
+        return a
+
+    def cunion(a, b):
+        cluster_parent[cfind(a)] = cfind(b)
+
+    # Tight join only — long single-link chains (glucose ↔ ETC down the left
+    # corridor) produce a huge AABB whose slide stalls and pockets miss.
+    join_r = max(1.35 * spacing, 220.0)
+    max_cluster_span = max(4.5 * spacing, 700.0)
+    for ai, a in enumerate(far_idx):
+        if len(island_pts_cache[a]) < 1:
+            continue
+        ta = cKDTree(island_pts_cache[a])
+        for b in far_idx[ai + 1:]:
+            if len(island_pts_cache[b]) < 1:
+                continue
+            d = float(np.min(ta.query(island_pts_cache[b], k=1)[0]))
+            if d > join_r:
+                continue
+            # Refuse unions that would stretch the rigid body across a void.
+            pts_ab = np.vstack([island_pts_cache[a], island_pts_cache[b]])
+            if float(np.max(pts_ab.max(0) - pts_ab.min(0))) > max_cluster_span:
+                continue
+            # Also refuse if the already-unioned components would over-span.
+            ca, cb = cfind(a), cfind(b)
+            if ca == cb:
+                continue
+            members_a = [j for j in far_idx if cfind(j) == ca]
+            members_b = [j for j in far_idx if cfind(j) == cb]
+            pts_u = np.vstack([island_pts_cache[j] for j in members_a + members_b
+                               if len(island_pts_cache[j]) > 0])
+            if float(np.max(pts_u.max(0) - pts_u.min(0))) > max_cluster_span:
+                continue
+            cunion(a, b)
+    clustered = defaultdict(list)
+    for i in far_idx:
+        clustered[cfind(i)].extend(islands[i])
+    # Near islands stay singleton (they will be skipped by the gap check below).
+    near_singles = [islands[i] for i in range(len(islands)) if i not in set(far_idx)]
+    # Farthest floaters first so they claim silhouette pockets before nearer
+    # candidates park in the corridor and block them.
+    def _group_gap(members):
+        pts, _ = _island_pts(members)
+        if len(pts) < 1:
+            return 0.0
+        return float(np.min(tree.query(pts, k=1)[0]))
+
+    island_groups = sorted(list(clustered.values()) + near_singles,
+                           key=lambda m: (-_group_gap(m), -len(m), m[0] if m else ''))
+    # Gap / slide target stays the ORIGINAL main hull. Adding tucked islands to
+    # the hull makes neighbors look "close" and skips them (glucose next to ETC).
+    hull_pts = main_pts
+    hull_tree = tree
+    main_lo = hull_pts.min(0)
+    main_hi = hull_pts.max(0)
+
+    for members in island_groups:
+        # Never translate the citrate-cycle expert component as an "island".
+        if tca_rx and set(members) & tca_rx:
+            continue
+        pts, ids = _island_pts(members)
+        if len(pts) < 1:
+            continue
+        # Drop TCA glyphs from the move set if a floater somehow shares one.
+        if frozen_tca:
+            ids = [i for i in ids if str(i) not in frozen_tca]
+            pts = np.array(
+                [(float((nodes.get(i) or nodes.get(str(i)) or {}).get('x', 0)),
+                  float((nodes.get(i) or nodes.get(str(i)) or {}).get('y', 0)))
+                 for i in ids
+                 if (nodes.get(i) or nodes.get(str(i))) and 'x' in (nodes.get(i) or nodes.get(str(i)))],
+                float) if ids else np.zeros((0, 2))
+        if len(pts) < 1:
+            continue
+        dists, idxs = hull_tree.query(pts, k=1)
+        gap = float(np.min(dists))
+        if gap <= gap_thresh:
+            continue
+        candidates += 1
+        j = int(np.argmin(dists))
+        near = hull_pts[int(idxs[j])]
+        src = pts[j]
+        vec = near - src
+        vlen = float(np.hypot(*vec))
+        if vlen < 1e-6:
+            continue
+        travel = max(0.0, gap - standoff)
+        if travel < 20.0:
+            continue
+        unit = vec / vlen
+        clo, chi = pts.min(0), pts.max(0)
+        bw = float(max(chi[0] - clo[0], 40.0) + 60.0)
+        bh = float(max(chi[1] - clo[1], 40.0) + 60.0)
+        # Island sits across a clear AABB corridor (above/below/left/right of main).
+        aabb_void = (
+            float(clo[1]) > float(main_hi[1]) + gap_thresh
+            or float(chi[1]) < float(main_lo[1]) - gap_thresh
+            or float(clo[0]) > float(main_hi[0]) + gap_thresh
+            or float(chi[0]) < float(main_lo[0]) - gap_thresh
+        )
+        idset = {str(i) for i in ids}
+        foreign = np.array(
+            [(float(n['x']), float(n['y'])) for nid, n in nodes.items()
+             if str(nid) not in idset and n.get('node_type') in ('metabolite', 'midmarker')
+             and 'x' in n],
+            float)
+        ft = cKDTree(foreign) if len(foreign) else None
+
+        def _collides(delta, clearance=clear):
+            if ft is None:
+                return False
+            return float(np.min(ft.query(pts + delta, k=1)[0])) < clearance
+
+        best_t = 0.0
+        best_delta = None
+        lo_t, hi_t = 0.0, travel
+        for _ in range(14):
+            mid = 0.5 * (lo_t + hi_t)
+            delta = unit * mid
+            if _collides(delta):
+                hi_t = mid
+            else:
+                best_t = mid
+                best_delta = delta
+                lo_t = mid
+        # Soft clearance + lateral offsets when the straight slide stalls early.
+        if best_t < 0.45 * travel:
+            for soft_k in (0.65, 0.45, 0.28):
+                lo_t, hi_t = best_t, travel
+                for _ in range(12):
+                    mid = 0.5 * (lo_t + hi_t)
+                    delta = unit * mid
+                    if _collides(delta, clearance=clear * soft_k):
+                        hi_t = mid
+                    else:
+                        if mid > best_t:
+                            best_t = mid
+                            best_delta = delta
+                        lo_t = mid
+            for sign in (-1.0, 1.0):
+                lateral = np.array([-unit[1], unit[0]], float) * (0.45 * spacing * sign)
+                for scale in (1.0, 0.8, 0.6, 0.4):
+                    delta = unit * (travel * scale) + lateral
+                    if not _collides(delta, clearance=clear * 0.4):
+                        radial = float(np.dot(delta, unit))
+                        if radial > best_t:
+                            best_t = radial
+                            best_delta = delta
+                        break
+        reason = 'tucked'
+        hard_delta = best_delta
+        hard_t = best_t
+        residual = gap - best_t
+        # Pocket when the slide stalls, leaves a still-large corridor, or the
+        # island sits in a clear AABB void (parent visual-floater case).
+        need_pocket = (
+            best_t < max(80.0, 0.35 * travel)
+            or residual > gap_thresh
+            or (aabb_void and residual > standoff)
+        )
+        if need_pocket:
+            # Core box for oversized islands so silhouette pockets can fit them.
+            box_w, box_h = bw, bh
+            if bw * bh > 350.0 * 350.0:
+                p_lo = np.percentile(pts, 15, axis=0)
+                p_hi = np.percentile(pts, 85, axis=0)
+                box_w = float(max(p_hi[0] - p_lo[0], 40.0) + 60.0)
+                box_h = float(max(p_hi[1] - p_lo[1], 40.0) + 60.0)
+            span_xy = max(float(main_pts.max(0)[0] - main_pts.min(0)[0]),
+                          float(main_pts.max(0)[1] - main_pts.min(0)[1]), 1.0)
+            # Keep search in a flush strip around the main AABB — large pads open
+            # fake exterior voids (x << main_lo) that look like pockets.
+            flush_pad = min(float(spacing) * 1.35 + SHELF_GAP, 0.1 * span_xy)
+            placed = {}
+            for void_flag in (True, False):
+                placed, _prep = pack_into_main_pockets(
+                    [(0, box_w, box_h)], hull_pts, spacing,
+                    prefer_c=near if aabb_void else hull_pts.mean(0),
+                    prefer_void=void_flag,
+                    search_pad=flush_pad)
+                if 0 in placed:
+                    ox, oy = placed[0]
+                    # Must sit flush with / inside the main AABB, not in the pad exterior.
+                    if (ox + box_w >= float(main_lo[0]) - standoff
+                            and oy + box_h >= float(main_lo[1]) - standoff
+                            and ox <= float(main_hi[0]) + standoff
+                            and oy <= float(main_hi[1]) + standoff):
+                        break
+                    placed = {}
+            if 0 in placed:
+                origin = placed[0]
+                target = np.array([origin[0] + 0.5 * box_w, origin[1] + 0.5 * box_h], float)
+                old_c = pts.mean(0)
+                delta = target - old_c
+                new_gap = float(np.min(hull_tree.query(pts + delta, k=1)[0]))
+                dlen = float(np.hypot(*delta))
+                prefer = hull_pts.mean(0)
+                # Reject wild teleports (pad search can park far outside the hull).
+                toward = float(np.hypot(*(old_c - prefer))) - float(np.hypot(*(old_c + delta - prefer)))
+                soft = clear * (0.45 if (aabb_void or bw * bh > 350.0 * 350.0) else 0.7)
+                max_dlen = max(gap * 1.75, travel * 1.5, span_xy * 0.65)
+                if (new_gap < min(gap - 40.0, residual - 10.0)
+                        and dlen <= max_dlen
+                        and toward >= (-120.0 if aabb_void else -40.0)
+                        and not _collides(delta, clearance=soft)):
+                    best_t = dlen
+                    best_delta = delta
+                    reason = 'pocket_teleport'
+        # Last resort: very soft clearance vs other islands so a blocked corridor
+        # (glucose in ETC's path) can still close without full glyph stacking
+        # that reintroduces official through-pairs and blows the clear budget.
+        residual = gap - best_t
+        if residual > gap_thresh and travel - best_t > 40.0:
+            # Keep clearance ≥~0.12× so we close AABB voids without stacking
+            # islands through main edges (official through spike / clear blow-up).
+            for soft_k in (0.28, 0.18, 0.12):
+                lo_t, hi_t = best_t, travel
+                improved = False
+                for _ in range(14):
+                    mid = 0.5 * (lo_t + hi_t)
+                    delta = unit * mid
+                    new_gap = float(np.min(hull_tree.query(pts + delta, k=1)[0]))
+                    if new_gap < standoff * 0.9 or _collides(delta, clearance=max(10.0, clear * soft_k)):
+                        hi_t = mid
+                    else:
+                        if mid > best_t:
+                            best_t = mid
+                            best_delta = delta
+                            improved = True
+                        lo_t = mid
+                if improved and gap - best_t <= gap_thresh * 1.15:
+                    break
+            if best_delta is not None and gap - best_t < residual - 20.0:
+                # Far AABB voids may need +2 through budget to close; clear recovers.
+                add_budget = 2 if gap > 400.0 else 1
+                gated = _through_gated_delta(members, ids, best_delta, unit, max_add=add_budget)
+                if gated is not None:
+                    best_delta = gated
+                    best_t = float(np.dot(gated, unit))
+                    reason = 'tucked_soft_corridor'
+                    residual = gap - best_t
+                elif hard_delta is not None and hard_t >= 40.0:
+                    best_delta = hard_delta
+                    best_t = hard_t
+                    reason = 'tucked'
+                    residual = gap - best_t
+                else:
+                    best_delta = None
+        if best_delta is None or best_t < 40.0:
+            details.append(dict(reactions=list(members)[:4], gap=round(gap, 1),
+                                moved_px=0.0, reason='blocked'))
+            continue
+        add_final = 2 if gap > 400.0 else 1
+        gated_final = _through_gated_delta(members, ids, best_delta, unit, max_add=add_final)
+        if gated_final is None:
+            details.append(dict(reactions=list(members)[:4], gap=round(gap, 1),
+                                moved_px=0.0, reason='through_blocked'))
+            continue
+        best_delta = gated_final
+        _apply(members, ids, best_delta)
+        moved += 1
+        details.append(dict(reactions=list(members)[:4], gap=round(gap, 1),
+                            moved_px=round(float(np.hypot(*best_delta)), 1), reason=reason))
+    # Second pass: re-cluster remaining FAR islands on current geometry (tight
+    # span cap) so ETC residuals keep sliding as one body instead of peeling.
+    if moved:
+        far2 = []
+        pts2 = []
+        for members in islands:
+            pts, _ids = _island_pts(members)
+            if len(pts) < 1:
+                continue
+            g = float(np.min(hull_tree.query(pts, k=1)[0]))
+            if g > gap_thresh:
+                far2.append(members)
+                pts2.append(pts)
+        parent2 = {i: i for i in range(len(far2))}
+
+        def cfind2(a):
+            while parent2[a] != a:
+                parent2[a] = parent2[parent2[a]]
+                a = parent2[a]
+            return a
+
+        def cunion2(a, b):
+            parent2[cfind2(a)] = cfind2(b)
+
+        for a in range(len(far2)):
+            ta = cKDTree(pts2[a])
+            for b in range(a + 1, len(far2)):
+                d = float(np.min(ta.query(pts2[b], k=1)[0]))
+                if d > join_r:
+                    continue
+                pts_u = np.vstack([pts2[a], pts2[b]])
+                if float(np.max(pts_u.max(0) - pts_u.min(0))) > max_cluster_span:
+                    continue
+                ca, cb = cfind2(a), cfind2(b)
+                if ca == cb:
+                    continue
+                memb = [j for j in range(len(far2)) if cfind2(j) in (ca, cb)]
+                pts_all = np.vstack([pts2[j] for j in memb])
+                if float(np.max(pts_all.max(0) - pts_all.min(0))) > max_cluster_span:
+                    continue
+                cunion2(a, b)
+        grouped2 = defaultdict(list)
+        for i, members in enumerate(far2):
+            grouped2[cfind2(i)].extend(members)
+        residual_groups = sorted(grouped2.values(),
+                                 key=lambda m: (-len(m), m[0] if m else ''))
+        for members in residual_groups:
+            pts, ids = _island_pts(members)
+            if len(pts) < 1:
+                continue
+            dists, idxs = hull_tree.query(pts, k=1)
+            gap = float(np.min(dists))
+            if gap <= gap_thresh:
+                continue
+            j = int(np.argmin(dists))
+            near = hull_pts[int(idxs[j])]
+            src = pts[j]
+            vec = near - src
+            vlen = float(np.hypot(*vec))
+            if vlen < 1e-6:
+                continue
+            travel = max(0.0, gap - standoff)
+            if travel < 40.0:
+                continue
+            unit = vec / vlen
+            idset = {str(i) for i in ids}
+            foreign = np.array(
+                [(float(n['x']), float(n['y'])) for nid, n in nodes.items()
+                 if str(nid) not in idset and n.get('node_type') in ('metabolite', 'midmarker')
+                 and 'x' in n],
+                float)
+            ft = cKDTree(foreign) if len(foreign) else None
+
+            def _collides2(delta, clearance=clear):
+                if ft is None:
+                    return False
+                return float(np.min(ft.query(pts + delta, k=1)[0])) < clearance
+
+            best_t = 0.0
+            best_delta = None
+            lo_t, hi_t = 0.0, travel
+            for _ in range(12):
+                mid = 0.5 * (lo_t + hi_t)
+                delta = unit * mid
+                if _collides2(delta, clearance=clear * 0.5):
+                    hi_t = mid
+                else:
+                    best_t = mid
+                    best_delta = delta
+                    lo_t = mid
+            if best_t < 0.5 * travel:
+                for soft_k in (0.4, 0.3):
+                    lo_t, hi_t = best_t, travel
+                    for _ in range(10):
+                        mid = 0.5 * (lo_t + hi_t)
+                        delta = unit * mid
+                        if _collides2(delta, clearance=clear * soft_k):
+                            hi_t = mid
+                        else:
+                            if mid > best_t:
+                                best_t = mid
+                                best_delta = delta
+                            lo_t = mid
+                for sign in (-1.0, 1.0):
+                    lateral = np.array([-unit[1], unit[0]], float) * (0.35 * spacing * sign)
+                    for scale in (1.0, 0.7, 0.45):
+                        delta = unit * (travel * scale) + lateral
+                        if not _collides2(delta, clearance=clear * 0.4):
+                            radial = float(np.dot(delta, unit))
+                            if radial > best_t:
+                                best_t = radial
+                                best_delta = delta
+                            break
+            residual2 = gap - best_t
+            if residual2 > gap_thresh and travel - best_t > 40.0:
+                for soft_k in (0.25, 0.16, 0.12):
+                    lo_t, hi_t = best_t, travel
+                    improved = False
+                    for _ in range(14):
+                        mid = 0.5 * (lo_t + hi_t)
+                        delta = unit * mid
+                        new_gap = float(np.min(hull_tree.query(pts + delta, k=1)[0]))
+                        if (new_gap < standoff * 0.9
+                                or _collides2(delta, clearance=max(10.0, clear * soft_k))):
+                            hi_t = mid
+                        else:
+                            if mid > best_t:
+                                best_t = mid
+                                best_delta = delta
+                                improved = True
+                            lo_t = mid
+                    if improved and gap - best_t <= gap_thresh * 1.15:
+                        break
+            if best_delta is None or best_t < 40.0:
+                continue
+            add2 = 2 if gap > 350.0 else 1
+            gated2 = _through_gated_delta(members, ids, best_delta, unit, max_add=add2)
+            if gated2 is None:
+                continue
+            _apply(members, ids, gated2)
+            moved += 1
+            details.append(dict(reactions=list(members)[:4], gap=round(gap, 1),
+                                moved_px=round(float(np.hypot(*gated2)), 1),
+                                reason='tucked_pass2'))
+    # Note: batch pocket-pack was removed — pack_into_main_pockets prefers the
+    # exterior pad strip on this map and teleported islands thousands of px.
+    # Through-gated soft slides above close AABB voids without that regression.
+    return dict(moved=moved, candidates=candidates, gap_thresh=round(gap_thresh, 1),
+                standoff=round(standoff, 1), details=details[:40])
 
 
 def compact_long_arms_escher(data, cur=None, max_arm=ARM_MAX, target=ARM_TARGET):

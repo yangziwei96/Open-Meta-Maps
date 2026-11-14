@@ -125,6 +125,21 @@ def test_repair_fast_and_no_overlap_regression():
     assert elapsed < 6.0
 
 
+def test_budget_s_scale_capped():
+    """Legacy wall-clock budget_s must not multiply tries by tens (Mac ~142s hotspot)."""
+    windows = [{"crossings": 10, "edges": 74}]
+    auto_budget, auto_tries, _ = hr._window_budget(windows, k=10)
+    # Uncapped scale from tool_pipeline's budget_s=35 vs ~1s auto_budget.
+    uncapped = int(auto_tries * (35.0 / max(auto_budget, 1e-9)))
+    capped = int(auto_tries * min(35.0 / max(auto_budget, 1e-9), hr.BUDGET_SCALE_CAP))
+    assert capped <= auto_tries * hr.BUDGET_SCALE_CAP
+    assert capped < uncapped
+    data = _crossing_map()
+    report = hr.repair(
+        data, skip_edges=[], k=3, max_rounds=2, max_accepts=4, budget_s=35.0)
+    assert report["budget_evals"] <= max(8, int(auto_tries * hr.BUDGET_SCALE_CAP) * 2)
+
+
 def test_repair_can_reduce_crossings_on_fixable_hotspot():
     before_data = _dense_fixable()
     before = hr._score(before_data, [])

@@ -39,6 +39,10 @@ BUDGET_EDGE = 0.002
 BUDGET_FLOOR = 0.8
 BUDGET_CAP = 30.0
 TRIES_PER_CROSS = 4.0
+# Callers still pass legacy wall-clock ``budget_s`` (e.g. 35 from tool_pipeline).
+# After mass-scaled tries, that number must NOT divide into auto_budget (~1s) or
+# tries explode (~40× → multi-minute hotspot). Cap the scale factor.
+BUDGET_SCALE_CAP = 3.0
 # Default k=DEFAULT_K matches layout_quality.evaluate worst_regions. Caps:
 #   max_accepts / max_rounds from caller (tool_pipeline) or window crossing mass
 #   max_tries from window mass × TRIES_PER_CROSS, scaled when budget_s > auto
@@ -707,22 +711,24 @@ def repair(data, model=None, scene=None, blocks=None, skip_edges=(), k=DEFAULT_K
     else:
         max_rounds = int(max_rounds)
     # Try ceiling from window mass. ``budget_s`` only scales tries when above the
-    # mass-derived second estimate — never a wall-clock stop.
+    # mass-derived second estimate — never a wall-clock stop. Cap the scale so
+    # legacy 35s caller budgets cannot multiply tries by tens.
     auto_budget, auto_tries, _mass2 = _window_budget(windows, k if k is not None else DEFAULT_K)
     if budget_evals is not None:
         max_tries = int(budget_evals)
     else:
         max_tries = auto_tries
         if budget_s is not None and auto_budget > 0 and float(budget_s) > auto_budget:
-            max_tries = max(auto_tries, int(auto_tries * float(budget_s) / auto_budget))
+            scale = min(float(budget_s) / auto_budget, BUDGET_SCALE_CAP)
+            max_tries = max(auto_tries, int(auto_tries * scale))
     setup_s = round(time.time() - t0, 2)
     report = dict(
         enabled=True, k=k, before={kk: before[kk] for kk in (
             'crossings', 'top_window_crossings', 'worst_window', 'node_overlaps', 'label_overlaps',
             'continuity_share', 'split_structures', 'length_p90', 'currency_involved', 'main_metabolite')},
         accepted=[], rejected=0, tries=0, rounds=0, reject_reasons={},
-        budget_evals=max_tries, budget_mass=mass, setup_s=setup_s, diagnosis=[],
-        max_rounds=max_rounds, max_accepts=max_accepts,
+        budget_evals=max_tries, budget_s=budget_s, budget_mass=mass, setup_s=setup_s,
+        diagnosis=[], max_rounds=max_rounds, max_accepts=max_accepts,
     )
     report['before']['curves_through_nodes'] = through0
     for win in windows:

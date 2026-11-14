@@ -52,6 +52,36 @@ def test_angle_candidates_include_fallback_rotations():
         assert ang in angles
 
 
+def test_clone_stub_caps_exploded_spoke_radius():
+    import math
+    from split_cofactor_hubs import CLONE_RADIUS_CAP, _clone_stub
+
+    nodes = {
+        "1": {"node_type": "midmarker", "x": 0.0, "y": 0.0},
+        "2": {
+            "node_type": "metabolite",
+            "x": 5000.0,
+            "y": 0.0,
+            "bigg_id": "atp_c",
+            "label_x": 5010.0,
+            "label_y": 5.0,
+        },
+    }
+    # Default uncapped keeps length; explicit cap pulls the clone in.
+    nid0 = _clone_stub(nodes, "2", "1", 0.0)
+    assert abs(math.hypot(nodes[nid0]["x"], nodes[nid0]["y"]) - 5000.0) < 1e-6
+    nid = _clone_stub(nodes, "2", "1", 90.0, radius_cap=CLONE_RADIUS_CAP)
+    dist = math.hypot(nodes[nid]["x"], nodes[nid]["y"])
+    assert abs(dist - CLONE_RADIUS_CAP) < 1e-6
+    # Local spokes stay length-preserving.
+    local = {
+        "1": {"node_type": "midmarker", "x": 0.0, "y": 0.0},
+        "2": {"node_type": "metabolite", "x": 100.0, "y": 0.0, "bigg_id": "atp_c"},
+    }
+    nid2 = _clone_stub(local, "2", "1", 180.0)
+    assert abs(math.hypot(local[nid2]["x"], local[nid2]["y"]) - 100.0) < 1e-6
+
+
 def test_split_e_coli_core_no_regression():
     raw = load_escher(EXAMPLE_RESULTS / "e_coli_core" / "OpenMetaMaps_e_coli_core_result.json")
     model = load_model(EXAMPLES / "e_coli_core.xml")
