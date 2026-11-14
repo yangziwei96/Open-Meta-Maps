@@ -727,6 +727,12 @@ def apply(data, skip_edges=(), only=None, mode=None, gem_path=None, pathway=None
                     seg_grid[c].append(k)
     # Incremental restyles only joint-route the reactions that were redrawn
     report.update(joint_route(data, joint_store, ev, cur_edge, rects, owner_arr, label_rects, label_owner, skip, only=only_set))
+    # Merge when `only=` is set — replacing the full list wiped Bezier metadata for
+    # untouched reactions (tip nudge / hotspot / relocation incremental path).
+    if only_set is not None:
+        prev = list((data[0].get('metadata') or {}).get('routed_edges') or [])
+        kept = [r for r in prev if r.get('reaction') not in only_set]
+        routed = kept + routed
     data[0].setdefault('metadata', {})['routed_edges'] = routed
     return report
 

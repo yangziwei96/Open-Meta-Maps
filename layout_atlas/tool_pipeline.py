@@ -29,7 +29,7 @@ import output_names
 LIMITS = dict(max_bytes=25 * 1024 * 1024, max_reactions=20000, full_routed_max_reactions=150, whole_map_max_reactions=3000, view_size=50)
 SOURCE_PATHS = False  # reuse the curated map's original curves (Escher Bezier chains) for the edges of matched structures
 ORIENTATION = 'full'  # 'off' | 'sides' (currency copies on the substrate / product side) | 'full' (also reactions outside the curated structures between their substrates and products)
-LAYOUT_STYLE = 'curated'  # 'legacy' | 'curated' (orthogonal polylines for algorithm edges; curated paths kept).
+LAYOUT_STYLE = 'curated'  # 'legacy' | 'curated' (V7: Bezier from curated-map constraints; no orthogonal polylines).
 
 def normalize_layout_style(value):
     """Map user/API layout_style to the canonical value."""
@@ -40,9 +40,9 @@ def normalize_layout_style(value):
 COMPLETION_CONTEXT = 'auto'  # 'auto' (V6: uncovered reactions are placed beside the glyphs of their own metabolites) | 'off'
 EDGE_ROUTING = 'libavoid'  # 'libavoid' (orthogonal, all edges) | 'hybrid' (routes only blocked algorithm-placed edges) | 'none' (straight lines)
 # Routing behavior by layout style and model size:
-#   - layout_style='curated': early edge_style.apply draws Bezier for layout stages; a final
-#     edge_style.apply(..., mode='orthogonal') writes axis-parallel polylines (≤2 bends) for
-#     algorithm edges. Curated Atlas paths / short cofactor stubs stay as stamped. No libavoid.
+#   - layout_style='curated': edge_style.apply Bezier curves (stable-v1 e42993f). No final
+#     orthogonal polyline pass — that added stair-step bends without packing/avoidance reason.
+#     Opt-in: OPM_ORTHOGONAL_FINAL=on.
 #   - layout_style='legacy' with <= ROUTING_THRESHOLD reactions: Uses libavoid orthogonal routing.
 #   - layout_style='legacy' with > ROUTING_THRESHOLD reactions: Routing is deferred (edge_routing.measure only).
 # For scalable=True (large models), straight connections are used initially; edge_style is applied separately.
@@ -925,7 +925,7 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
         metric['label_placement'] = dict(label_placement.optimize(data), seconds=round(time.time() - t_labels, 1))
         if log:
             log(f"  label placement: {metric['label_placement']}")
-        metric['edge_routing'] = dict(mode='curated (orthogonal algorithm connections)')
+        metric['edge_routing'] = dict(mode='curated (Bezier connections)')
         if os.environ.get('OPM_PERIPHERAL', 'on') != 'off' and not PREVIOUS_SKIP_PACK:   # the switch exists for before / after comparisons
             import peripheral as peripheral_module
             import quality_gate
@@ -1145,10 +1145,12 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
         if found:
             gem_file = found[0]
             break
-    if LAYOUT_STYLE == 'curated':
+    # Final orthogonal polyline pass is opt-in. Stable-v1 e42993f kept Bezier-only
+    # curated routing; the tip orthogonal pass added stair-step bends (iIT341
+    # bends_added≈157) without packing/avoidance reason.
+    if LAYOUT_STYLE == 'curated' and os.environ.get('OPM_ORTHOGONAL_FINAL', 'off') == 'on':
         import edge_style as _es_final
         t_orth = time.time()
-        # draw_map writes into <job>/full; the uploaded GEM lives in <job>/upload.
         metric['edge_style_orthogonal'] = dict(
             _es_final.apply(
                 data, skip_edges, mode='orthogonal',
@@ -1157,12 +1159,16 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
         if log:
             log(f"  orthogonal algorithm routes (final): {metric['edge_style_orthogonal']}")
         dump(folder / 'map.json', data)
+    elif LAYOUT_STYLE == 'curated':
+        metric['edge_style_orthogonal'] = dict(
+            skipped='bezier_only_vs_stable', enabled=False)
+        if log:
+            log('  orthogonal algorithm routes (final): skipped (Bezier-only vs stable; '
+                'set OPM_ORTHOGONAL_FINAL=on)')
     # Late per-reaction currency clones for Pathway-Scorer-style hubs (layout gate).
-    # Runs after orthogonal multimarkers exist so the gate scores the same polylines
-    # the official edge_orthogonality measure uses. Also runs on --previous pin paths
-    # (including mid-size skip-packing), not only full redraws.
-    # Small headline GEMs: hub split is an 8s+ scoring pass with marginal visual win
-    # vs stable-v1 wall (~65s); keep for mid/large unless explicitly off.
+    # Also runs on --previous pin paths (including mid-size skip-packing), not only
+    # full redraws. Small headline GEMs: hub split is an 8s+ scoring pass with
+    # marginal visual win vs stable-v1 wall (~65s); keep off unless explicitly on.
     import split_cofactor_hubs as _sch
     from hub_drawing import pathway_from_model as _pathway_from_model
     curated_rids = {rid for b in blocks for rid in b.get('reaction_ids') or []}
@@ -1182,9 +1188,11 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
     metric['cofactor_hub_split'] = hub_report
     dump(output_names.map_json(folder), data)
     dump(folder / 'cofactor_hub_split.json', hub_report)
-    # Tip nudge after orthogonal routing and hub split; refit canvas only when a
-    # tip is accepted so 0-accept maps stay byte-identical to main.
-    if not PREVIOUS_SKIP_PACK:
+    # Tip nudge after hub split; refit canvas only when a tip is accepted so
+    # 0-accept maps stay byte-identical to main. Scoring uses Bezier (not orthogonal).
+    # Mid/large: skip — stable-v1 e42993f had no tip nudge; accepts also risked
+    # wiping full Bezier routed_edges via incremental only= restyle.
+    if not PREVIOUS_SKIP_PACK and len(model['reactions']) < 200:
         import composition as _comp_tip
         tip = _comp_tip.nudge_frontier_escher(
             # Keep tip identical to no-previous; structure previous is applied after.
@@ -1202,29 +1210,42 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             metric['canvas_fit_after_tip'] = fit
             if log and fit.get('applied'):
                 log(f"  canvas fit after tip: {fit.get('content')} pad=40")
-            # Same n_rx gate as early/final clear — mid/large residual sets stall
-            # even under try caps (iIT341 ~1000 official pairs).
             if (
                 LAYOUT_STYLE == 'curated'
                 and os.environ.get('OPM_CLEAR_THROUGH', 'on') != 'off'
-                and len(model['reactions']) < 200
             ):
                 import edge_style as _es_tip
                 metric['clear_through_nodes_post_tip'] = _es_tip.clear_through_nodes(
-                    data, skip_edges, log=log, mode='orthogonal',
+                    data, skip_edges, log=log, mode='bezier',
                     gem_path=str(gem_file) if gem_file else None,
                     max_rounds=1, max_edge_tries=24, max_nudge_tries=24)
                 dump(output_names.map_json(folder), data)
-    # Last geometry pass: tuck floating islands flush with the dense main hull so
-    # empty AABB voids (e_coli TR/top floaters, iIT341 far modules) do not survive.
-    # Skip when compose deliberately kept shelf rows (small-map row/column guides);
-    # final tuck would yank shelf tiles back into AABB voids and erase that grid.
+    elif not PREVIOUS_SKIP_PACK:
+        tip = dict(skipped='n_rx>=200_stable_no_tip_nudge', accepted=0, applied=False)
+        metric['frontier_tip_nudge'] = tip
+        if composition_report is not None:
+            composition_report['frontier_tip_nudge'] = tip
+        if log:
+            log('  frontier tip nudge: skipped (n_rx>=200 vs stable-v1)')
+    # Last geometry pass: tuck floating islands flush with the dense main hull.
+    # Mid/large: skip (stable-v1 e42993f) — tip silhouette tuck irregularized the
+    # skyline AABB (iIT341 blank 0.58 vs stable 0.20) despite compactness wins.
+    # Small maps: skip when shelf rows were kept; otherwise tuck floaters.
     # clear_through stays small-map only.
     if LAYOUT_STYLE == 'curated' and not PREVIOUS_SKIP_PACK:
         import composition as _comp_isl
         shelf_rows_kept = int(
             ((composition_report or {}).get('shelf') or {}).get('rows') or 0)
-        if shelf_rows_kept > 0:
+        n_rx_isl = len(model['reactions'])
+        if n_rx_isl >= 200:
+            island = dict(skipped='n_rx>=200_rectangular_packing', moved=0)
+            metric['island_tuck_escher'] = island
+            if composition_report is not None:
+                composition_report['island_tuck_escher'] = island
+            if log:
+                log('  island silhouette tuck (escher, final): skipped '
+                    '(n_rx>=200 rectangular packing vs stable)')
+        elif shelf_rows_kept > 0:
             island = dict(skipped='shelf_rows_keep_alignment',
                           shelf_rows=shelf_rows_kept, moved=0)
             metric['island_tuck_escher'] = island
@@ -1271,27 +1292,8 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                     f"{_rr_post['restored']} nodes")
             dump(output_names.map_json(folder), data)
             dump(folder / 'map.json', data)
-            # Mid/large: squeeze empty bands after tuck so far modules do not leave
-            # a tall/wide AABB (iIT341 blank ~0.60 vs stable 0.20).
-            if len(model['reactions']) >= 200 and os.environ.get('OPM_SQUEEZE', 'on') != 'off':
-                spacing_sq = _comp_isl.reaction_spacing_escher(data)
-                k_sq = float(os.environ.get('OPM_SQUEEZE_K', _comp_isl.SQUEEZE_K))
-                sq = _comp_isl.squeeze_escher(data, max_gap=k_sq * spacing_sq)
-                sq2 = _comp_isl.squeeze_escher(
-                    data, max_gap=max(spacing_sq * 1.25, 40.0))
-                if sq2.get('applied'):
-                    sq2['fallback'] = True
-                    sq2['first'] = {kk: vv for kk, vv in sq.items()}
-                    sq = sq2
-                sq['spacing_px'] = round(spacing_sq, 1)
-                metric['empty_band_squeeze_post_island'] = sq
-                if log:
-                    log('  empty-band squeeze (post-island): ' + str(sq))
-                if sq.get('applied'):
-                    fit_sq = _comp_isl.fit_canvas_to_content(data)
-                    metric['canvas_fit_after_post_island_squeeze'] = fit_sq
-                    dump(output_names.map_json(folder), data)
-                    dump(folder / 'map.json', data)
+            # No mid/large post-island squeeze — tip island tuck/squeeze are not
+            # intentional wins vs stable-v1 (irregularized AABB / blank).
         # Final clear only on small maps (stable had no clear_through). iIT341
         # residual sets stall even under try caps — skip mid/large.
         if (
