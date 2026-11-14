@@ -74,14 +74,17 @@ def absolute_source_coords(source_sha256):
     return _absolute_from_observations(source_sha256)
 
 
-def _absolute_from_escher(body, path):
+def _absolute_from_escher(body, path, skip_nids=None):
     nodes = body.get('nodes') or {}
     reactions = body.get('reactions') or {}
     rx, mets = {}, defaultdict(list)
     edge_lengths = []
     # Midmarker↔metabolite pairs for corridor padding compress (r:id, m:id).
     edges = []
-    for _nid, n in nodes.items():
+    skip = {str(x) for x in (skip_nids or ())}
+    for nid, n in nodes.items():
+        if skip and str(nid) in skip:
+            continue
         if n.get('node_type') == 'metabolite' and n.get('bigg_id'):
             mets[n['bigg_id']].append((n.get('node_is_primary', True), n['x'], n['y']))
     for _rid, r in reactions.items():

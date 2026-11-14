@@ -6,6 +6,7 @@ skipped and only free nodes are completed around the pinned anchors.
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -33,7 +34,9 @@ def load_previous_anchors(path, model=None):
     body = payload[1] if isinstance(payload, list) and len(payload) >= 2 else payload
     if not isinstance(body, dict):
         raise ValueError(f'Not an Escher map: {path}')
-    abs_map = _absolute_from_escher(body, str(path))
+    header = payload[0] if isinstance(payload, list) and payload else {}
+    skip = (header.get('metadata') or {}).get('hub_split_clones') if isinstance(header, dict) else None
+    abs_map = _absolute_from_escher(body, str(path), skip_nids=skip)
     anchors = {}
     for rid, xy in (abs_map.get('reactions') or {}).items():
         anchors['r:' + rid] = [float(xy[0]), float(xy[1])]
@@ -62,63 +65,671 @@ def should_skip_packing(anchors, model, threshold=PACK_SKIP_SHARE):
     return reaction_anchor_share(anchors, model) >= float(threshold)
 
 
+def _mean_translation(deltas):
+    """Least-squares mean offset of 2-D deltas (deterministic; no tuned weights)."""
+    arr = np.asarray(list(deltas), float)
+    if arr.size == 0:
+        return None
+    return arr.mean(axis=0)
+
+
 def apply_block_positions(blocks, anchors):
-    """Rewrite curated block glyph positions from previous anchors where present."""
+    """Translate each curated block as a rigid body from previous anchors.
+
+    When a block has one or more glyphs that match previous anchors, compute one
+    structure-level translation (mean offset of the matches) and add it to every
+    glyph in the block.  Blocks with no matches are left unchanged.
+    """
     if not anchors:
         return blocks, 0
     n = 0
     for b in blocks or []:
         pos = dict(b.get('positions') or {})
-        for k in list(pos):
+        deltas = []
+        for k, xy in pos.items():
             if k in anchors:
-                pos[k] = list(anchors[k])
-                n += 1
+                deltas.append(np.asarray(anchors[k], float) - np.asarray(xy, float))
+        delta = _mean_translation(deltas)
+        if delta is None:
+            b['positions'] = pos
+            continue
+        for k in list(pos):
+            pos[k] = (np.asarray(pos[k], float) + delta).tolist()
+            n += 1
         b['positions'] = pos
     return blocks, n
 
 
-def pin_scene(scene, anchors):
+def _infer_structures_from_scene(scene, pos, blocks=None):
+    """Build structure rows from blocks or ``copy:<module>:…`` scene keys."""
+    if blocks:
+        return [dict(id=b.get('id'), reactions=list(b.get('reaction_ids') or []),
+                     parent=b.get('id'))
+                for b in blocks if b.get('id')]
+    modules = {}
+    for k in pos or {}:
+        if isinstance(k, str) and k.startswith('copy:') and k.count(':') >= 2:
+            modules.setdefault(k.split(':', 2)[1], set())
+    parts = (scene or {}).get('participants') or {}
+    for pk, key in parts.items():
+        if not (isinstance(key, str) and key.startswith('copy:') and key.count(':') >= 2):
+            continue
+        rid, _met = _participant_rid_met(pk)
+        if rid is None:
+            continue
+        modules.setdefault(key.split(':', 2)[1], set()).add(rid)
+    return [dict(id=mid, reactions=sorted(rids), parent=mid)
+            for mid, rids in sorted(modules.items())]
+
+
+def _structure_rows(blocks, structures=None, scene=None, pos=None):
+    """Curated structure rows (spatial pieces), not whole atlas modules."""
+    if structures is not None:
+        return list(structures)
+    from curated_axes import expert_structure_entries
+    rows = expert_structure_entries(blocks)
+    if rows:
+        return rows
+    return _infer_structures_from_scene(scene, pos, blocks=blocks)
+
+
+def _module_id(structure):
+    """Atlas module id that owns ``copy:<module>:…`` glyphs for this structure."""
+    parent = structure.get('parent')
+    if parent:
+        return parent
+    sid = structure.get('id') or ''
+    return sid.split('#', 1)[0]
+
+
+def _participant_rid_met(pk):
+    if isinstance(pk, (tuple, list)) and len(pk) >= 2:
+        return pk[0], pk[1]
+    if isinstance(pk, str) and '||' in pk:
+        a, b = pk.split('||', 1)
+        return a, b
+    if isinstance(pk, (tuple, list)) and len(pk) >= 1:
+        return pk[0], None
+    return None, None
+
+
+def assign_reaction_owners(structures, scene=None, pos=None):
+    """Map each reaction id to exactly one curated structure id.
+
+    Shared-reaction ownership rule (explicit, not silent lex-smallest block id):
+    a reaction listed in more than one curated structure is owned by the structure
+    whose module ``copy:<module>:…`` glyphs cover the most of that reaction's
+    participant metabolites in the scene.  Ties break by larger structure
+    (more reactions), then by lexicographically smaller structure id.  Each
+    reaction is owned by at most one structure; rigidity is enforced per curated
+    structure (spatial piece), not per whole module.
+    """
+    rows = [s for s in (structures or []) if s.get('id') and (s.get('reactions') or [])]
+    if not rows:
+        return {}
+    parts = (scene or {}).get('participants') or {}
+    # Pre-count copy-prefix hits per (structure, reaction).
+    copy_hits = defaultdict(int)
+    for pk, key in parts.items():
+        if not (isinstance(key, str) and key.startswith('copy:') and key.count(':') >= 2):
+            continue
+        rid, _met = _participant_rid_met(pk)
+        if rid is None:
+            continue
+        module = key.split(':', 2)[1]
+        for s in rows:
+            if rid not in (s.get('reactions') or []):
+                continue
+            if _module_id(s) == module:
+                copy_hits[(s['id'], rid)] += 1
+    candidates = defaultdict(list)
+    for s in rows:
+        sid = s['id']
+        n_rx = len(s.get('reactions') or [])
+        for rid in s.get('reactions') or []:
+            candidates[rid].append((copy_hits.get((sid, rid), 0), n_rx, sid))
+    owner = {}
+    for rid, opts in candidates.items():
+        # Most copy hits, then larger structure, then smaller id.
+        opts_sorted = sorted(opts, key=lambda t: (-t[0], -t[1], t[2]))
+        owner[rid] = opts_sorted[0][2]
+    return owner
+
+
+def _structure_membership(scene, pos, blocks=None, structures=None, rid_owner=None):
+    """Map curated structure id → scene keys (exclusive membership).
+
+    Membership is per curated structure (``expert_structures`` spatial piece),
+    not per whole module.  Shared reactions follow ``assign_reaction_owners``.
+    """
+    pos = pos or {}
+    rows = _structure_rows(blocks, structures=structures, scene=scene, pos=pos)
+    if rid_owner is None:
+        rid_owner = assign_reaction_owners(rows, scene=scene, pos=pos)
+    structure_keys = defaultdict(set)
+    owner = {}
+
+    def claim(sid, k):
+        """Exclusive membership: each scene key belongs to at most one structure."""
+        if not sid or k not in pos:
+            return
+        # Shared primaries / instances are never part of a curated rigid body.
+        if k.startswith('m:') or k.startswith('inst:'):
+            return
+        prev_sid = owner.get(k)
+        if prev_sid is None:
+            owner[k] = sid
+            structure_keys[sid].add(k)
+            return
+        if prev_sid == sid or k.startswith('copy:'):
+            return
+
+    # Index side stubs once: O(|pos|) instead of O(|rx|×|pos|).
+    side_by_rid = defaultdict(list)
+    for k in pos:
+        if isinstance(k, str) and k.startswith('side:') and k.count(':') >= 2:
+            side_by_rid[k.split(':', 2)[1]].append(k)
+    # Reaction midmarkers and side stubs from the explicit ownership map first.
+    for rid, sid in rid_owner.items():
+        claim(sid, 'r:' + rid)
+        for k in side_by_rid.get(rid, []):
+            claim(sid, k)
+    # copy: glyphs claimed by the structure that owns the reaction using them.
+    parts = scene.get('participants') or {}
+    for pk, key in parts.items():
+        if not isinstance(key, str) or key not in pos:
+            continue
+        rid, _met = _participant_rid_met(pk)
+        sid = rid_owner.get(rid) if rid is not None else None
+        if sid is None and key.startswith('copy:') and key.count(':') >= 2:
+            module = key.split(':', 2)[1]
+            for s in sorted(rows, key=lambda x: x.get('id') or ''):
+                if _module_id(s) == module:
+                    sid = s['id']
+                    break
+        if sid is None:
+            continue
+        claim(sid, key)
+    # Ensure every copy: key still lands in some structure of its module.
+    for k in pos:
+        if not (isinstance(k, str) and k.startswith('copy:') and k.count(':') >= 2):
+            continue
+        if k in owner:
+            continue
+        module = k.split(':', 2)[1]
+        for s in sorted(rows, key=lambda x: x.get('id') or ''):
+            if _module_id(s) == module:
+                claim(s['id'], k)
+                break
+    return structure_keys
+
+
+def _structure_translation(keys, pos, anchors):
+    """One structure-level translation from matched previous anchors, or None."""
+    deltas = []
+    for k in keys:
+        if k.startswith('copy:'):
+            met = k.rsplit(':', 1)[-1]
+            mk = 'm:' + met
+            if mk in anchors:
+                deltas.append(np.asarray(anchors[mk], float) - np.asarray(pos[k], float))
+        elif k.startswith('r:') and k in anchors:
+            deltas.append(np.asarray(anchors[k], float) - np.asarray(pos[k], float))
+    return _mean_translation(deltas)
+
+
+def _xy_moved(old, new, tol=0.0):
+    """True when ``new`` differs from ``old`` by more than ``tol``."""
+    d = np.asarray(new, float) - np.asarray(old, float)
+    return float(np.hypot(d[0], d[1])) > float(tol)
+
+
+def snapshot_structure_relatives(scene, blocks=None, structures=None, prefer_source=True):
+    """Record midmarker-relative coordinates for every curated structure member.
+
+    When ``prefer_source`` is true, prefer ``same_map_snapshot`` / block positions
+    as the shape source of truth (matches the no-previous absolute rigid restore).
+    Scene coordinates only fill keys missing from the source cloud.  Used so
+    stages after pinning can restore stored relatives without re-applying absolute
+    same-map coordinates that fight ``--previous`` pins.
+    """
+    if not scene or not scene.get('positions'):
+        return {}
+    pos = scene['positions']
+    rows = _structure_rows(blocks, structures=structures, scene=scene, pos=pos)
+    rid_owner = assign_reaction_owners(rows, scene=scene, pos=pos)
+    membership = _structure_membership(
+        scene, pos, blocks=blocks, structures=rows, rid_owner=rid_owner)
+    # Prefer same_map_snapshot when present (matches no-previous absolute restore);
+    # otherwise use the current scene so non-same-map structures keep packing geometry.
+    source = {}
+    if prefer_source:
+        for b in blocks or []:
+            snap = b.get('same_map_snapshot') or {}
+            bid = b.get('id')
+            for k, xy in snap.items():
+                source.setdefault(k, list(xy))
+                if k.startswith('m:') and bid:
+                    source.setdefault('copy:%s:%s' % (bid, k[2:]), list(xy))
+    out = {}
+    for sid, keys in membership.items():
+        keys = sorted(k for k in keys if k in pos or k in source)
+        if not keys:
+            continue
+        ref = next((k for k in keys if k.startswith('r:')), keys[0])
+        if ref in source:
+            ref_xy = np.asarray(source[ref], float)
+        elif ref in pos:
+            ref_xy = np.asarray(pos[ref], float)
+        else:
+            continue
+        relatives = {}
+        for k in keys:
+            if k in source:
+                relatives[k] = (np.asarray(source[k], float) - ref_xy).tolist()
+            elif k in pos and ref in pos:
+                # Keep scene-relative offset (side stubs / non-same-map members).
+                relatives[k] = (np.asarray(pos[k], float) - np.asarray(pos[ref], float)).tolist()
+        if not relatives:
+            continue
+        out[sid] = dict(
+            ref=ref,
+            reactions=sorted(rid for rid, own in rid_owner.items() if own == sid),
+            relatives=relatives,
+        )
+    return out
+
+
+def restore_structure_relatives(scene, snapshots, tol=0.0):
+    """Re-apply stored structure relatives; keep each structure's reference fixed.
+
+    Returns ``(scene, n_moved)`` where ``n_moved`` counts glyphs whose coordinates
+    actually changed.
+    """
+    if not scene or not snapshots:
+        return scene, 0
+    pos = scene.get('positions') or {}
+    moved = 0
+    for _sid, snap in snapshots.items():
+        rel = snap.get('relatives') or {}
+        ref = snap.get('ref')
+        if not ref or ref not in pos or not rel:
+            continue
+        # If the reference itself drifted from the snapshot frame, first place it
+        # using any available absolute anchor is NOT done here — callers keep the
+        # current ref (previous pin).  All other members are placed relative to it.
+        ref_xy = np.asarray(pos[ref], float)
+        for k, dxy in rel.items():
+            if k not in pos:
+                continue
+            new_xy = (ref_xy + np.asarray(dxy, float)).tolist()
+            if _xy_moved(pos[k], new_xy, tol=tol):
+                pos[k] = new_xy
+                moved += 1
+    scene['positions'] = pos
+    return scene, moved
+
+
+def snapshot_structure_relatives_escher(data, blocks=None, structures=None, scene=None):
+    """Snapshot Escher node / label / Bezier geometry relative to each structure ref midmarker."""
+    if not data or len(data) < 2:
+        return {}
+    body = data[1]
+    nodes = body.get('nodes') or {}
+    reactions = body.get('reactions') or {}
+    rows = _structure_rows(
+        blocks, structures=structures, scene=scene, pos=(scene or {}).get('positions'))
+    if not rows:
+        meta = (data[0] or {}).get('metadata') or {}
+        rows = list(meta.get('expert_structures') or [])
+    rid_owner = assign_reaction_owners(rows, scene=scene, pos=(scene or {}).get('positions'))
+    if not rid_owner:
+        # No scene: every listed reaction is owned by its (sole) structure row;
+        # shared reactions still follow the explicit tie-break (size, then id).
+        rid_owner = assign_reaction_owners(rows, scene=scene or {}, pos={})
+    rx_by_rid = {}
+    mid_of = {}
+    holders = defaultdict(set)
+    for rx in reactions.values():
+        rid = rx.get('bigg_id')
+        if not rid:
+            continue
+        rx_by_rid[rid] = rx
+        for seg in (rx.get('segments') or {}).values():
+            for nid in (seg.get('from_node_id'), seg.get('to_node_id')):
+                if nid is None:
+                    continue
+                holders[str(nid)].add(rid)
+                n = nodes.get(nid) or nodes.get(str(nid))
+                if n and n.get('node_type') == 'midmarker':
+                    mid_of[rid] = str(nid)
+    out = {}
+    for sid in {s['id'] for s in rows if s.get('id')}:
+        rids = sorted(rid for rid, own in rid_owner.items() if own == sid and rid in mid_of)
+        if not rids:
+            continue
+        ref_rid = rids[0]
+        ref_nid = mid_of[ref_rid]
+        ref_n = nodes.get(ref_nid) or {}
+        ref_xy = np.asarray([ref_n['x'], ref_n['y']], float)
+        relatives = {}
+        owned = set(rids)
+
+        def _rel_key(kind, *parts):
+            return (kind,) + tuple(parts)
+
+        for rid in rids:
+            nid = mid_of[rid]
+            n = nodes[nid]
+            relatives[_rel_key('mid', rid)] = (np.asarray([n['x'], n['y']], float) - ref_xy).tolist()
+            rx = rx_by_rid[rid]
+            if 'label_x' in rx:
+                relatives[_rel_key('rx_label', rid)] = (
+                    np.asarray([rx['label_x'], rx['label_y']], float) - ref_xy).tolist()
+            for seg_id, seg in (rx.get('segments') or {}).items():
+                for end in ('from_node_id', 'to_node_id'):
+                    nid = seg.get(end)
+                    if nid is None:
+                        continue
+                    nid = str(nid)
+                    n = nodes.get(nid)
+                    if n is None:
+                        continue
+                    # Shared glyphs across structures are not part of this rigid body.
+                    if holders.get(nid) and not holders[nid].issubset(owned):
+                        continue
+                    if n.get('node_type') == 'midmarker':
+                        continue
+                    relatives[_rel_key('node', rid, seg_id, end, n.get('node_type'), n.get('bigg_id'))] = (
+                        np.asarray([n['x'], n['y']], float) - ref_xy).tolist()
+                    if 'label_x' in n:
+                        relatives[_rel_key('node_label', rid, seg_id, end, n.get('node_type'), n.get('bigg_id'))] = (
+                            np.asarray([n['label_x'], n['label_y']], float) - ref_xy).tolist()
+                for bname in ('b1', 'b2'):
+                    b = seg.get(bname)
+                    if isinstance(b, dict) and 'x' in b and 'y' in b:
+                        relatives[_rel_key(bname, rid, seg_id)] = (
+                            np.asarray([b['x'], b['y']], float) - ref_xy).tolist()
+        out[sid] = dict(ref_rid=ref_rid, ref_nid=ref_nid, reactions=rids, relatives=relatives)
+    return out
+
+
+def restore_structure_relatives_escher(data, snapshots, tol=0.0):
+    """Restore Escher structure relatives; keep each structure's ref midmarker fixed.
+
+    Returns ``(data, n_moved)`` counting nodes / labels / control points that moved.
+    """
+    from map_edit import set_node_xy, translate_reaction_label
+    if not data or len(data) < 2 or not snapshots:
+        return data, 0
+    body = data[1]
+    nodes = body.get('nodes') or {}
+    reactions = body.get('reactions') or {}
+    rx_by_rid = {rx.get('bigg_id'): rx for rx in reactions.values() if rx.get('bigg_id')}
+    mid_of = {}
+    for rid, rx in rx_by_rid.items():
+        for seg in (rx.get('segments') or {}).values():
+            for nid in (seg.get('from_node_id'), seg.get('to_node_id')):
+                n = nodes.get(nid) if nid is not None else None
+                if n and n.get('node_type') == 'midmarker':
+                    mid_of[rid] = str(nid)
+                    break
+            if rid in mid_of:
+                break
+    moved = 0
+    for _sid, snap in snapshots.items():
+        rel = snap.get('relatives') or {}
+        ref_rid = snap.get('ref_rid')
+        ref_nid = snap.get('ref_nid') or mid_of.get(ref_rid)
+        if not ref_nid or ref_nid not in nodes or not rel:
+            continue
+        ref_xy = np.asarray([nodes[ref_nid]['x'], nodes[ref_nid]['y']], float)
+        # Midmarkers first (so reaction labels can follow).
+        for key, dxy in rel.items():
+            if not (isinstance(key, tuple) and key and key[0] == 'mid'):
+                continue
+            rid = key[1]
+            nid = mid_of.get(rid)
+            if not nid or nid not in nodes:
+                continue
+            target = ref_xy + np.asarray(dxy, float)
+            old = [nodes[nid]['x'], nodes[nid]['y']]
+            if _xy_moved(old, target, tol=tol):
+                dx, dy = set_node_xy(nodes[nid], float(target[0]), float(target[1]), digits=6)
+                rx = rx_by_rid.get(rid)
+                if rx is not None:
+                    translate_reaction_label(rx, dx, dy, digits=6)
+                moved += 1
+        for key, dxy in rel.items():
+            if not isinstance(key, tuple) or not key:
+                continue
+            kind = key[0]
+            target = ref_xy + np.asarray(dxy, float)
+            if kind == 'rx_label':
+                rid = key[1]
+                rx = rx_by_rid.get(rid)
+                if rx is None or 'label_x' not in rx:
+                    continue
+                old = [rx['label_x'], rx['label_y']]
+                if _xy_moved(old, target, tol=tol):
+                    rx['label_x'] = round(float(target[0]), 6)
+                    rx['label_y'] = round(float(target[1]), 6)
+                    moved += 1
+            elif kind == 'node':
+                rid, seg_id, end, _nt, _bg = key[1], key[2], key[3], key[4], key[5]
+                rx = rx_by_rid.get(rid)
+                if rx is None:
+                    continue
+                seg = (rx.get('segments') or {}).get(seg_id)
+                if not seg:
+                    continue
+                nid = seg.get(end)
+                if nid is None or nid not in nodes:
+                    continue
+                old = [nodes[nid]['x'], nodes[nid]['y']]
+                if _xy_moved(old, target, tol=tol):
+                    set_node_xy(nodes[nid], float(target[0]), float(target[1]), digits=6)
+                    moved += 1
+            elif kind == 'node_label':
+                rid, seg_id, end = key[1], key[2], key[3]
+                rx = rx_by_rid.get(rid)
+                if rx is None:
+                    continue
+                seg = (rx.get('segments') or {}).get(seg_id)
+                if not seg:
+                    continue
+                nid = seg.get(end)
+                n = nodes.get(nid) if nid is not None else None
+                if not n or 'label_x' not in n:
+                    continue
+                old = [n['label_x'], n['label_y']]
+                if _xy_moved(old, target, tol=tol):
+                    n['label_x'] = round(float(target[0]), 6)
+                    n['label_y'] = round(float(target[1]), 6)
+                    moved += 1
+            elif kind in ('b1', 'b2'):
+                rid, seg_id = key[1], key[2]
+                rx = rx_by_rid.get(rid)
+                if rx is None:
+                    continue
+                seg = (rx.get('segments') or {}).get(seg_id)
+                if not seg:
+                    continue
+                b = seg.get(kind)
+                if not isinstance(b, dict):
+                    seg[kind] = dict(x=round(float(target[0]), 6), y=round(float(target[1]), 6))
+                    moved += 1
+                    continue
+                old = [b.get('x', 0.0), b.get('y', 0.0)]
+                if _xy_moved(old, target, tol=tol):
+                    b['x'] = round(float(target[0]), 6)
+                    b['y'] = round(float(target[1]), 6)
+                    moved += 1
+    return data, moved
+
+
+def pin_scene(scene, anchors, blocks=None, structures=None, mode='all'):
     """Hard-pin previous anchors into a display scene before export.
 
-    Pins ``r:`` / ``m:`` keys and curated ``copy:…:met`` glyphs to the previous
-    primary metabolite position.  Currency ``side:`` stubs follow their reaction
-    midmarker by the same delta so spokes stay attached.  Must run before
-    ``drawing.export`` (which applies one uniform canvas translation); do not
-    re-apply absolute previous coordinates onto the exported Escher JSON.
+    Curated structures move as rigid bodies: one least-squares mean translation
+    from all matched previous anchors for that structure, applied to every
+    member.  Membership is per curated structure (spatial piece), with shared
+    reactions assigned by ``assign_reaction_owners``.  Nodes outside structures
+    restore independently.
+
+    ``mode``:
+      - ``'all'``: translate structures + pin free nodes (default)
+      - ``'free'``: only pin free nodes; leave curated structures untouched so
+        mid-pipeline geometry can match the no-previous path
+      - ``'structures'``: only rigid-translate curated structures
+
+    Returns the count of glyphs that actually moved.
     """
     if not scene or not anchors:
         return scene, 0
     pos = scene.get('positions') or {}
     n = 0
-    old_mids = {k: list(pos[k]) for k in pos if k.startswith('r:') and k in anchors}
-    for k, xy in anchors.items():
-        if k in pos:
-            pos[k] = [float(xy[0]), float(xy[1])]
-            n += 1
+    old_mids = {k: list(pos[k]) for k in pos if k.startswith('r:')}
+    rows = _structure_rows(blocks, structures=structures, scene=scene, pos=pos)
+    rid_owner = assign_reaction_owners(rows, scene=scene, pos=pos)
+    structure_keys = _structure_membership(
+        scene, pos, blocks=blocks, structures=rows, rid_owner=rid_owner)
+    in_structure = set()
+    for keys in structure_keys.values():
+        in_structure.update(keys)
+
+    if mode in ('all', 'structures'):
+        for _bid, keys in structure_keys.items():
+            delta = _structure_translation(keys, pos, anchors)
+            if delta is None:
+                continue
+            for k in keys:
+                new_xy = (np.asarray(pos[k], float) + delta).tolist()
+                if _xy_moved(pos[k], new_xy):
+                    pos[k] = new_xy
+                    n += 1
+
+    if mode in ('all', 'free'):
+        for k, xy in anchors.items():
+            if k in pos and k not in in_structure:
+                new_xy = [float(xy[0]), float(xy[1])]
+                if _xy_moved(pos[k], new_xy):
+                    pos[k] = new_xy
+                    n += 1
+
+    # Keep remaining side stubs attached to midmarkers that moved.
     for k in list(pos):
-        if not k.startswith('copy:'):
+        if not k.startswith('side:') or k in in_structure:
             continue
-        met = k.rsplit(':', 1)[-1]
-        mk = 'm:' + met
-        if mk in anchors:
-            pos[k] = [float(anchors[mk][0]), float(anchors[mk][1])]
-            n += 1
-    # Keep side stubs attached to pinned midmarkers.
-    for k in list(pos):
-        if not k.startswith('side:'):
-            continue
-        # side:<rid>:<met>
         parts = k.split(':', 2)
         if len(parts) < 3:
             continue
         rk = 'r:' + parts[1]
-        if rk not in anchors or rk not in old_mids:
+        if rk not in old_mids or rk not in pos:
             continue
-        delta = np.asarray(anchors[rk], float) - np.asarray(old_mids[rk], float)
-        pos[k] = (np.asarray(pos[k], float) + delta).tolist()
-        n += 1
+        delta = np.asarray(pos[rk], float) - np.asarray(old_mids[rk], float)
+        new_xy = (np.asarray(pos[k], float) + delta).tolist()
+        if _xy_moved(pos[k], new_xy):
+            pos[k] = new_xy
+            n += 1
     scene['positions'] = pos
     return scene, n
+
+
+def translate_structures_escher(data, anchors, blocks=None, structures=None, scene=None, tol=0.0):
+    """Rigidly translate each curated structure on the final Escher map toward previous anchors.
+
+    One least-squares mean translation per structure from matched midmarker /
+    metabolite anchors; applied to every exclusive node, label, and b1/b2 of that
+    structure.  Returns ``(data, n_moved)``.
+    """
+    from map_edit import set_node_xy, translate_reaction_label
+    if not data or len(data) < 2 or not anchors:
+        return data, 0
+    rows = _structure_rows(blocks, structures=structures, scene=scene,
+                           pos=(scene or {}).get('positions'))
+    if not rows:
+        rows = list(((data[0] or {}).get('metadata') or {}).get('expert_structures') or [])
+    rid_owner = assign_reaction_owners(rows, scene=scene or {}, pos=(scene or {}).get('positions') or {})
+    body = data[1]
+    nodes = body.get('nodes') or {}
+    reactions = body.get('reactions') or {}
+    rx_by_rid = {rx.get('bigg_id'): rx for rx in reactions.values() if rx.get('bigg_id')}
+    mid_of = {}
+    holders = defaultdict(set)
+    for rid, rx in rx_by_rid.items():
+        for seg in (rx.get('segments') or {}).values():
+            for nid in (seg.get('from_node_id'), seg.get('to_node_id')):
+                if nid is None:
+                    continue
+                holders[str(nid)].add(rid)
+                n = nodes.get(nid)
+                if n and n.get('node_type') == 'midmarker':
+                    mid_of[rid] = str(nid)
+    moved = 0
+    for sid in {s['id'] for s in rows if s.get('id')}:
+        rids = [rid for rid, own in rid_owner.items() if own == sid and rid in mid_of]
+        if not rids:
+            continue
+        owned = set(rids)
+        deltas = []
+        for rid in rids:
+            rk = 'r:' + rid
+            if rk in anchors and rid in mid_of:
+                n = nodes[mid_of[rid]]
+                deltas.append(np.asarray(anchors[rk], float) - np.asarray([n['x'], n['y']], float))
+            rx = rx_by_rid[rid]
+            for seg in (rx.get('segments') or {}).values():
+                for nid in (seg.get('from_node_id'), seg.get('to_node_id')):
+                    if nid is None:
+                        continue
+                    nid = str(nid)
+                    n = nodes.get(nid)
+                    if not n or n.get('node_type') != 'metabolite' or not n.get('bigg_id'):
+                        continue
+                    if holders.get(nid) and not holders[nid].issubset(owned):
+                        continue
+                    mk = 'm:' + n['bigg_id']
+                    if mk in anchors:
+                        deltas.append(np.asarray(anchors[mk], float) - np.asarray([n['x'], n['y']], float))
+        delta = _mean_translation(deltas)
+        if delta is None:
+            continue
+        dx, dy = float(delta[0]), float(delta[1])
+        if abs(dx) <= tol and abs(dy) <= tol:
+            continue
+        touched = set()
+        for rid in rids:
+            nid = mid_of[rid]
+            if nid not in touched:
+                set_node_xy(nodes[nid], nodes[nid]['x'] + dx, nodes[nid]['y'] + dy, digits=6)
+                touched.add(nid)
+                moved += 1
+            rx = rx_by_rid[rid]
+            translate_reaction_label(rx, dx, dy, digits=6)
+            for seg in (rx.get('segments') or {}).values():
+                for end in ('from_node_id', 'to_node_id'):
+                    nid = seg.get(end)
+                    if nid is None:
+                        continue
+                    nid = str(nid)
+                    if nid in touched:
+                        continue
+                    n = nodes.get(nid)
+                    if n is None:
+                        continue
+                    if holders.get(nid) and not holders[nid].issubset(owned):
+                        continue
+                    set_node_xy(n, n['x'] + dx, n['y'] + dy, digits=6)
+                    touched.add(nid)
+                    moved += 1
+                for bname in ('b1', 'b2'):
+                    b = seg.get(bname)
+                    if isinstance(b, dict) and 'x' in b and 'y' in b:
+                        b['x'] = round(float(b['x']) + dx, 6)
+                        b['y'] = round(float(b['y']) + dy, 6)
+                        moved += 1
+    return data, moved
 
 
 def pin_escher(data, anchors):
@@ -159,10 +770,13 @@ def filter_previous_map(path, model):
                     used_nodes.add(str(nid))
     kept_nodes = {nid: dict(nodes[nid]) for nid in used_nodes if nid in nodes}
     # Keep the previous compare-map representative glyph for each remaining metabolite
-    # (same rule as evaluation.escher_bridge.escher_positions: last primary wins).  Do not
-    # move other clones — that would stretch edges that still use them.
+    # (primary first, then smallest x — same as _absolute_from_escher). Skip hub-split
+    # clones so --previous pins stay on the original hub glyph.
+    skip_clones = {str(x) for x in ((header.get('metadata') or {}).get('hub_split_clones') or [])}
     ref_nid = {}
     for nid, n in nodes.items():
+        if str(nid) in skip_clones:
+            continue
         if n.get('node_type') != 'metabolite' or not n.get('bigg_id'):
             continue
         mid = n['bigg_id']

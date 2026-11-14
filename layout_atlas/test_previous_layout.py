@@ -40,11 +40,109 @@ def test_pin_scene_and_blocks():
     assert n == 2
     assert scene['positions']['r:A'] == [1.0, 2.0]
     assert scene['positions']['r:B'] == [0.0, 0.0]
+    # Matched glyphs: r:A → (+1,+2), m:x → (+3,+4); mean translation (+2,+3).
     blocks = [dict(positions={'r:A': [0.0, 0.0], 'm:x': [0.0, 0.0], 'r:C': [5.0, 5.0]})]
     blocks, n = prev.apply_block_positions(blocks, anchors)
-    assert n == 2
-    assert blocks[0]['positions']['r:A'] == [1.0, 2.0]
-    assert blocks[0]['positions']['r:C'] == [5.0, 5.0]
+    assert n == 3
+    assert blocks[0]['positions']['r:A'] == [2.0, 3.0]
+    assert blocks[0]['positions']['m:x'] == [2.0, 3.0]
+    assert blocks[0]['positions']['r:C'] == [7.0, 8.0]
+
+
+def test_pin_scene_translates_curated_structure_rigidly():
+    """``--previous`` moves a curated structure by one translation, never per-copy."""
+    import numpy as np
+    # Structure S: two mets and one midmarker; free m: / r: outside it.
+    scene = dict(
+        positions={
+            'r:R1': [0.0, 0.0],
+            'copy:S:a': [-50.0, 10.0],
+            'copy:S:b': [50.0, -10.0],
+            'm:a': [100.0, 100.0],
+            'm:c': [200.0, 200.0],
+            'r:OUT': [300.0, 300.0],
+            'side:R1:h': [0.0, 25.0],
+            'side:OUT:h': [300.0, 320.0],
+        },
+        participants={
+            ('R1', 'a'): 'copy:S:a',
+            ('R1', 'b'): 'copy:S:b',
+            ('R1', 'h'): 'side:R1:h',
+        },
+    )
+    before = {k: list(v) for k, v in scene['positions'].items()}
+    # Conflicting per-node previous anchors that would deform S if applied independently.
+    anchors = {
+        'r:R1': [100.0, 100.0],
+        'm:a': [40.0, 120.0],
+        'm:b': [160.0, 80.0],
+        'm:c': [210.0, 210.0],
+        'r:OUT': [310.0, 310.0],
+    }
+    scene, n = prev.pin_scene(scene, anchors)
+    assert n >= 4
+    pos = scene['positions']
+    # Structure members share one translation (least-squares mean of matched offsets).
+    deltas = [
+        np.asarray(anchors['r:R1']) - before['r:R1'],
+        np.asarray(anchors['m:a']) - before['copy:S:a'],
+        np.asarray(anchors['m:b']) - before['copy:S:b'],
+    ]
+    expect = np.mean(deltas, axis=0)
+    for k in ('r:R1', 'copy:S:a', 'copy:S:b'):
+        got = np.asarray(pos[k]) - before[k]
+        assert abs(got[0] - expect[0]) < 1e-9
+        assert abs(got[1] - expect[1]) < 1e-9
+    # Relative geometry inside S unchanged.
+    ref = np.asarray(pos['r:R1'])
+    for k in ('copy:S:a', 'copy:S:b'):
+        rel_before = np.asarray(before[k]) - before['r:R1']
+        rel_after = np.asarray(pos[k]) - ref
+        assert abs(rel_before[0] - rel_after[0]) < 1e-9
+        assert abs(rel_before[1] - rel_after[1]) < 1e-9
+    # Outside-structure pins stay independent.
+    assert pos['m:c'] == [210.0, 210.0]
+    assert pos['r:OUT'] == [310.0, 310.0]
+    assert pos['m:a'] == [40.0, 120.0]  # free primary restores independently
+    # side: stubs follow their reaction midmarker.
+    assert abs(pos['side:R1:h'][0] - (before['side:R1:h'][0] + expect[0])) < 1e-9
+    assert abs(pos['side:R1:h'][1] - (before['side:R1:h'][1] + expect[1])) < 1e-9
+    assert pos['side:OUT:h'] == [310.0, 330.0]
+
+
+def test_pin_scene_uses_blocks_when_participants_missing():
+    """Block reaction_ids keep midmarkers in the rigid body without participants."""
+    import numpy as np
+    scene = dict(
+        positions={
+            'r:R1': [0.0, 0.0],
+            'copy:S:a': [-40.0, 0.0],
+            'copy:S:b': [40.0, 0.0],
+            'side:R1:h': [0.0, 20.0],
+        },
+        participants={},  # incomplete — membership comes from blocks
+    )
+    blocks = [dict(id='S', reaction_ids=['R1'])]
+    before = {k: list(v) for k, v in scene['positions'].items()}
+    anchors = {'r:R1': [100.0, 50.0], 'm:a': [50.0, 50.0], 'm:b': [150.0, 50.0]}
+    scene, _n = prev.pin_scene(scene, anchors, blocks=blocks)
+    deltas = [
+        np.asarray(anchors['r:R1']) - before['r:R1'],
+        np.asarray(anchors['m:a']) - before['copy:S:a'],
+        np.asarray(anchors['m:b']) - before['copy:S:b'],
+    ]
+    expect = np.mean(deltas, axis=0)
+    for k in before:
+        got = np.asarray(scene['positions'][k]) - before[k]
+        assert abs(got[0] - expect[0]) < 1e-9
+        assert abs(got[1] - expect[1]) < 1e-9
+    # Relative geometry unchanged.
+    ref = np.asarray(scene['positions']['r:R1'])
+    for k in ('copy:S:a', 'copy:S:b', 'side:R1:h'):
+        rel_b = np.asarray(before[k]) - before['r:R1']
+        rel_a = np.asarray(scene['positions'][k]) - ref
+        assert abs(rel_b[0] - rel_a[0]) < 1e-9
+        assert abs(rel_b[1] - rel_a[1]) < 1e-9
 
 
 def test_filter_previous_map_drops_removed_reactions(tmp_path):

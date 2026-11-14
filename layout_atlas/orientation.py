@@ -28,6 +28,7 @@ import math
 
 import numpy as np
 
+import edge_evenness as ee
 from core import currency, participation_roles
 
 SIDE_K = 0.27
@@ -73,9 +74,8 @@ def _axis(subs, prods, here):
     return np.array([1.0, 0.0]) if n < 1e-6 else u / n
 
 
-def spoke_length(clearance, k=SIDE_K, dmin=SIDE_MIN, dmax=SIDE_MAX, spread_max=SIDE_SPREAD_MAX):
-    distance = float(np.clip(k * max(clearance, 0.0), dmin, dmax))
-    return distance, distance * (spread_max / dmax)
+def spoke_length(clearance, k=SIDE_K, dmin=SIDE_MIN, dmax=SIDE_MAX):
+    return float(np.clip(k * max(clearance, 0.0), dmin, dmax))
 
 
 def side_gap_for(distance):
@@ -138,42 +138,133 @@ def _freer_perp(here, u, rid, segments, radius):
     return -1.0 if plus > minus else 1.0
 
 
-def reaction_spoke_params(model, scene, cur=None):
-    """Per-reaction adaptive (distance, spread, gap). Shared by sides / display_scene / separate."""
+# Fallback median when the scene has too few core chords: two full spokes plus
+# one fan spread. Share = SIDE_MAX / fallback so that median yields SIDE_MAX.
+_DEFAULT_CORE_MEDIAN = 2.0 * SIDE_MAX + SIDE_SPREAD_MAX
+# Raise by at most one clearance step (SIDE_MIN * SIDE_K) above SIDE_MAX.
+_STUB_RAISE_MAX = SIDE_MIN * SIDE_K
+_STUB_MEDIAN_SHARE = SIDE_MAX / _DEFAULT_CORE_MEDIAN
+# Escher secondary / primary / marker radii (layout-benchmark own sizes).
+_STUB_RADIUS = 10.0
+_PRIMARY_RADIUS = 20.0
+_MARKER_RADIUS = 5.0
+
+
+def stub_ceiling(median):
+    """Spoke-distance ceiling from a core-edge median, clipped to [SIDE_MAX, SIDE_MAX + raise]."""
+    med = float(median) if median and math.isfinite(median) else _DEFAULT_CORE_MEDIAN
+    hi = SIDE_MAX + _STUB_RAISE_MAX
+    return float(max(SIDE_MAX, min(hi, _STUB_MEDIAN_SHARE * med)))
+
+
+def layout_glyph_radius(role='primary'):
+    """Layout disk radius for ``primary``, ``secondary``, or ``marker`` glyphs."""
+    r = (role or 'primary').lower()
+    if r == 'marker':
+        return float(_MARKER_RADIUS)
+    if r == 'secondary':
+        return float(_STUB_RADIUS)
+    return float(_PRIMARY_RADIUS)
+
+
+def _glyph_radius(key, copies, cur):
+    if key.startswith('r:'):
+        return _MARKER_RADIUS
+    if key.startswith('side:'):
+        return _STUB_RADIUS
+    mid = (copies or {}).get(key)
+    if mid is None and key.startswith(('m:', 'copy:', 'inst:')):
+        mid = key.split(':', 2)[-1]
+    if mid in (cur or ()):
+        return _STUB_RADIUS
+    return _PRIMARY_RADIUS
+
+
+def _side_slots(here, u, perp, groups, dist, spr):
+    """Stub centre positions for a reaction at spoke distance ``dist``."""
+    out = []
+    for sign, keys in groups.items():
+        for i, key in enumerate(keys):
+            offset = (i - (len(keys) - 1) / 2) * spr
+            out.append((key, here + sign * u * dist + perp * offset))
+    return out
+
+
+def _lengthening_increases_overlap(slots_raised, slots_std, positions, skip, copies, cur):
+    """True when raised stub centres deepen overlap vs SIDE_MAX placement."""
+    others = [(k, np.asarray(v, float), _glyph_radius(k, copies, cur))
+              for k, v in positions.items() if k not in skip]
+    if not others:
+        return False
+    for (key_r, xy_r), (_, xy_s) in zip(slots_raised, slots_std):
+        for ok, oxy, r_other in others:
+            need = _STUB_RADIUS + r_other
+            d_r = float(np.hypot(*(xy_r - oxy)))
+            d_s = float(np.hypot(*(xy_s - oxy)))
+            # Penetration depth: lengthening must not increase it.
+            if max(0.0, need - d_r) > max(0.0, need - d_s) + 1e-9:
+                return True
+            # Labels sit near glyphs; keep a soft margin beyond node radii.
+            label_need = need + SIDE_GAP_FLOOR
+            if d_r < label_need and d_r + 1e-9 < d_s:
+                return True
+    return False
+
+
+def reaction_spoke_params(model, scene, cur=None, blocks=()):
+    """Per-reaction adaptive (distance, spread, gap). Shared by sides / display_scene / separate.
+
+    For algorithm-placed reactions the spoke ceiling may rise toward the median
+    core (non-currency) mid→metabolite chord so currency stubs track the same
+    length scale the official edge-length scorer sees. Curated Atlas reactions
+    keep the ``SIDE_MAX`` ceiling so their stubs only translate with the
+    structure. Clearance-based floors keep the dense-map rule.
+    """
     cur = currency(model) if cur is None else cur
     positions = scene['positions']
     rx_xy = _reaction_xy(positions)
     clearances = {rid: local_clearance(np.array(positions['r:' + rid], float), rid, rx_xy) for rid in rx_xy}
     dmin = map_spoke_floor(list(clearances.values()))
+    raised = stub_ceiling(ee.median_core_edge(model, scene, cur, default=_DEFAULT_CORE_MEDIAN))
+    curated = _expert_reactions(blocks) if blocks else set()
     out = {}
     for r in model['reactions']:
         rid = r['id']
         clearance = clearances[rid]
-        distance, spread = spoke_length(clearance, dmin=dmin)
-        out[rid] = dict(distance=distance, spread=spread, gap=side_gap_for(distance), clearance=clearance, floor=dmin)
+        # Raise distance only for algorithm reactions. Spread still scales with
+        # SIDE_MAX so a higher ceiling cannot compress the fan and create overlaps.
+        dmax = SIDE_MAX if rid in curated else raised
+        distance = spoke_length(clearance, dmin=dmin, dmax=dmax)
+        spread = float(distance) * (SIDE_SPREAD_MAX / SIDE_MAX)
+        out[rid] = dict(distance=distance, spread=spread, gap=side_gap_for(min(distance, SIDE_MAX)),
+                        clearance=clearance, floor=dmin)
     return out
 
 
-def place_side_glyphs(model, positions, participants, cur, params=None, fixed_distance=None, fixed_spread=None):
+def place_side_glyphs(model, positions, participants, cur, params=None, fixed_distance=None, fixed_spread=None,
+                      blocks=(), copies=None):
     cur = currency(model) if cur is None else cur
     scene = dict(positions=positions, participants=participants)
     fixed = fixed_distance is not None
     params = ({r['id']: dict(distance=float(fixed_distance),
                              spread=float(SIDE_SPREAD_MAX if fixed_spread is None else fixed_spread),
                              gap=side_gap_for(float(fixed_distance)), clearance=None)
-               for r in model['reactions']} if fixed else (params or reaction_spoke_params(model, scene, cur)))
+               for r in model['reactions']} if fixed else (params or reaction_spoke_params(model, scene, cur, blocks=blocks)))
     segments = [] if fixed else _unrelated_segments(model, scene, cur)
+    copies = copies or {}
     moved = 0
     for r in model['reactions']:
         here = np.array(positions['r:' + r['id']], float)
         subs, prods = _split(r, participants, positions, cur)
         u = _axis(subs, prods, here)
         p = params[r['id']]
-        dist, spr = p['distance'], p['spread']
+        dist, spr = float(p['distance']), float(p['spread'])
+        # Prefer the freer half-plane at full spoke length. The probe radius uses
+        # SIDE_MAX so the side choice does not depend on the raised ceiling.
         if fixed or dist < SIDE_MAX - 0.5:
             side = 1.0
         else:
-            side = _freer_perp(here, u, r['id'], segments, radius=max(2.0 * dist, 80.0))
+            side = _freer_perp(here, u, r['id'], segments, radius=max(2.0 * SIDE_MAX, 80.0))
         perp = side * np.array([-u[1], u[0]])
         groups = {-1: [], 1: []}
         for mid, coefficient in r['metabolites'].items():
@@ -183,6 +274,14 @@ def place_side_glyphs(model, positions, participants, cur, params=None, fixed_di
             if key is not None and key.startswith('side:'):
                 for role_c in participation_roles(coefficient):
                     groups[-1 if role_c < 0 else 1].append(key)
+        if not fixed and dist > SIDE_MAX + 0.5:
+            skip = {'r:' + r['id']} | {k for keys in groups.values() for k in keys}
+            raised_slots = _side_slots(here, u, perp, groups, dist, spr)
+            std_slots = _side_slots(here, u, perp, groups, SIDE_MAX, spr)
+            if _lengthening_increases_overlap(raised_slots, std_slots, positions, skip, copies, cur):
+                dist = SIDE_MAX
+                p['distance'] = dist
+                p['gap'] = side_gap_for(dist)
         for sign, keys in groups.items():
             for i, key in enumerate(keys):
                 offset = (i - (len(keys) - 1) / 2) * spr
@@ -224,7 +323,8 @@ def sides(model, scene, blocks, distance=None, spread=None):
     cur = currency(model)
     scene = dict(scene, positions={k: list(v) for k, v in scene['positions'].items()})
     moved, params = place_side_glyphs(model, scene['positions'], scene['participants'], cur,
-                                      fixed_distance=distance, fixed_spread=spread)
+                                      fixed_distance=distance, fixed_spread=spread, blocks=blocks,
+                                      copies=scene.get('copies'))
     scene['orientation_sides_moved'] = moved
     if distance is None:
         scene['orientation_spoke_params'] = {
@@ -413,7 +513,11 @@ def angle_of(subs, prods):
 
 def angles_from_map(map_json, skip=None):
     """{reaction id: angle in degrees between the mean substrate and product directions}, from an Escher map (all drawn glyphs, as in the
-    comparison with the expert map)."""
+    comparison with the expert map).
+
+    Segments that reference a missing node id (e.g. a dangling multimarker after a
+    partial ``--previous`` graft) are skipped so layout quality still evaluates.
+    """
     body = map_json[1]
     nodes = body['nodes']
     out = {}
@@ -421,16 +525,19 @@ def angles_from_map(map_json, skip=None):
         mid = None
         for seg in rx['segments'].values():
             for k in (seg['from_node_id'], seg['to_node_id']):
-                if nodes[k]['node_type'] == 'midmarker':
-                    mid = nodes[k]
+                n = nodes.get(k)
+                if n is not None and n.get('node_type') == 'midmarker':
+                    mid = n
         if mid is None:
             continue
         coefficient = {m['bigg_id']: m['coefficient'] for m in rx['metabolites']}
         subs, prods = [], []
         for seg in rx['segments'].values():
             for k in (seg['from_node_id'], seg['to_node_id']):
-                n = nodes[k]
-                if n['node_type'] == 'metabolite' and not (skip and skip(n['bigg_id'])):
+                n = nodes.get(k)
+                if n is None:
+                    continue
+                if n.get('node_type') == 'metabolite' and not (skip and skip(n.get('bigg_id'))):
                     v = np.array([n['x'] - mid['x'], n['y'] - mid['y']])
                     (subs if coefficient.get(n['bigg_id'], 0) < 0 else prods).append(v)
         angle = angle_of(subs, prods)

@@ -152,9 +152,11 @@ def display_scene(model,corexy,blocks=()):
     key='copy:'+b['id']+':'+mid;xy=b['positions'][mk]
    else:key=mk;xy=corexy.get(mk,(np.array(corexy[rk])+[0,80]).tolist())
    positions[key]=xy;labels[key]=mid;participants[r['id'],mid]=key;copies[key]=mid
- params=orientation_module.reaction_spoke_params(model,dict(positions=positions,participants=participants),cur)
+ params=orientation_module.reaction_spoke_params(model,dict(positions=positions,participants=participants),cur,blocks=blocks)
  for r in model['reactions']:
-  scale=params[r['id']]['distance']/orientation_module.SIDE_MAX;i=0
+  # Cap initial stubs at SIDE_MAX so a later median-raised ceiling (applied in
+  # orientation.sides) cannot inflate pre-compose bboxes.
+  scale=min(params[r['id']]['distance'],orientation_module.SIDE_MAX)/orientation_module.SIDE_MAX;i=0
   here=np.array(corexy['r:'+r['id']],float)
   for mid in r['metabolites']:
    key=participants[r['id'],mid]
