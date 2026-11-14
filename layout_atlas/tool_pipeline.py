@@ -1217,18 +1217,32 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                 dump(output_names.map_json(folder), data)
     # Last geometry pass: tuck floating islands flush with the dense main hull so
     # empty AABB voids (e_coli TR/top floaters, iIT341 far modules) do not survive.
-    # Always tuck (quality/compactness > wall); clear_through stays small-map only.
+    # Skip when compose deliberately kept shelf rows (small-map row/column guides);
+    # final tuck would yank shelf tiles back into AABB voids and erase that grid.
+    # clear_through stays small-map only.
     if LAYOUT_STYLE == 'curated' and not PREVIOUS_SKIP_PACK:
         import composition as _comp_isl
-        spacing_isl = _comp_isl.reaction_spacing_escher(data)
-        island = _comp_isl.tuck_islands_escher(
-            data, cur=currency(model), spacing=spacing_isl)
-        metric['island_tuck_escher'] = island
-        if composition_report is not None:
-            composition_report['island_tuck_escher'] = island
-        if log and island.get('moved'):
-            log(f"  island silhouette tuck (escher, final): moved {island['moved']}/"
-                f"{island.get('candidates', 0)} gap_thresh={island.get('gap_thresh')}")
+        shelf_rows_kept = int(
+            ((composition_report or {}).get('shelf') or {}).get('rows') or 0)
+        if shelf_rows_kept > 0:
+            island = dict(skipped='shelf_rows_keep_alignment',
+                          shelf_rows=shelf_rows_kept, moved=0)
+            metric['island_tuck_escher'] = island
+            if composition_report is not None:
+                composition_report['island_tuck_escher'] = island
+            if log:
+                log(f"  island silhouette tuck (escher, final): skipped "
+                    f"(shelf_rows={shelf_rows_kept} keep alignment)")
+        else:
+            spacing_isl = _comp_isl.reaction_spacing_escher(data)
+            island = _comp_isl.tuck_islands_escher(
+                data, cur=currency(model), spacing=spacing_isl, blocks=blocks)
+            metric['island_tuck_escher'] = island
+            if composition_report is not None:
+                composition_report['island_tuck_escher'] = island
+            if log and island.get('moved'):
+                log(f"  island silhouette tuck (escher, final): moved {island['moved']}/"
+                    f"{island.get('candidates', 0)} gap_thresh={island.get('gap_thresh')}")
         if island.get('moved'):
             fit_isl = _comp_isl.fit_canvas_to_content(data)
             metric['canvas_fit_after_island_tuck'] = fit_isl
@@ -1246,6 +1260,17 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                     f"max_gap={cor2.get('max_gap')} min_len={cor2.get('min_len')}")
                 dump(output_names.map_json(folder), data)
                 dump(folder / 'map.json', data)
+            # Re-snap absolute_rigid row/column relatives after any non-rigid tuck /
+            # corridor slide (restore after arms runs earlier; final tuck can still
+            # perturb shared metabolites that rigid glyphs attach to).
+            import curated_axes as _ca_post_isl
+            data, _rr_post = _ca_post_isl.restore_rigid_group_escher(data, blocks)
+            metric['same_map_restore_post_island'] = _rr_post
+            if log and _rr_post.get('restored'):
+                log(f"  same-map rigid restore (escher post-island): "
+                    f"{_rr_post['restored']} nodes")
+            dump(output_names.map_json(folder), data)
+            dump(folder / 'map.json', data)
             # Mid/large: squeeze empty bands after tuck so far modules do not leave
             # a tall/wide AABB (iIT341 blank ~0.60 vs stable 0.20).
             if len(model['reactions']) >= 200 and os.environ.get('OPM_SQUEEZE', 'on') != 'off':

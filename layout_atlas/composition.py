@@ -152,10 +152,17 @@ def tuck_islands_to_silhouette(model, scene, blocks, cur, spacing=None):
     scene = dict(scene, positions={k: list(v) for k, v in scene['positions'].items()})
     pos = scene['positions']
     comps = components(model, scene, cur)
-    # Hull reference = large connected components only. Do NOT freeze same_map_rigid
-    # tiles as main — those are often the visual islands we must tuck (translation
-    # preserves their internal geometry).
+    # Hull = large components PLUS same_map_rigid tiles. Compose / reflow already
+    # freeze absolute_rigid backbones as main so hand-drawn row/column relatives
+    # survive; early silhouette tuck used to slide each currency-split module on
+    # its own (PFK/RPE… 1600px) and erased that grid before restore could help.
     main = [i for i, c in enumerate(comps) if len(c['reactions']) >= MAIN_MIN]
+    rigid_rx = {rid for b in (blocks or []) if b.get('same_map_rigid')
+                for rid in (b.get('reaction_ids') or [])}
+    if rigid_rx:
+        for i, c in enumerate(comps):
+            if i not in main and any(rid in rigid_rx for rid in c['reactions']):
+                main.append(i)
     if not main:
         main = [int(np.argmax([len(c['reactions']) for c in comps]))] if comps else []
     if not main:
@@ -519,13 +526,21 @@ def compose(model, scene, blocks, cur):
             lw = min(max([text_w(str(labels.get(k, ''))) for k in ks] + [0.0]), 220.0)
             pads[i] = lw
             boxes.append((i, arr.min(0), arr.max(0) - arr.min(0) + np.array([60.0 + lw, 60.0])))
-        # Pocket-pack into empty space flush with the main AABB before any external shelf.
+        # Small maps (e_coli): shelf independents in uniform rows/columns beside the
+        # main AABB. Pocket-pack alone left shelf.rows=0 and erased the hand-drawn
+        # row/column guide that same-map absolute_rigid establishes on the main body.
+        # Mid/large: pocket-pack first (spoke-safe), shelf only leftovers.
+        n_rx_model = len(model['reactions'])
         prefer_c = main_pts.mean(0)
-        pocket_boxes = sorted(
-            [(i, float(size[0]), float(size[1])) for i, _bmin, size in boxes],
-            key=lambda t: (-t[1] * t[2], t[0]))
-        pocket_placed, pocket_rep = pack_into_main_pockets(
-            pocket_boxes, main_pts, spacing, prefer_c=prefer_c)
+        pocket_placed, pocket_rep = {}, dict(placed=0, missed=len(boxes), skipped=None)
+        if n_rx_model >= 200:
+            pocket_boxes = sorted(
+                [(i, float(size[0]), float(size[1])) for i, _bmin, size in boxes],
+                key=lambda t: (-t[1] * t[2], t[0]))
+            pocket_placed, pocket_rep = pack_into_main_pockets(
+                pocket_boxes, main_pts, spacing, prefer_c=prefer_c)
+        else:
+            pocket_rep = dict(placed=0, missed=len(boxes), skipped='shelf_rows_small_map')
         report['pocket_pack'] = pocket_rep
         remaining = []
         for i, bmin, size in boxes:
@@ -650,9 +665,13 @@ def compose(model, scene, blocks, cur):
     # After related/independent moves: pull true exterior stubs into free regions
     # of the main AABB. Keep this mild — aggressive teleports raise crossings and
     # split curated structures (the initial pocket_pack already places most tiles).
+    # Skip when shelf rows are the packing mode: interior pocket hops yank shelved
+    # modules off their row/column guides (e_coli hops ~1175 px).
+    shelf_rep_early = report.get('shelf') or {}
+    skip_interior_for_shelf = int(shelf_rep_early.get('rows') or 0) > 0
     iter_reps = []
     prev_ids = None
-    for _it in range(2):
+    for _it in range(0 if skip_interior_for_shelf else 2):
         main_pts = np.array(
             [placed_pts[k] for i in main for k in cur_keys_of[i] if k in placed_pts], float)
         if len(main_pts) < 2:
@@ -722,20 +741,34 @@ def compose(model, scene, blocks, cur):
             break
     if iter_reps:
         report['interior_repack'] = iter_reps
-    # Close empty corridors between islands and the dense main hull (AABB voids that
-    # pocket-pack leaves with leftover=0 but still look like TR/top floaters).
-    scene, island_rep = tuck_islands_to_silhouette(
-        model, scene, blocks, cur, spacing=spacing)
-    report['island_tuck'] = island_rep
-    # Final landscape reflow: translation-only skyline of rigid visual components so the
-    # content bbox lands in 4:3–16:9 even when related-pulls left a tall column.
-    scene, reflow = reflow_landscape(model, scene, blocks, cur)
-    report['landscape_reflow'] = reflow
-    # Reflow may re-pocket/flush; one more silhouette tuck for anything still gapped.
-    scene, island_rep2 = tuck_islands_to_silhouette(
-        model, scene, blocks, cur, spacing=spacing)
-    if island_rep2.get('moved'):
-        report['island_tuck_after_reflow'] = island_rep2
+    # Small-map shelf rows restore hand-drawn row/column guides for independents.
+    # Silhouette tuck + landscape far-outlier pocket-pack yank those shelf tiles
+    # back into AABB voids (e_coli: shelf.rows=5 → pocket placed=9) and erase the
+    # absolute_rigid + shelf grid. Keep the shelf; mid/large still tuck/reflow.
+    shelf_rep = report.get('shelf') or {}
+    used_shelf_rows = int(shelf_rep.get('rows') or 0) > 0
+    if used_shelf_rows:
+        report['island_tuck'] = dict(skipped='shelf_rows_keep_alignment',
+                                     shelf_rows=shelf_rep.get('rows'))
+        report['landscape_reflow'] = dict(
+            skipped='shelf_rows_keep_alignment',
+            shelf_rows=shelf_rep.get('rows'),
+            shelf_side=shelf_rep.get('side'))
+    else:
+        # Close empty corridors between islands and the dense main hull (AABB voids that
+        # pocket-pack leaves with leftover=0 but still look like TR/top floaters).
+        scene, island_rep = tuck_islands_to_silhouette(
+            model, scene, blocks, cur, spacing=spacing)
+        report['island_tuck'] = island_rep
+        # Final landscape reflow: translation-only skyline of rigid visual components so the
+        # content bbox lands in 4:3–16:9 even when related-pulls left a tall column.
+        scene, reflow = reflow_landscape(model, scene, blocks, cur)
+        report['landscape_reflow'] = reflow
+        # Reflow may re-pocket/flush; one more silhouette tuck for anything still gapped.
+        scene, island_rep2 = tuck_islands_to_silhouette(
+            model, scene, blocks, cur, spacing=spacing)
+        if island_rep2.get('moved'):
+            report['island_tuck_after_reflow'] = island_rep2
     scene['composition'] = report
     return scene, report
 
@@ -2415,18 +2448,23 @@ def compact_long_arms_scene(model, scene, cur, max_arm=ARM_MAX, target=ARM_TARGE
     return scene, report
 
 
-def tuck_islands_escher(data, cur=None, spacing=None):
+def tuck_islands_escher(data, cur=None, spacing=None, blocks=None):
     """Pull spatially floating reaction islands flush with the dense main hull.
 
     Runs on the finished Escher map (after squeeze / corridor) so later geometry
     passes cannot reopen the empty corridors that scene-level tuck closed.
     Gap is the minimum point-to-hull distance (not component centres). Translation
     only; Bezier ``b1``/``b2`` shift with their reaction.
+
+    ``blocks`` with ``same_map_rigid``: those reactions stay put (absolute row /
+    column relatives from the curated source map). Only non-rigid floaters tuck.
     """
     from core import CURRENCY
     cur = set(cur or ()) | set(CURRENCY)
     body = data[1]
     nodes, reactions = body['nodes'], body['reactions']
+    rigid_rx = {rid for b in (blocks or []) if b.get('same_map_rigid')
+                for rid in (b.get('reaction_ids') or [])}
     parent = {}
 
     def find(a):
@@ -2570,7 +2608,11 @@ def tuck_islands_escher(data, cur=None, spacing=None):
     # so CYTBD/NADH/O2t tuck as one rigid body. Never join a far floater to a
     # near island: min-gap over the union would drop below thresh and skip the
     # whole group (e_coli glucose/ETC sitting across an AABB void next to FBA).
-    islands = list(rows[1:])
+    # Skip same_map_rigid islands — absolute_rigid bake already placed them on
+    # hand-drawn rows/columns; sliding each currency-split piece independently
+    # is what erased module grid alignment on the speed branch.
+    islands = [m for m in rows[1:]
+               if not (rigid_rx and any(rid in rigid_rx for rid in m))]
     island_pts_cache = []
     island_gaps = []
     for members in islands:

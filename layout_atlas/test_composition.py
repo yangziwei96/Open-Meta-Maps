@@ -436,6 +436,59 @@ def test_tuck_islands_to_silhouette_closes_aabb_void():
     assert after[1] < 500.0, (after, rep)
 
 
+def test_tuck_islands_to_silhouette_freezes_same_map_rigid():
+    """Absolute-rigid atlas modules keep row/column; only non-rigid floaters tuck."""
+    reactions = []
+    parts = {}
+    pos = {}
+    n_main = max(C.MAIN_MIN, 24)
+    cols = 6
+    for i in range(n_main):
+        rid = f'M{i}'
+        mid = f'm{i}'
+        mets = {'backbone': -1.0, mid: 1.0} if i else {mid: -1.0, 'backbone': 1.0}
+        reactions.append({'id': rid, 'metabolites': mets})
+        for m in mets:
+            parts[rid, m] = f'm:{m}'
+        x = (i % cols) * 120.0
+        y = (i // cols) * 120.0
+        pos[f'r:{rid}'] = [x, y]
+        pos[f'm:{mid}'] = [x + 30.0, y + 20.0]
+    pos['m:backbone'] = [300.0, 200.0]
+    # Two far same-map modules sharing a source-grid column (x=200).
+    for rid, y0 in (('RIG_A', -800.0), ('RIG_B', -1100.0)):
+        reactions.append({'id': rid, 'metabolites': {f'{rid}z': -1.0, f'{rid}w': 1.0}})
+        parts[rid, f'{rid}z'] = f'm:{rid}z'
+        parts[rid, f'{rid}w'] = f'm:{rid}w'
+        pos[f'r:{rid}'] = [200.0, y0]
+        pos[f'm:{rid}z'] = [180.0, y0 - 20.0]
+        pos[f'm:{rid}w'] = [220.0, y0 + 20.0]
+    # Non-rigid floater elsewhere.
+    reactions.append({'id': 'FREE', 'metabolites': {'fz': -1.0, 'fw': 1.0}})
+    parts['FREE', 'fz'] = 'm:fz'
+    parts['FREE', 'fw'] = 'm:fw'
+    pos['r:FREE'] = [800.0, -900.0]
+    pos['m:fz'] = [780.0, -920.0]
+    pos['m:fw'] = [820.0, -880.0]
+    blocks = [
+        dict(id='b1', same_map_rigid='AtlasMap', reaction_ids=['RIG_A']),
+        dict(id='b2', same_map_rigid='AtlasMap', reaction_ids=['RIG_B']),
+    ]
+    before_a = list(pos['r:RIG_A'])
+    before_b = list(pos['r:RIG_B'])
+    before_f = list(pos['r:FREE'])
+    model = {'reactions': reactions}
+    scene = {'positions': {k: list(v) for k, v in pos.items()},
+             'participants': parts, 'labels': {}}
+    out, rep = C.tuck_islands_to_silhouette(
+        model, scene, blocks=blocks, cur=set(), spacing=120.0)
+    # Rigid pair stays put (row/column from absolute bake).
+    assert out['positions']['r:RIG_A'] == before_a, (before_a, out['positions']['r:RIG_A'], rep)
+    assert out['positions']['r:RIG_B'] == before_b, (before_b, out['positions']['r:RIG_B'], rep)
+    # Free floater still tucks.
+    assert out['positions']['r:FREE'][1] > before_f[1] + 100.0, (before_f, out['positions']['r:FREE'], rep)
+
+
 def test_fit_canvas_to_content_shrinks_frame():
     data = [
         {},
