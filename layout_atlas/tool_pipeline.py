@@ -1245,14 +1245,14 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                     f"max_gap={cor2.get('max_gap')} min_len={cor2.get('min_len')}")
                 dump(output_names.map_json(folder), data)
                 dump(folder / 'map.json', data)
-        # Single final clear (try/round caps — never wall-clock). Runs even when
-        # island did not move so through→0 is not gated on floater motion.
+        # Single final clear (try/round caps — never wall-clock). Bezier
+        # official_clear (not orthogonal) is what drove tip gate15 70→0; ortho
+        # mode barely moves the count. Runs even when island did not move.
         if os.environ.get('OPM_CLEAR_THROUGH', 'on') != 'off':
             import edge_style as _es_isl
-            metric['clear_through_nodes_post_island_tuck'] = _es_isl.clear_through_nodes(
-                data, skip_edges, log=log, mode='orthogonal',
-                gem_path=str(gem_file) if gem_file else None,
-                max_rounds=5, max_edge_tries=140, max_nudge_tries=160)
+            metric['clear_through_nodes_final'] = _es_isl.clear_through_nodes(
+                data, skip_edges, log=log, mode='bezier',
+                max_rounds=4, max_edge_tries=120, max_nudge_tries=128)
             dump(output_names.map_json(folder), data)
             dump(folder / 'map.json', data)
     # Final --previous step: rigidly translate each curated structure toward previous
