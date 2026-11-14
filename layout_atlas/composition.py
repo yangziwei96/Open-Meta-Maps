@@ -275,13 +275,18 @@ def tuck_islands_to_silhouette(model, scene, blocks, cur, spacing=None):
                 # Accept teleport only if it actually closes the hull gap.
                 trial = pts + delta
                 new_gap = float(np.min(tree.query(trial, k=1)[0]))
-                if new_gap < gap - 40.0 and not _collides(delta):
-                    best_t = float(np.hypot(*delta))
+                dlen = float(np.hypot(*delta))
+                # Same 1200px hop cap as interior_repack — uncapped teleports
+                # explode iIT341 canvas / blank vs stable (10k+ px hops).
+                if (new_gap < gap - 40.0 and dlen <= 1200.0
+                        and not _collides(delta)):
+                    best_t = dlen
                     best_delta = delta
                     reason = 'pocket_teleport'
                     prep_note = prep
                 else:
-                    prep_note = dict(prep, rejected_gap=round(new_gap, 1))
+                    prep_note = dict(prep, rejected_gap=round(new_gap, 1),
+                                     rejected_dlen=round(dlen, 1))
             else:
                 prep_note = prep
         else:
@@ -719,18 +724,26 @@ def compose(model, scene, blocks, cur):
         report['interior_repack'] = iter_reps
     # Close empty corridors between islands and the dense main hull (AABB voids that
     # pocket-pack leaves with leftover=0 but still look like TR/top floaters).
-    scene, island_rep = tuck_islands_to_silhouette(
-        model, scene, blocks, cur, spacing=spacing)
-    report['island_tuck'] = island_rep
-    # Final landscape reflow: translation-only skyline of rigid visual components so the
-    # content bbox lands in 4:3–16:9 even when related-pulls left a tall column.
-    scene, reflow = reflow_landscape(model, scene, blocks, cur)
-    report['landscape_reflow'] = reflow
-    # Reflow may re-pocket/flush; one more silhouette tuck for anything still gapped.
-    scene, island_rep2 = tuck_islands_to_silhouette(
-        model, scene, blocks, cur, spacing=spacing)
-    if island_rep2.get('moved'):
-        report['island_tuck_after_reflow'] = island_rep2
+    # Mid/large: skip late island tuck + landscape reflow — they inflate blank /
+    # canvas height vs stable-v1 iIT341 (0.20 blank / ~5k H). Small maps keep
+    # them for e_coli floater wins.
+    n_rx = len(model['reactions'])
+    if n_rx >= 200:
+        report['island_tuck'] = dict(skipped='n_rx>=200_packing_gate')
+        report['landscape_reflow'] = dict(skipped='n_rx>=200_packing_gate')
+    else:
+        scene, island_rep = tuck_islands_to_silhouette(
+            model, scene, blocks, cur, spacing=spacing)
+        report['island_tuck'] = island_rep
+        # Final landscape reflow: translation-only skyline of rigid visual components so the
+        # content bbox lands in 4:3–16:9 even when related-pulls left a tall column.
+        scene, reflow = reflow_landscape(model, scene, blocks, cur)
+        report['landscape_reflow'] = reflow
+        # Reflow may re-pocket/flush; one more silhouette tuck for anything still gapped.
+        scene, island_rep2 = tuck_islands_to_silhouette(
+            model, scene, blocks, cur, spacing=spacing)
+        if island_rep2.get('moved'):
+            report['island_tuck_after_reflow'] = island_rep2
     scene['composition'] = report
     return scene, report
 
