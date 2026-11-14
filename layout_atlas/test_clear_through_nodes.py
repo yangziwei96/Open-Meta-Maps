@@ -85,14 +85,63 @@ def test_clear_through_nodes_drives_e_coli_official_to_credit_band():
 
 def test_clear_through_nodes_skips_when_official_already_clean():
     """Post-hotspot / post-orthogonal clears must early-out once official is 0."""
-    data = load_escher(EXAMPLE)
-    skip = (data[0].get("metadata") or {}).get("preserved_edges") or []
-    edge_style.clear_through_nodes(data, skip)
-    assert lq.official_lines_through_nodes_count(data, skip) == 0
-    report = edge_style.clear_through_nodes(data, skip)
+    # Minimal map with no through pairs — exercises the cheap official_clean path
+    # without depending on a multi-pass clear of the full example reaching exactly 0.
+    data = [{
+        "map_name": "clean", "map_id": "clean", "schema": "1.0.0",
+        "metadata": {"preserved_edges": []},
+    }, {
+        "nodes": {
+            "m1": {"node_type": "metabolite", "bigg_id": "a_c", "x": 0.0, "y": 0.0,
+                   "node_is_primary": True},
+            "m2": {"node_type": "metabolite", "bigg_id": "b_c", "x": 200.0, "y": 0.0,
+                   "node_is_primary": True},
+            "mid": {"node_type": "midmarker", "x": 100.0, "y": 0.0},
+        },
+        "reactions": {
+            "r": {"bigg_id": "R1", "segments": {
+                "1": {"from_node_id": "mid", "to_node_id": "m1", "b1": None, "b2": None},
+                "2": {"from_node_id": "mid", "to_node_id": "m2", "b1": None, "b2": None},
+            }},
+        },
+    }]
+    assert lq.official_lines_through_nodes_count(data, []) == 0
+    report = edge_style.clear_through_nodes(data, [])
     assert report["reason"] == "official_clean"
     assert report["after_official"] == 0
-    assert report["seconds"] < 1.0
+    assert report["seconds"] < 0.5
+    assert report["edges_tried"] == 0
+
+
+def test_nudge_respects_max_tries_cap():
+    """Mac e_coli burned 2000+ nudge trials — hard cap must bind."""
+    data = load_escher(EXAMPLE)
+    skip = (data[0].get("metadata") or {}).get("preserved_edges") or []
+    # Leave official pairs intact so nudge has work; cap tries tightly.
+    before = lq.official_lines_through_nodes_count(data, skip)
+    assert before > 0
+    index = lq.CrossingIndex(data, skip)
+    nudge = edge_style._nudge_through_obstacles(
+        data, skip, crossing_index=index, max_tries=12, max_rounds=3)
+    assert nudge["tried"] <= 12
+    assert nudge["tried"] > 0 or before == 0
+    if nudge["tried"] >= 12:
+        assert nudge.get("capped") is True
+
+
+def test_clear_through_try_budgets_not_wall_clock():
+    """Budgets are edge/nudge try counts; max_seconds must not be the stop."""
+    data = load_escher(EXAMPLE)
+    skip = (data[0].get("metadata") or {}).get("preserved_edges") or []
+    report = edge_style.clear_through_nodes(
+        data, skip, max_rounds=3, max_edge_tries=20, max_nudge_tries=16,
+        max_seconds=0.001,  # would stop immediately if honored as wall-clock
+    )
+    assert report["edges_tried"] <= 20
+    assert report.get("budget_edge_tries") == 20
+    assert (report.get("nudge") or {}).get("tried", 0) <= 16
+    # With a tiny wall budget ignored, we still evaluate some edges.
+    assert report["edges_tried"] >= 1
 
 
 def test_prepare_keeps_preserved_algorithm_corridor():

@@ -915,9 +915,10 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
         metric['edge_style'] = dict(edge_style.apply(data, skip_edges), seconds=round(time.time() - t_style, 1))
         if log:
                 log(f"  curated-style connections: {metric['edge_style']}")
-        if os.environ.get('OPM_CLEAR_THROUGH', 'on') != 'off':
-            metric['clear_through_nodes'] = edge_style.clear_through_nodes(
-                data, skip_edges, log=log)
+        # Skip early clear_through: post-restore edge_style reintroduces through
+        # pairs (gate15: 70→0 then 49 again), so the first bezier clear (~26–105s
+        # on Mac with unbounded nudge) is pure wall-time waste vs stable-v1 ~65s.
+        # Later clears (post-restore / post-orthogonal / post-island) own through→0.
         import label_placement
         t_labels = time.time()
         metric['label_placement'] = dict(label_placement.optimize(data), seconds=round(time.time() - t_labels, 1))
@@ -1064,8 +1065,11 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             if log:
                 log(f"  curated-style connections (post-restore): {metric['edge_style_post_restore']}")
             if os.environ.get('OPM_CLEAR_THROUGH', 'on') != 'off':
+                # Sole mid-pipeline clear. Budgets are try counts (like hotspot),
+                # not wall-clock — Mac tip burned 2057 nudge trials / 105s.
                 metric['clear_through_nodes_post_restore'] = _es_post.clear_through_nodes(
-                    data, skip_edges, log=log)
+                    data, skip_edges, log=log, max_rounds=4,
+                    max_edge_tries=120, max_nudge_tries=128)
             dump(output_names.map_json(folder), data)
         # Hotspot repair AFTER rigid restore + overlap clear + squeeze + corridor
         # so accepted moves are not undone by absolute snap / padding slides.
@@ -1077,28 +1081,23 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                      reactions=list(b['reaction_ids']))
                 for b in blocks if len(b.get('reaction_ids') or []) >= 2]
             data[0].setdefault('metadata', {})['expert_structures'] = curated_structures_early
-            # After absolute rigid restore, more windows need search than the default
-            # mass-scaled budget covers (e_coli formate cluster alone was 15 crossings).
+            # Near stable-v1 hotspot cost (~8.8s e_coli); avoid post-#38 try inflation.
             n_rx = len(model['reactions'])
-            # Corridor slides can add a few local spoke crossings; give small maps
-            # enough search to recover the pre-corridor counted-crossing floor.
-            hs_budget = 35.0 if n_rx < 200 else 45.0
-            hs_k = 10 if n_rx < 200 else 8
+            hs_budget = 10.0 if n_rx < 200 else 18.0
+            hs_k = 5 if n_rx < 200 else 6
             # Mass-scaled try ceiling from budget_s (no wall-clock). Do not pass
             # PREVIOUS_ANCHORS as pinned_keys here: mid-pipeline --previous pins are
             # deferred to the final rigid structure translate so curated relatives
             # stay identical to the no-previous drawing.
             metric['hotspot_repair'] = hotspot_repair.repair(
                 data, model=model, scene=scene, blocks=blocks, skip_edges=skip_edges, log=log,
-                structures=curated_structures_early, k=hs_k, max_accepts=100,
-                budget_s=hs_budget, max_rounds=8)
+                structures=curated_structures_early, k=hs_k, max_accepts=12,
+                budget_s=hs_budget, max_rounds=4)
             if log:
                 hr = metric['hotspot_repair']
                 log('  hotspot repair: ' + str({k: hr.get(k) for k in ('accepted_count', 'tries', 'rounds', 'seconds', 'improved')}))
-            if os.environ.get('OPM_CLEAR_THROUGH', 'on') != 'off':
-                import edge_style as _es_clear
-                metric['clear_through_nodes_post_hotspot'] = _es_clear.clear_through_nodes(
-                    data, skip_edges, log=log)
+            # No post-hotspot clear: post-restore clear owns through→0; a second
+            # partial clear only burned wall time (Mac 316s residual clears).
             dump(output_names.map_json(folder), data)
         # Shrink canvas to content (same stage as main) before the final label pass.
         # Tip nudge may refit later only when it accepts a move.
@@ -1166,23 +1165,33 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             seconds=round(time.time() - t_orth, 1))
         if log:
             log(f"  orthogonal algorithm routes (final): {metric['edge_style_orthogonal']}")
-        # Orthogonal rewrite can reintroduce through-node hits; clear again on the
-        # final polyline geometry (no canvas scale / map split).
+        # Orthogonal rewrite can reintroduce through-node hits; clear with try
+        # caps (early-out when already 0 — never unbounded nudge).
         if os.environ.get('OPM_CLEAR_THROUGH', 'on') != 'off':
             metric['clear_through_nodes_post_orthogonal'] = _es_final.clear_through_nodes(
                 data, skip_edges, log=log, mode='orthogonal',
-                gem_path=str(gem_file) if gem_file else None)
+                gem_path=str(gem_file) if gem_file else None,
+                max_rounds=3, max_edge_tries=64, max_nudge_tries=64)
         dump(folder / 'map.json', data)
     # Late per-reaction currency clones for Pathway-Scorer-style hubs (layout gate).
     # Runs after orthogonal multimarkers exist so the gate scores the same polylines
     # the official edge_orthogonality measure uses. Also runs on --previous pin paths
     # (including mid-size skip-packing), not only full redraws.
+    # Small headline GEMs: hub split is an 8s+ scoring pass with marginal visual win
+    # vs stable-v1 wall (~65s); keep for mid/large unless explicitly off.
     import split_cofactor_hubs as _sch
     from hub_drawing import pathway_from_model as _pathway_from_model
     curated_rids = {rid for b in blocks for rid in b.get('reaction_ids') or []}
     pathway = _pathway_from_model(model)
-    data, hub_report = _sch.apply_gated(
-        data, model, pathway=pathway, curated=curated_rids, log=log)
+    n_rx_hub = len(model['reactions'])
+    hub_default = 'off' if n_rx_hub < 200 else 'on'
+    if os.environ.get('OPM_HUB_SPLIT', hub_default) == 'off':
+        hub_report = dict(enabled=False, skipped='small_map_wall', hub_count=None)
+        if log:
+            log('  cofactor hub split: skipped (small map wall budget)')
+    else:
+        data, hub_report = _sch.apply_gated(
+            data, model, pathway=pathway, curated=curated_rids, log=log)
     metric['cofactor_hub_split'] = hub_report
     dump(output_names.map_json(folder), data)
     dump(folder / 'cofactor_hub_split.json', hub_report)
@@ -1213,7 +1222,8 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                 import edge_style as _es_tip
                 metric['clear_through_nodes_post_tip'] = _es_tip.clear_through_nodes(
                     data, skip_edges, log=log, mode='orthogonal',
-                    gem_path=str(gem_file) if gem_file else None)
+                    gem_path=str(gem_file) if gem_file else None,
+                    max_rounds=1, max_edge_tries=24, max_nudge_tries=24)
             dump(output_names.map_json(folder), data)
     # Last geometry pass: tuck floating islands flush with the dense main hull so
     # empty AABB voids (e_coli TR/top floaters) do not survive into the PNG.
@@ -1249,17 +1259,12 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             # extra rounds — soft-corridor tuck can leave a thicker residual set.
             if os.environ.get('OPM_CLEAR_THROUGH', 'on') != 'off':
                 import edge_style as _es_isl
+                # Final clear after floater tuck (may reintroduce through pairs).
+                # Nudge try-cap keeps Mac from 2000+ trial hangs; rounds aim at →0.
                 metric['clear_through_nodes_post_island_tuck'] = _es_isl.clear_through_nodes(
                     data, skip_edges, log=log, mode='orthogonal',
                     gem_path=str(gem_file) if gem_file else None,
-                    max_rounds=6)
-                # Second pass if a few official pairs remain after the first budget.
-                post = metric['clear_through_nodes_post_island_tuck']
-                if int(post.get('after_official') or 0) > 0:
-                    metric['clear_through_nodes_post_island_tuck_2'] = _es_isl.clear_through_nodes(
-                        data, skip_edges, log=log, mode='orthogonal',
-                        gem_path=str(gem_file) if gem_file else None,
-                        max_rounds=4)
+                    max_rounds=4, max_edge_tries=96, max_nudge_tries=128)
                 dump(output_names.map_json(folder), data)
                 dump(folder / 'map.json', data)
     # Final --previous step: rigidly translate each curated structure toward previous
