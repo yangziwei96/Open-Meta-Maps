@@ -29,7 +29,7 @@ import output_names
 LIMITS = dict(max_bytes=25 * 1024 * 1024, max_reactions=20000, full_routed_max_reactions=150, whole_map_max_reactions=3000, view_size=50)
 SOURCE_PATHS = False  # reuse the curated map's original curves (Escher Bezier chains) for the edges of matched structures
 ORIENTATION = 'full'  # 'off' | 'sides' (currency copies on the substrate / product side) | 'full' (also reactions outside the curated structures between their substrates and products)
-LAYOUT_STYLE = 'curated'  # 'legacy' | 'curated' (V7: Bezier curves from curated-map constraints; no orthogonal polylines).
+LAYOUT_STYLE = 'curated'  # 'legacy' | 'curated' (orthogonal polylines for algorithm edges; curated paths kept).
 
 def normalize_layout_style(value):
     """Map user/API layout_style to the canonical value."""
@@ -40,9 +40,9 @@ def normalize_layout_style(value):
 COMPLETION_CONTEXT = 'auto'  # 'auto' (V6: uncovered reactions are placed beside the glyphs of their own metabolites) | 'off'
 EDGE_ROUTING = 'libavoid'  # 'libavoid' (orthogonal, all edges) | 'hybrid' (routes only blocked algorithm-placed edges) | 'none' (straight lines)
 # Routing behavior by layout style and model size:
-#   - layout_style='curated': Uses Bezier curve fitting (edge_style.apply) for all algorithm-placed edges.
-#     Curated-style curves follow community-map templates. No libavoid routing is used
-#     because the Bezier curves already avoid obstacles via iterative candidate selection.
+#   - layout_style='curated': early edge_style.apply draws Bezier for layout stages; a final
+#     edge_style.apply(..., mode='orthogonal') writes axis-parallel polylines (≤2 bends) for
+#     algorithm edges. Curated Atlas paths / short cofactor stubs stay as stamped. No libavoid.
 #   - layout_style='legacy' with <= ROUTING_THRESHOLD reactions: Uses libavoid orthogonal routing.
 #   - layout_style='legacy' with > ROUTING_THRESHOLD reactions: Routing is deferred (edge_routing.measure only).
 # For scalable=True (large models), straight connections are used initially; edge_style is applied separately.
@@ -465,6 +465,14 @@ def draw_map_from_previous(model, selected, folder, full_model=None, log=None):
         log(f"  previous layout: reused map ({report['kept_reactions']} reactions, "
             f"{report['removed_reactions']} removed, {report['nodes']} nodes{extra}); "
             f"skipped packing/redraw")
+    # Hub split on the reused drawing (same gate as the full compose path).
+    import split_cofactor_hubs as _sch
+    from hub_drawing import pathway_from_model as _pathway_from_model
+    curated_rids = {rid for b in (selected or []) for rid in b.get('reaction_ids') or []}
+    pathway = _pathway_from_model(model)
+    data, hub_report = _sch.apply_gated(
+        data, model, pathway=pathway, curated=curated_rids, log=log)
+    dump(folder / 'cofactor_hub_split.json', hub_report)
     dump(output_names.map_json(folder), data)
     try:
         Draft4Validator(read(ESCHER_SCHEMA)).validate(data)
@@ -490,6 +498,7 @@ def draw_map_from_previous(model, selected, folder, full_model=None, log=None):
         layout_quality_final=quality_summary,
         completion=dict(method='previous_filter_graft', **report),
         previous_relayout=previous_relayout,
+        cofactor_hub_split=hub_report,
         routing=dict(status='preserved_from_previous'),
         routing_attempts=[], orientation_mode=ORIENTATION,
         instance_optimization=dict(mode='off'), context_placement=dict(mode='off'),
@@ -597,16 +606,14 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                 continue
             for i, rid in enumerate(bridge['reaction_ids']):
                 key = 'r:' + rid
-                if PREVIOUS_ANCHORS and key in PREVIOUS_ANCHORS:
-                    continue
                 anchors[key] = (np.array(a) + (np.array(c) - a) * (i + 1) / (len(bridge['reaction_ids']) + 1)).tolist()
-    # Pin previous-map anchors (overwrite) so complete_spaced treats them as fixed.
-    if PREVIOUS_ANCHORS and not PREVIOUS_SKIP_PACK:
-        anchors.update({k: list(v) for k, v in PREVIOUS_ANCHORS.items()})
-        blocks, _ = prev.apply_block_positions(blocks, PREVIOUS_ANCHORS)
-        if log:
-            log(f'  previous layout: pinned {len(PREVIOUS_ANCHORS)} anchors '
-                f'({prev.reaction_anchor_share(PREVIOUS_ANCHORS, model):.0%} of reactions)')
+    # Defer all --previous placement to the final Escher rigid translate so curated
+    # structure relatives stay identical to the no-previous drawing.  Mid-pipeline
+    # pins / leftovers change neighbour forces and deform structures.
+    if PREVIOUS_ANCHORS and not PREVIOUS_SKIP_PACK and log:
+        log(f'  previous layout: {len(PREVIOUS_ANCHORS)} anchors '
+            f'({prev.reaction_anchor_share(PREVIOUS_ANCHORS, model):.0%} of reactions); '
+            f'deferred to final rigid structure translate')
     timings = {}
     stamp = time.time()
 
@@ -617,12 +624,17 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
         if log:
             log(f'  {name}: {timings[name]} s')
 
-    def _pin_previous(scene):
-        if not PREVIOUS_ANCHORS:
-            return scene
-        scene, n = prev.pin_scene(scene, PREVIOUS_ANCHORS)
-        if log and n:
-            log(f'  previous layout restore: {n} glyphs')
+    def _pin_previous(scene, label=None):
+        # Mid-pipeline previous pins are deferred; see final translate_structures_escher.
+        return scene
+
+    def _same_map_or_previous_restore(scene, label):
+        """Same-map absolute restore (identical to the no-previous path)."""
+        import curated_axes as _ca_restore
+        scene, _rr = _ca_restore.restore_rigid_group(scene, blocks)
+        if log and _rr.get('restored'):
+            log(f'  same-map rigid restore ({label}): {_rr["restored"]} glyphs'
+                + (f', n_rx={_rr["n_rx"]}' if _rr.get('n_rx') is not None else ''))
         return scene
 
     if scalable:
@@ -663,31 +675,12 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             completion_skip = {rid for region in regions if len(region['reactions']) > 1 for rid in region['reactions']}
         # With a previous map, embed a new reaction only when ≥2 participants are already drawn;
         # otherwise leave it as a new component (do not pull onto a single metabolite).
-        min_anch = 2 if PREVIOUS_ANCHORS else 1
+        # Same min_anchors as no-previous so curated geometry stays comparable;
+        # --previous structure placement happens on the final map.
         scene, completion_report = completion_context_module.place(
-            model, scene, blocks, currency(model), completion_skip, min_anchors=min_anch)
+            model, scene, blocks, currency(model), completion_skip, min_anchors=1)
         if log:
             log(f"  anchor-driven placement: {completion_report['placed']} of {completion_report['candidates']} reactions placed {completion_report['tiers']}, attachment {completion_report['attachment_rate_before']['rate']} -> {completion_report['attachment_rate_after']['rate']}")
-        scene = _pin_previous(scene)
-        # Pin-old / place-new: never drop reactions that lack ≥2 anchors — park leftovers.
-        if PREVIOUS_ANCHORS:
-            scene, leftover_report = prev.place_leftover_reactions(
-                model, scene, anchors=PREVIOUS_ANCHORS, cur=currency(model), min_embed_anchors=2)
-            if completion_report is not None:
-                completion_report['previous_leftovers'] = leftover_report
-            if log and leftover_report.get('placed'):
-                log(f"  previous leftovers: placed {leftover_report['placed']} "
-                    f"(embedded {leftover_report['embedded']}, "
-                    f"new components {leftover_report['new_components']})")
-            scene = _pin_previous(scene)
-    elif PREVIOUS_ANCHORS:
-        scene, leftover_report = prev.place_leftover_reactions(
-            model, scene, anchors=PREVIOUS_ANCHORS, cur=currency(model), min_embed_anchors=2)
-        completion_report = dict(method='previous_leftovers_only', previous_leftovers=leftover_report)
-        if log and leftover_report.get('placed'):
-            log(f"  previous leftovers: placed {leftover_report['placed']} "
-                f"(embedded {leftover_report['embedded']}, "
-                f"new components {leftover_report['new_components']})")
         scene = _pin_previous(scene)
     peripheral_report = None
     instance_report = None
@@ -708,11 +701,8 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
         scene, composition_report = composition.compose(model, scene, blocks, currency(model))
         if log:
             log('  composition: ' + str({k: v for k, v in composition_report.items() if k != 'moves'}))
-        # Composition / landscape reflow must not break same-map absolute relatives.
-        import curated_axes as _ca
-        scene, _rr = _ca.restore_rigid_group(scene, blocks)
-        if log and _rr.get('restored'):
-            log(f"  same-map rigid restore (after compose): {_rr['restored']} glyphs, n_rx={_rr.get('n_rx')}")
+        # Composition / landscape reflow must not break curated relatives.
+        scene = _same_map_or_previous_restore(scene, 'after compose')
         scene = _pin_previous(scene)
     elif PREVIOUS_SKIP_PACK:
         scene = _pin_previous(scene)
@@ -753,7 +743,7 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             model, scene, currency(model), curated_rx, top=10)
         scene, completion_after = completion_context_module.place(
             model, scene, blocks, currency(model), completion_skip, boundary_aware=True,
-            min_anchors=(2 if PREVIOUS_ANCHORS else 1))
+            min_anchors=1)
         scene = _pin_previous(scene)
         if completion_report is not None:
             completion_report['after_compose'] = {
@@ -778,10 +768,7 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
         if log and arm_report.get('shortened'):
             log(f"  compact long arms: shortened {arm_report['shortened']}, "
                 f"pulled mids {arm_report['pulled_midmarkers']}")
-        import curated_axes as _ca2
-        scene, _rr2 = _ca2.restore_rigid_group(scene, blocks)
-        if log and _rr2.get('restored'):
-            log(f"  same-map rigid restore (after arms): {_rr2['restored']} glyphs")
+        scene = _same_map_or_previous_restore(scene, 'after arms')
         # Private glyphs already move with each reaction in place(); a second full
         # instances.optimize here doubled runtime on iIT341 without cutting ac crossings.
     import orientation as orientation_module
@@ -790,42 +777,24 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
     if scalable:
         scene, audit = gl.scalable_scene_relax(model, scene, blocks, extra_groups=plan['groups'])
         lap('scene relaxation (sparse)')
-    elif PREVIOUS_ANCHORS:
-        # Local relayout of free nodes only when it lowers crossings substantially;
-        # otherwise keep the pinned previous geometry and leftover parking.
-        import copy as _copy_prev
-        before_scene = _copy_prev.deepcopy(scene)
-        cross_before = prev.scene_segment_crossings(model, scene)
-        scene, audit = geometry.complete_scene(model, scene, blocks)
-        scene = _pin_previous(scene)
-        scene, _ = prev.place_leftover_reactions(
-            model, scene, anchors=PREVIOUS_ANCHORS, cur=currency(model), min_embed_anchors=2)
-        scene = _pin_previous(scene)
-        cross_after = prev.scene_segment_crossings(model, scene)
-        keep = prev.keep_local_relayout(cross_before, cross_after)
-        previous_relayout = dict(
-            crossings_before=cross_before, crossings_after=cross_after, kept=keep)
-        if not keep:
-            scene = before_scene
-            scene = _pin_previous(scene)
-            audit = dict(audit or {}, previous_relayout_reverted=True)
-        # complete_scene stamps scene['anchors']; a reverted snapshot may lack it.
-        scene['anchors'] = {k: list(v) for k, v in (scene.get('anchors') or anchors).items()}
-        if log:
-            log(f"  previous local relayout: crossings {cross_before} -> {cross_after} "
-                f"({'kept' if keep else 'reverted'})")
     else:
         scene, audit = geometry.complete_scene(model, scene, blocks)
     scene = orientation_module.apply(model, scene, blocks, ORIENTATION, 'after_relax')
     if INSTANCES == 'auto' and not PREVIOUS_SKIP_PACK:
         import instances as instances_module
         scene = instances_module.separate(model, scene, blocks)
+        # After packing + separation, replace far cross-structure / far shared links with structure-local
+        # inst: nodes.  Placement already enforces separate()'s metabolite gap / Escher primary diameter,
+        # so a second separate pass is skipped (it shuffled neighbours and raised overlaps).
+        scene, local_report = instances_module.structure_local(
+            model, scene, blocks, currency(model),
+            reasons=scene.get('instance_reasons'))
         if instance_report is not None:
+            instance_report['structure_local'] = local_report
+            instance_report['added'] = int(instance_report.get('added', 0)) + int(local_report.get('added', 0))
             instance_report['instances_separated'] = scene.get('instances_separated')
     import curated_axes as _ca3
-    scene, _rr3 = _ca3.restore_rigid_group(scene, blocks)
-    if log and _rr3.get('restored'):
-        log(f"  same-map rigid restore (after relax): {_rr3['restored']} glyphs")
+    scene = _same_map_or_previous_restore(scene, 'after relax')
     scene = _pin_previous(scene)
     scene, _ov = _ca3.clear_rigid_node_overlaps(scene, blocks)
     if log and _ov.get('moved'):
@@ -880,6 +849,9 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
             if log:
                 log(f'  previous layout pin (escher): {n_pin} nodes')
     data[0]['metadata']['layout_sources'] = sources
+    # copy: keys structure_local detached from — compact_long_arms_escher must not shorten them.
+    data[0]['metadata']['structure_local_frozen_copies'] = list(
+        scene.get('structure_local_frozen_copies') or ())
     if plan is not None:
         metric['global'] = dict(plan=(plan or {}).get('stats'), scene_nodes=len(scene['positions']),
                                 routing_status=('none: straight connections between glyphs; structure edges use the structures\' own lines or curves'
@@ -943,12 +915,17 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
         metric['edge_style'] = dict(edge_style.apply(data, skip_edges), seconds=round(time.time() - t_style, 1))
         if log:
                 log(f"  curated-style connections: {metric['edge_style']}")
+        # No early clear: post-restore used to reintroduce through after an early
+        # pass (gate15), so we paid twice. One final try-capped bezier clear after
+        # island tuck owns residuals on small maps; mid/large skip clear entirely.
+        if os.environ.get('OPM_CLEAR_THROUGH', 'on') != 'off' and len(model['reactions']) < 200:
+            metric['clear_through_nodes'] = dict(skipped='defer_to_final')
         import label_placement
         t_labels = time.time()
         metric['label_placement'] = dict(label_placement.optimize(data), seconds=round(time.time() - t_labels, 1))
         if log:
             log(f"  label placement: {metric['label_placement']}")
-        metric['edge_routing'] = dict(mode='curated (Bezier connections)')
+        metric['edge_routing'] = dict(mode='curated (orthogonal algorithm connections)')
         if os.environ.get('OPM_PERIPHERAL', 'on') != 'off' and not PREVIOUS_SKIP_PACK:   # the switch exists for before / after comparisons
             import peripheral as peripheral_module
             import quality_gate
@@ -1020,7 +997,6 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                 log(f"  compact long arms (escher): shortened {arm_escher['shortened']}")
         import curated_axes as _ca_es
         if not PREVIOUS_SKIP_PACK:
-            # Absolute same-map restore would overwrite --previous pins with source-map coords.
             data, _rr_es = _ca_es.restore_rigid_group_escher(data, blocks)
             if log and _rr_es.get('restored'):
                 log(f"  same-map rigid restore (escher after arms): {_rr_es['restored']} nodes")
@@ -1080,15 +1056,15 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                     f"max_gap={corridor.get('max_gap')} min_len={corridor.get('min_len')}")
             dump(output_names.map_json(folder), data)
         # Rebuild algorithm Beziers against post-restore geometry on small maps
-        # (early edge_style ran before absolute snap). Skip on mid/large — edge_style
-        # alone is ~75 s on iIT341 and would blow the runtime gate.
+        # (early edge_style ran before absolute snap; final orthogonal pass comes later).
+        # Skip on mid/large — edge_style alone is costly on large GEMs.
         if len(model['reactions']) < 200:
             import edge_style as _es_post
             t_style2 = time.time()
-            metric['edge_style_post_restore'] = dict(
-                _es_post.apply(data, skip_edges), seconds=round(time.time() - t_style2, 1))
-            if log:
-                log(f"  curated-style connections (post-restore): {metric['edge_style_post_restore']}")
+            # Skip full post-restore restyle: it reintroduced ~50 official through
+            # pairs after an early clear (gate15). Absolute snap already updated
+            # glyph xy; Beziers stay until the final try-capped clear.
+            metric['edge_style_post_restore'] = dict(skipped='avoid_through_reintro')
             dump(output_names.map_json(folder), data)
         # Hotspot repair AFTER rigid restore + overlap clear + squeeze + corridor
         # so accepted moves are not undone by absolute snap / padding slides.
@@ -1100,26 +1076,22 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                      reactions=list(b['reaction_ids']))
                 for b in blocks if len(b.get('reaction_ids') or []) >= 2]
             data[0].setdefault('metadata', {})['expert_structures'] = curated_structures_early
-            # After absolute rigid restore, more windows need search than the default
-            # mass-scaled budget covers (e_coli formate cluster alone was 15 crossings).
+            # Near stable-v1 hotspot (~8.8s e_coli): budget_s only scales tries.
             n_rx = len(model['reactions'])
-            # Corridor slides can add a few local spoke crossings; give small maps
-            # enough search to recover the pre-corridor counted-crossing floor.
-            hs_budget = 35.0 if n_rx < 200 else 45.0
-            hs_k = 10 if n_rx < 200 else 8
-            # Mass-scaled try ceiling from budget_s (no wall-clock). Do not pass
-            # PREVIOUS_ANCHORS as pinned_keys here: mid-pipeline --previous pins are
-            # deferred to the final rigid structure translate so curated relatives
-            # stay identical to the no-previous drawing.
+            hs_budget = 9.0 if n_rx < 200 else 16.0
+            hs_k = 5 if n_rx < 200 else 6
             metric['hotspot_repair'] = hotspot_repair.repair(
                 data, model=model, scene=scene, blocks=blocks, skip_edges=skip_edges, log=log,
-                structures=curated_structures_early, k=hs_k, max_accepts=100,
-                budget_s=hs_budget, max_rounds=8)
+                structures=curated_structures_early, k=hs_k, max_accepts=8,
+                budget_s=hs_budget, max_rounds=4)
             if log:
                 hr = metric['hotspot_repair']
                 log('  hotspot repair: ' + str({k: hr.get(k) for k in ('accepted_count', 'tries', 'rounds', 'seconds', 'improved')}))
+            # No post-hotspot clear: post-restore clear owns through→0; a second
+            # partial clear only burned wall time (Mac 316s residual clears).
             dump(output_names.map_json(folder), data)
-        # Shrink canvas to content so empty frame padding does not inflate blank/empty gates.
+        # Shrink canvas to content (same stage as main) before the final label pass.
+        # Tip nudge may refit later only when it accepts a move.
         if not PREVIOUS_SKIP_PACK:
             import composition as _comp_fit
             fit = _comp_fit.fit_canvas_to_content(data)
@@ -1147,6 +1119,158 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
         metric['edge_routing'] = er
     else:
         metric['edge_routing'] = dict(mode=EDGE_ROUTING, not_applied='large model: routing of the algorithm-placed connections is a later step')
+    # Stamp curated source curves before the final orthogonal pass so official
+    # edge_orthogonality sees real waypoints (and so layout_quality describes the final map).
+    pending = metric.pop('_source_path_chains', None)
+    if pending:
+        import source_paths
+        written = source_paths.write_curves_to_escher(data, pending)
+        sp = metric.get('source_paths') or {}
+        sp['written'] = len(written)
+        sp['not_written_to_map_json'] = len(pending) - len(written)
+        metric['source_paths'] = sp
+        data[0]['metadata']['source_paths'] = [
+            dict(reaction=f['reaction'], metabolite=f['metabolite'], status=f['status'], shift_px=f['shift_px'], source=f['source'])
+            for f in written
+        ]
+        dump(folder / 'map.json', data)
+    # Final orthogonal polylines after curated source-path waypoints are present.
+    gem_file = None
+    for root in (folder, folder.parent):
+        cand = root / 'upload' / 'model.xml'
+        if cand.is_file():
+            gem_file = cand
+            break
+        found = sorted((root / 'upload').glob('model.*')) if (root / 'upload').is_dir() else []
+        if found:
+            gem_file = found[0]
+            break
+    if LAYOUT_STYLE == 'curated':
+        import edge_style as _es_final
+        t_orth = time.time()
+        # draw_map writes into <job>/full; the uploaded GEM lives in <job>/upload.
+        metric['edge_style_orthogonal'] = dict(
+            _es_final.apply(
+                data, skip_edges, mode='orthogonal',
+                gem_path=str(gem_file) if gem_file else None),
+            seconds=round(time.time() - t_orth, 1))
+        if log:
+            log(f"  orthogonal algorithm routes (final): {metric['edge_style_orthogonal']}")
+        dump(folder / 'map.json', data)
+    # Late per-reaction currency clones for Pathway-Scorer-style hubs (layout gate).
+    # Runs after orthogonal multimarkers exist so the gate scores the same polylines
+    # the official edge_orthogonality measure uses. Also runs on --previous pin paths
+    # (including mid-size skip-packing), not only full redraws.
+    # Small headline GEMs: hub split is an 8s+ scoring pass with marginal visual win
+    # vs stable-v1 wall (~65s); keep for mid/large unless explicitly off.
+    import split_cofactor_hubs as _sch
+    from hub_drawing import pathway_from_model as _pathway_from_model
+    curated_rids = {rid for b in blocks for rid in b.get('reaction_ids') or []}
+    pathway = _pathway_from_model(model)
+    # Default off on all maps (stable-v1 e42993f had no hub_split). Opt-in via
+    # OPM_HUB_SPLIT=on only — avoids clone/spoke fragmentation and iIT341 packing
+    # / hub-radius blowups vs stable. Small maps stay off even if env forgotten.
+    n_rx_hub = len(model['reactions'])
+    hub_default = 'off'
+    if n_rx_hub < 200 or os.environ.get('OPM_HUB_SPLIT', hub_default) == 'off':
+        hub_report = dict(enabled=False, skipped='hub_split_off_vs_stable', hub_count=None)
+        if log:
+            log('  cofactor hub split: skipped (default off vs stable; set OPM_HUB_SPLIT=on)')
+    else:
+        data, hub_report = _sch.apply_gated(
+            data, model, pathway=pathway, curated=curated_rids, log=log)
+    metric['cofactor_hub_split'] = hub_report
+    dump(output_names.map_json(folder), data)
+    dump(folder / 'cofactor_hub_split.json', hub_report)
+    # Tip nudge after orthogonal routing and hub split; refit canvas only when a
+    # tip is accepted so 0-accept maps stay byte-identical to main.
+    if not PREVIOUS_SKIP_PACK:
+        import composition as _comp_tip
+        tip = _comp_tip.nudge_frontier_escher(
+            # Keep tip identical to no-previous; structure previous is applied after.
+            data, model, previous_anchors=None,
+            skip_edges=skip_edges,
+            gem_path=str(gem_file) if gem_file else None)
+        metric['frontier_tip_nudge'] = tip
+        if composition_report is not None:
+            composition_report['frontier_tip_nudge'] = tip
+        if log and tip.get('accepted'):
+            log('  frontier tip nudge: ' + str(tip))
+        if tip.get('accepted'):
+            dump(output_names.map_json(folder), data)
+            fit = _comp_tip.fit_canvas_to_content(data)
+            metric['canvas_fit_after_tip'] = fit
+            if log and fit.get('applied'):
+                log(f"  canvas fit after tip: {fit.get('content')} pad=40")
+            # Same n_rx gate as early/final clear — mid/large residual sets stall
+            # even under try caps (iIT341 ~1000 official pairs).
+            if (
+                LAYOUT_STYLE == 'curated'
+                and os.environ.get('OPM_CLEAR_THROUGH', 'on') != 'off'
+                and len(model['reactions']) < 200
+            ):
+                import edge_style as _es_tip
+                metric['clear_through_nodes_post_tip'] = _es_tip.clear_through_nodes(
+                    data, skip_edges, log=log, mode='orthogonal',
+                    gem_path=str(gem_file) if gem_file else None,
+                    max_rounds=1, max_edge_tries=24, max_nudge_tries=24)
+                dump(output_names.map_json(folder), data)
+    # Last geometry pass: tuck floating islands flush with the dense main hull so
+    # empty AABB voids (e_coli TR/top floaters) do not survive into the PNG.
+    if LAYOUT_STYLE == 'curated' and not PREVIOUS_SKIP_PACK:
+        import composition as _comp_isl
+        spacing_isl = _comp_isl.reaction_spacing_escher(data)
+        island = _comp_isl.tuck_islands_escher(
+            data, cur=currency(model), spacing=spacing_isl)
+        metric['island_tuck_escher'] = island
+        if composition_report is not None:
+            composition_report['island_tuck_escher'] = island
+        if log and island.get('moved'):
+            log(f"  island silhouette tuck (escher, final): moved {island['moved']}/"
+                f"{island.get('candidates', 0)} gap_thresh={island.get('gap_thresh')}")
+        if island.get('moved'):
+            fit_isl = _comp_isl.fit_canvas_to_content(data)
+            metric['canvas_fit_after_island_tuck'] = fit_isl
+            dump(output_names.map_json(folder), data)
+            dump(folder / 'map.json', data)
+            # Transport arms (FUMt2/MALt2) may still be long after rigid restore;
+            # re-run empty-corridor with TCA-core freeze before through-clear.
+            spacing_cor = _comp_isl.reaction_spacing_escher(data)
+            cor2 = _comp_isl.compact_empty_corridors_escher(data, spacing=spacing_cor)
+            metric['empty_corridor_escher_post_island'] = cor2
+            if composition_report is not None:
+                composition_report['empty_corridor_escher_post_island'] = cor2
+            if log and cor2.get('shortened'):
+                log(f"  empty-corridor compact (post-island): shortened {cor2['shortened']} "
+                    f"max_gap={cor2.get('max_gap')} min_len={cor2.get('min_len')}")
+                dump(output_names.map_json(folder), data)
+                dump(folder / 'map.json', data)
+        # Final clear only on small maps (stable had no clear_through). iIT341
+        # residual sets are ~1000 official pairs — even 48 try-capped trials stall.
+        if (
+            os.environ.get('OPM_CLEAR_THROUGH', 'on') != 'off'
+            and len(model['reactions']) < 200
+        ):
+            import edge_style as _es_isl
+            metric['clear_through_nodes_final'] = _es_isl.clear_through_nodes(
+                data, skip_edges, log=log, mode='bezier',
+                max_rounds=3, max_edge_tries=96, max_nudge_tries=72)
+            dump(output_names.map_json(folder), data)
+            dump(folder / 'map.json', data)
+    # Final --previous step: rigidly translate each curated structure toward previous
+    # anchors.  Internal relatives stay identical to the no-previous drawing.
+    # Do not clear overlaps afterwards — that pass can nudge duplicate rigid glyphs
+    # and break within-structure relatives.
+    if PREVIOUS_ANCHORS:
+        data, n_final = prev.translate_structures_escher(
+            data, PREVIOUS_ANCHORS, blocks=blocks, scene=scene)
+        if log and n_final:
+            log(f'  previous structure rigid translate (final map): {n_final} glyphs')
+        import composition as _comp_prev_fit
+        fit_prev = _comp_prev_fit.fit_canvas_to_content(data)
+        if log and fit_prev.get('applied'):
+            log(f"  canvas fit after previous translate: {fit_prev.get('content')} pad=40")
+        dump(output_names.map_json(folder), data)
     t_quality = time.time()
     # Persist structure membership on the map so continuity can be scored from map.json alone.
     # Absolute same-map reuse keeps BiGG spacing; score spatial pieces, not whole atlas windows.
@@ -1188,52 +1312,6 @@ def draw_map(model, selected, folder, full_model=None, scalable=False, log=None,
                                                          unattached=[dict(exchange=d['exchange'], transports=d['transports'], anchors=d['anchors'], x=d.get('x'), y=d.get('y'))
                                                                      for d in peripheral_report['details'] if d['state'] == 'not_attached'][:12])
         quality_issues['peripheral'] = peripheral_report['details']
-    # Stamp reused source curves into map.json after evaluate (keeps gate runtime/overlaps comparable).
-    pending = metric.pop('_source_path_chains', None)
-    if pending:
-        import source_paths
-        written = source_paths.write_curves_to_escher(data, pending)
-        sp = metric.get('source_paths') or {}
-        sp['written'] = len(written)
-        sp['not_written_to_map_json'] = len(pending) - len(written)
-        metric['source_paths'] = sp
-        data[0]['metadata']['source_paths'] = [
-            dict(reaction=f['reaction'], metabolite=f['metabolite'], status=f['status'], shift_px=f['shift_px'], source=f['source'])
-            for f in written
-        ]
-        # Refresh orderliness on the stamped map without a full crossing re-evaluate.
-        try:
-            from evaluation.map_rules import orderliness_metrics
-            edges, _nodes = layout_quality.build_edges(data, skip_edges)
-            spacing = ((quality_summary.get('core') or {}).get('long_lines') or {}).get('reaction_spacing_px') or 60.0
-            ord_m = orderliness_metrics(data[1], edges, float(spacing))
-            details = quality_summary.setdefault('details', {})
-            details['orderliness'] = dict(
-                main_segment_axis_share=ord_m.get('main_segment_axis_share'),
-                main_segment_axis_share_length=ord_m.get('main_segment_axis_share_length'),
-                reaction_axis_share=ord_m.get('reaction_axis_share'),
-                chain_turn_median_deg=ord_m.get('chain_turn_median_deg'),
-                metabolite_grid_share=ord_m.get('metabolite_grid_share'),
-                segments=ord_m.get('orderliness_segments'),
-                reactions=ord_m.get('orderliness_reactions'),
-                chain_turns=ord_m.get('orderliness_chain_turns'),
-                metabolites=ord_m.get('orderliness_metabolites'),
-                grid_tol_px=ord_m.get('orderliness_grid_tol_px'),
-            )
-            for k in ('main_segment_axis_share', 'main_segment_axis_share_length',
-                      'reaction_axis_share', 'chain_turn_median_deg', 'metabolite_grid_share'):
-                details[k] = ord_m.get(k)
-            details['panel'] = layout_quality._detailed_metrics_panel(
-                details,
-                line_shape=details.get('line_shape') or {},
-                cycles=details.get('cycles') or {},
-                unrelated=details.get('unrelated_overlaps') or {},
-                crossing_density=details.get('crossing_density') or {},
-                composition=details.get('composition') or {},
-            )
-        except Exception as ex:  # noqa: BLE001 — curve stamp must not fail the job
-            if log:
-                log(f'  orderliness refresh after source-path stamp skipped: {type(ex).__name__}: {ex}'[:160])
     metric['layout_quality_final'] = quality_summary
     metric['algorithm_curated_crossings'] = (quality_summary.get('details') or {}).get('algorithm_curated_crossings')
     metric['longest_links'] = (quality_summary.get('details') or {}).get('longest_links')
@@ -1498,13 +1576,22 @@ def draw_global_map(job, model, selected, folder, prov_kinds, n_reactions, plan=
         return None
     job.add_file(output_names.map_svg(folder).name, 'Completed map (global layout)', 'svg')
     job.add_file(output_names.map_json(folder).name, 'Completed map, Escher JSON', 'json')
-    job.warn('global_degraded', 'Global map without routing: connections are straight lines (structure edges keep their own lines or curves); long edges and crossings are not optimised yet.')
+    # Describe the final map JSON (after any orthogonal pass), not the pre-style export.
+    ortho = metric.get('edge_style_orthogonal') or {}
+    n_ortho = int(ortho.get('orthogonal') or 0)
+    if n_ortho > 0:
+        degraded = [f'routing: orthogonal polylines on {n_ortho} algorithm edge(s); stubs/curated paths unchanged']
+        kind = 'global'
+    else:
+        degraded = ['routing: none (straight connections)']
+        kind = 'global_degraded'
+        job.warn('global_degraded', 'Global map without routing: connections are straight lines (structure edges keep their own lines or curves); long edges and crossings are not optimised yet.')
     network = global_network_metrics(model, output_names.map_json(folder))
     job.state['views'] = []  # a global map has no separate views; the modules tab lists the structures
     job.save()
-    return dict(kind='global_degraded', requested_layout='global', degraded=['routing: none (straight connections)'], seconds=round(time.time() - t0, 1), network=network,
+    return dict(kind=kind, requested_layout='global', degraded=degraded, seconds=round(time.time() - t0, 1), network=network,
                 metrics={k: metric.get(k) for k in ('node_overlap_pairs', 'label_overlap_pairs', 'straight_crossings')}, source_paths=metric.get('source_paths'),
-                instances=metric.get('instances'), global_layout=metric.get('global'), completion=metric.get('completion'), expert_geometry=metric.get('expert_geometry'), instance_optimization=metric.get('instance_optimization'), context_placement=metric.get('context_placement'), completion_context=metric.get('completion_context'), layout_quality_final=metric.get('layout_quality_final'), edge_style=metric.get('edge_style'), peripheral=metric.get('peripheral'), block_relocation=metric.get('block_relocation'), region_placement=metric.get('region_placement'), regions=metric.get('regions'), expert_submodule=metric.get('expert_submodule'), label_placement=metric.get('label_placement'), hotspot_repair=metric.get('hotspot_repair'), protected=metric.get('protected'), node_overlap_kinds=metric.get('node_overlap_kinds'), edge_routing=metric.get('edge_routing'))
+                instances=metric.get('instances'), global_layout=metric.get('global'), completion=metric.get('completion'), expert_geometry=metric.get('expert_geometry'), instance_optimization=metric.get('instance_optimization'), context_placement=metric.get('context_placement'), completion_context=metric.get('completion_context'), layout_quality_final=metric.get('layout_quality_final'), edge_style=metric.get('edge_style'), edge_style_orthogonal=metric.get('edge_style_orthogonal'), peripheral=metric.get('peripheral'), block_relocation=metric.get('block_relocation'), region_placement=metric.get('region_placement'), regions=metric.get('regions'), expert_submodule=metric.get('expert_submodule'), label_placement=metric.get('label_placement'), hotspot_repair=metric.get('hotspot_repair'), clear_through_nodes=metric.get('clear_through_nodes'), clear_through_nodes_post_restore=metric.get('clear_through_nodes_post_restore'), clear_through_nodes_post_hotspot=metric.get('clear_through_nodes_post_hotspot'), clear_through_nodes_post_orthogonal=metric.get('clear_through_nodes_post_orthogonal'), clear_through_nodes_post_tip=metric.get('clear_through_nodes_post_tip'), clear_through_nodes_final=metric.get('clear_through_nodes_final'), protected=metric.get('protected'), node_overlap_kinds=metric.get('node_overlap_kinds'), edge_routing=metric.get('edge_routing'))
 
 
 def run_job(folder):
@@ -1774,7 +1861,9 @@ def run_job(folder):
         job.save()
         map_note = None
         if len(allids) <= LIMITS['full_routed_max_reactions']:
-            metric = draw_map(model, selected, folder / 'full', full_model=model)
+            # Pass job.log so clear_through / hotspot progress reaches the UI
+            # (otherwise "Complete the map" looks frozen while CrossingIndex runs).
+            metric = draw_map(model, selected, folder / 'full', full_model=model, log=job.log)
             if (folder / 'full' / 'layout_issues.json').is_file():
                 (folder / 'layout_issues.json').write_bytes((folder / 'full' / 'layout_issues.json').read_bytes())
                 job.add_file('layout_issues.json', 'Layout issues (where the problems are)', 'json')
@@ -1788,7 +1877,7 @@ def run_job(folder):
             else:
                 (output_names.map_svg(folder)).write_text(epv.recolor_svg((output_names.map_svg(folder)).read_text(), prov_kinds))
             map_note = dict(kind='routed_full', routing=(metric.get('routing') or {}).get('status'), routing_attempts=metric.get('routing_attempts'),
-                            metrics={k: metric.get(k) for k in ('node_overlap_pairs', 'label_overlap_pairs', 'straight_crossings')}, source_paths=metric.get('source_paths'), expert_geometry=metric.get('expert_geometry'), instance_optimization=metric.get('instance_optimization'), context_placement=metric.get('context_placement'), completion_context=metric.get('completion_context'), layout_quality_final=metric.get('layout_quality_final'), edge_style=metric.get('edge_style'), peripheral=metric.get('peripheral'), block_relocation=metric.get('block_relocation'), region_placement=metric.get('region_placement'), regions=metric.get('regions'), expert_submodule=metric.get('expert_submodule'), label_placement=metric.get('label_placement'), hotspot_repair=metric.get('hotspot_repair'), protected=metric.get('protected'), node_overlap_kinds=metric.get('node_overlap_kinds'), edge_routing=metric.get('edge_routing'))
+                            metrics={k: metric.get(k) for k in ('node_overlap_pairs', 'label_overlap_pairs', 'straight_crossings')}, source_paths=metric.get('source_paths'), expert_geometry=metric.get('expert_geometry'), instance_optimization=metric.get('instance_optimization'), context_placement=metric.get('context_placement'), completion_context=metric.get('completion_context'), layout_quality_final=metric.get('layout_quality_final'), edge_style=metric.get('edge_style'), peripheral=metric.get('peripheral'), block_relocation=metric.get('block_relocation'), region_placement=metric.get('region_placement'), regions=metric.get('regions'), expert_submodule=metric.get('expert_submodule'), label_placement=metric.get('label_placement'), hotspot_repair=metric.get('hotspot_repair'), clear_through_nodes=metric.get('clear_through_nodes'), clear_through_nodes_post_restore=metric.get('clear_through_nodes_post_restore'), clear_through_nodes_post_hotspot=metric.get('clear_through_nodes_post_hotspot'), clear_through_nodes_post_orthogonal=metric.get('clear_through_nodes_post_orthogonal'), clear_through_nodes_post_tip=metric.get('clear_through_nodes_post_tip'), clear_through_nodes_final=metric.get('clear_through_nodes_final'), protected=metric.get('protected'), node_overlap_kinds=metric.get('node_overlap_kinds'), edge_routing=metric.get('edge_routing'))
         elif len(allids) <= LIMITS['whole_map_max_reactions']:
             global_note = None
             if LAYOUT == 'global':
