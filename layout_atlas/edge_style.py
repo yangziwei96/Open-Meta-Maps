@@ -1242,6 +1242,135 @@ def _force_straight_preserved_spoke(data, rid, met_bigg, max_dist=800.0):
             'met_node': met_id, 'dist': round(dist, 1), 'segment': seg_key}
 
 
+def _straighten_preserved_spoke(data, rid, met_bigg, max_dist=800.0):
+    """Collapse a preserved mid→…→met path to a single straight mid→met segment.
+
+    Surgical clear often rewrites curated TCA spokes into multimarker corridors
+    (ICDHyr→icit, CS→cit). Connectivity stays, but the ring no longer reads as
+    closed vs stable straight spokes. Glyph positions are unchanged.
+    """
+    from collections import defaultdict
+
+    rx, mid, nodes = _reaction_mid_and_rx(data, rid)
+    if rx is None or mid is None:
+        return None
+    cands = [
+        nid for nid, n in nodes.items()
+        if n.get('node_type') == 'metabolite' and n.get('bigg_id') == met_bigg
+    ]
+    if not cands:
+        return None
+    mx, my = float(nodes[mid]['x']), float(nodes[mid]['y'])
+    met_id = min(
+        cands,
+        key=lambda nid: (float(nodes[nid]['x']) - mx) ** 2 + (float(nodes[nid]['y']) - my) ** 2,
+    )
+    dist = math.hypot(float(nodes[met_id]['x']) - mx, float(nodes[met_id]['y']) - my)
+    if dist > max_dist:
+        return None
+    segs = rx.setdefault('segments', {})
+    # Already a clean straight mid→met?
+    for key, s in list(segs.items()):
+        if s.get('from_node_id') == mid and s.get('to_node_id') == met_id:
+            algo = (
+                str(key).startswith('es_s') or str(key).startswith('route')
+                or str(key).startswith('qg') or str(key).startswith('hr')
+                or str(key).startswith('clr')
+            )
+            if not algo and s.get('b1') is None and s.get('b2') is None:
+                return None
+    out = defaultdict(list)
+    for key, s in segs.items():
+        out[s['from_node_id']].append((key, s))
+    drop_keys, drop_nodes = set(), set()
+    for key, s in list(segs.items()):
+        if s.get('from_node_id') != mid:
+            continue
+        to = s.get('to_node_id')
+        if to == met_id:
+            drop_keys.add(key)
+            continue
+        algo = (
+            str(key).startswith('es_s') or str(key).startswith('route')
+            or str(key).startswith('qg') or str(key).startswith('hr')
+            or str(key).startswith('clr')
+        )
+        if not algo and nodes.get(to, {}).get('node_type') != 'multimarker':
+            continue
+        if nodes.get(to, {}).get('node_type') != 'multimarker' and not algo:
+            continue
+        cur = to
+        chain_keys = {key}
+        chain_nodes = set()
+        tip = to
+        while nodes.get(cur, {}).get('node_type') == 'multimarker':
+            chain_nodes.add(cur)
+            tip = cur
+            nxt = out.get(cur)
+            if not nxt:
+                break
+            chain_keys.add(nxt[0][0])
+            cur = nxt[0][1]['to_node_id']
+        if cur == met_id or nodes.get(cur, {}).get('bigg_id') == met_bigg:
+            drop_keys |= chain_keys
+            drop_nodes |= chain_nodes
+    for key in drop_keys:
+        segs.pop(key, None)
+    for nn in drop_nodes:
+        used = any(
+            nn in (s.get('from_node_id'), s.get('to_node_id'))
+            for s in segs.values()
+        )
+        if not used:
+            nodes.pop(nn, None)
+    used_ids = set()
+    for r2 in (data[1].get('reactions') or {}).values():
+        for k in (r2.get('segments') or {}):
+            if str(k).isdigit():
+                used_ids.add(int(k))
+    seg_i = (max(used_ids) + 1) if used_ids else 900000
+    while seg_i in used_ids:
+        seg_i += 1
+    seg_key = str(seg_i)
+    segs[seg_key] = dict(from_node_id=mid, to_node_id=met_id, b1=None, b2=None)
+    return {'reaction': rid, 'metabolite': met_bigg, 'mid': mid,
+            'met_node': met_id, 'dist': round(dist, 1), 'segment': seg_key,
+            'reason': 'straighten_preserved'}
+
+
+# Main citrate-cycle metabolites — straighten only these preserved spokes so the
+# ring reads closed like stable without undoing currency-spoke through clears.
+_TCA_RING_METS = frozenset({
+    'oaa_c', 'cit_c', 'acon_C_c', 'icit_c', 'akg_c', 'succoa_c', 'succ_c',
+    'fum_c', 'mal__L_c', 'accoa_c',
+})
+_TCA_RING_RX = frozenset({
+    'CS', 'ACONTa', 'ACONTb', 'ICDHyr', 'AKGDH', 'SUCOAS', 'SUCDi', 'FUM', 'MDH',
+})
+
+
+def straighten_preserved_spokes(data, skip_edges=None, ring_only=True):
+    """Straighten preserved mid→met spokes (stable TCA ring look).
+
+    Default ``ring_only=True`` limits to citrate-cycle reactions/mets — full
+    preserved straighten reopened ~35 official through pairs on e_coli.
+    """
+    skip = list(skip_edges) if skip_edges is not None else list(
+        ((data[0] or {}).get('metadata') or {}).get('preserved_edges') or []
+    )
+    details = []
+    for edge in skip:
+        if not (isinstance(edge, (list, tuple)) and len(edge) >= 2):
+            continue
+        rid, met = edge[0], edge[1]
+        if ring_only and (rid not in _TCA_RING_RX or met not in _TCA_RING_METS):
+            continue
+        hit = _straighten_preserved_spoke(data, rid, met)
+        if hit:
+            details.append(hit)
+    return dict(straightened=len(details), details=details, ring_only=ring_only)
+
+
 def repair_missing_preserved_spokes(data, skip_edges=None, gate_official=True):
     """Reconnect preserved spokes left as incomplete multimarker detours.
 
@@ -1620,14 +1749,22 @@ def clear_through_nodes(data, skip_edges=None, log=None, mode=None, gem_path=Non
                         if k in style:
                             style_acc[k] += int(style.get(k) or 0)
                 # Preserved template claim: never accept a restyle that severs
-                # mid→met (e_coli MDH→mal__L_c opened the TCA ring while official
-                # still dropped). Heal to straight mid→met at existing glyph
-                # positions; reject the trial if still unreachable.
-                if preserved and not _reaction_reaches_metabolite(trial, rid, met):
-                    repair_missing_preserved_spokes(trial, skip, gate_official=False)
-                    if not _reaction_reaches_metabolite(trial, rid, met):
-                        _force_straight_preserved_spoke(trial, rid, met)
-                    if not _reaction_reaches_metabolite(trial, rid, met):
+                # mid→met (e_coli MDH→mal__L_c / ICDHyr→icit opened the TCA ring
+                # while official still dropped). Heal every preserved met on this
+                # reaction; reject the trial if any stay unreachable.
+                preserved_mets = {m for (r, m) in skip_set if r == rid} or (
+                    {met} if preserved else set())
+                if preserved_mets:
+                    for pm in list(preserved_mets):
+                        if not _reaction_reaches_metabolite(trial, rid, pm):
+                            repair_missing_preserved_spokes(
+                                trial, skip, gate_official=False)
+                            break
+                    for pm in list(preserved_mets):
+                        if not _reaction_reaches_metabolite(trial, rid, pm):
+                            _force_straight_preserved_spoke(trial, rid, pm)
+                    if any(not _reaction_reaches_metabolite(trial, rid, pm)
+                           for pm in preserved_mets):
                         report['edges_tried'] += 1
                         continue
                 after_off = lq.official_lines_through_nodes_count(trial, skip)
@@ -1641,7 +1778,12 @@ def clear_through_nodes(data, skip_edges=None, log=None, mode=None, gem_path=Non
                 cross_ok = cross_delta <= 0 or (official_drop >= 1 and cross_delta <= 1)
                 # Preserved: also forbid any glyph move (relocated must stay 0).
                 reloc_ok = (not preserved) or int((style or {}).get('relocated') or 0) == 0
-                path_ok = (not preserved) or _reaction_reaches_metabolite(trial, rid, met)
+                # All preserved spokes on this reaction must stay connected
+                # (restyling ICDHyr→akg must not delete ICDHyr→icit).
+                path_ok = all(
+                    _reaction_reaches_metabolite(trial, rid, pm)
+                    for pm in preserved_mets
+                ) if preserved_mets else True
                 if official_drop > 0 and cross_ok and reloc_ok and path_ok:
                     data[0], data[1] = trial[0], trial[1]
                     index.rebuild(data)
@@ -1689,15 +1831,14 @@ def clear_through_nodes(data, skip_edges=None, log=None, mode=None, gem_path=Non
             report['edges_kept'] = 1
         report['edges_tried'] = 1
 
-    # Heal preserved spokes after surgical detours; revert if official regresses.
-    off_before_repair = lq.official_lines_through_nodes_count(data, skip)
-    snap0, snap1 = copy.deepcopy(data[0]), copy.deepcopy(data[1])
-    post = repair_missing_preserved_spokes(data, skip)
-    if post.get('repaired') and lq.official_lines_through_nodes_count(data, skip) > off_before_repair:
-        data[0], data[1] = snap0, snap1
-        post = dict(repaired=0, details=[], reverted='official_regression',
-                    attempted=post.get('details') or [])
+    # Heal preserved spokes after surgical detours. Quality > through residual:
+    # keep structural heals even when official count rises (e_coli ICDHyr→icit
+    # ring closure was previously reverted as official_regression).
+    post = repair_missing_preserved_spokes(data, skip, gate_official=False)
     report['preserved_repair_post'] = post
+    # Collapse remaining preserved corridors back to straight mid→met so the
+    # TCA ring reads closed like stable (not multimarker detours).
+    report['preserved_straighten'] = straighten_preserved_spokes(data, skip)
     after = lq.curves_through_nodes_report(data, skip)
     after_off = lq.official_lines_through_nodes_report(data, skip)
     after_cross = int(lq.CrossingIndex(data, skip).headline())

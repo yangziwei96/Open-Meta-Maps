@@ -2509,25 +2509,34 @@ def tuck_islands_escher(data, cur=None, spacing=None):
     tca_rx, frozen_tca = _tca_expert_rx_and_nodes(data)
 
     def _apply(members, ids, delta):
+        # Translate glyphs AND their labels — island tuck used to run after the
+        # final label pass and left met/rx labels stranded (e_coli ~1184px).
+        dx, dy = float(delta[0]), float(delta[1])
         for nid in ids:
             if str(nid) in frozen_tca:
                 continue
             n = nodes.get(nid) or nodes.get(str(nid))
             if n and 'x' in n:
-                n['x'] = float(n['x'] + delta[0])
-                n['y'] = float(n['y'] + delta[1])
+                n['x'] = float(n['x'] + dx)
+                n['y'] = float(n['y'] + dy)
+                if 'label_x' in n:
+                    n['label_x'] = float(n['label_x'] + dx)
+                    n['label_y'] = float(n['label_y'] + dy)
         for rid in members:
             if rid in tca_rx:
                 continue
             for rx in reactions.values():
                 if (rx.get('bigg_id') or '') != rid:
                     continue
+                if 'label_x' in rx:
+                    rx['label_x'] = float(rx['label_x'] + dx)
+                    rx['label_y'] = float(rx['label_y'] + dy)
                 for seg in (rx.get('segments') or {}).values():
                     for bk in ('b1', 'b2'):
                         b = seg.get(bk)
                         if isinstance(b, dict) and 'x' in b:
-                            b['x'] = float(b['x'] + delta[0])
-                            b['y'] = float(b['y'] + delta[1])
+                            b['x'] = float(b['x'] + dx)
+                            b['y'] = float(b['y'] + dy)
         return {str(i) for i in ids}
 
     def _through_gated_delta(members, ids, delta, unit_vec=None, max_add=1):
@@ -2778,7 +2787,12 @@ def tuck_islands_escher(data, cur=None, spacing=None):
                 # Reject wild teleports (pad search can park far outside the hull).
                 toward = float(np.hypot(*(old_c - prefer))) - float(np.hypot(*(old_c + delta - prefer)))
                 soft = clear * (0.45 if (aabb_void or bw * bh > 350.0 * 350.0) else 0.7)
-                max_dlen = max(gap * 1.75, travel * 1.5, span_xy * 0.65)
+                # Cap teleports at 1200px (same as scene tuck / interior_repack) —
+                # uncapped hops (4–8k) blow iIT341 longest/median spokes.
+                max_dlen = min(
+                    1200.0,
+                    max(gap * 1.75, travel * 1.5, span_xy * 0.65),
+                )
                 if (new_gap < min(gap - 40.0, residual - 10.0)
                         and dlen <= max_dlen
                         and toward >= (-120.0 if aabb_void else -40.0)
